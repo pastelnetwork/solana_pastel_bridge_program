@@ -1,0 +1,20 @@
+[toolchain]
+
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+solana_pastel_bridge_program = "Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "/home/ubuntu/.config/solana/id.json"
+
+[scripts]
+build = "RUSTUP_TOOLCHAIN=nightly cargo build --release"
+test = "sh scripts/run_tests_with_logs.sh"
+

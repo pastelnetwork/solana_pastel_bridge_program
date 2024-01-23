@@ -1,0 +1,36 @@
+
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+
+# Environment variables (often used with dotenv crate)
+.env
+
+# Backup files
+*~
+.*.swp
+.*.swo
+.*.suo
+.*.bak
+.*.tmp
+
+# Log files
+*.log
+
+# Node.js dependencies (if using wasm-bindgen, etc.)
+/node_modules/
+
+# Generated files (for example, when using cbindgen)
+*.generated.rs
