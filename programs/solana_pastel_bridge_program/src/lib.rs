@@ -453,6 +453,65 @@ impl<'info> Initialize<'info> {
 }
 
 
+#[derive(Accounts)]
+pub struct ReallocateBridgeState<'info> {
+    #[account(mut, has_one = admin_pubkey)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    pub admin_pubkey: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    #[account(mut)]
+    pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
+    #[account(mut)]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+    #[account(mut)]
+    pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
+    #[account(mut)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+}
+
+// Define the reallocation thresholds and limits
+const REALLOCATION_THRESHOLD: f32 = 0.9;
+const ADDITIONAL_SPACE: usize = 10_240;
+const MAX_SIZE: usize = 100 * 1024; // 100KB
+
+// Function to reallocate account data
+fn reallocate_account_data(account: &mut AccountInfo, current_usage: usize) -> Result<()> {
+    let current_size = account.data_len();
+    let usage_ratio = current_usage as f32 / current_size as f32;
+
+    if usage_ratio > REALLOCATION_THRESHOLD {
+        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
+        account.realloc(new_size, false)?;
+        msg!("Account reallocated to new size: {}", new_size);
+    }
+
+    Ok(())
+}
+
+
+impl<'info> ReallocateBridgeState<'info> {
+    pub fn execute(ctx: Context<ReallocateBridgeState>) -> Result<()> {
+        // Reallocate TempServiceRequestsDataAccount
+        let temp_service_requests_usage = ctx.accounts.temp_service_requests_data_account.service_requests.len() * std::mem::size_of::<ServiceRequest>();
+        reallocate_account_data(&mut ctx.accounts.temp_service_requests_data_account.to_account_info(), temp_service_requests_usage)?;
+
+        // Reallocate BridgeNodesDataAccount
+        let bridge_nodes_usage = ctx.accounts.bridge_nodes_data_account.bridge_nodes.len() * std::mem::size_of::<BridgeNode>();
+        reallocate_account_data(&mut ctx.accounts.bridge_nodes_data_account.to_account_info(), bridge_nodes_usage)?;
+
+        // Reallocate ServiceRequestTxidMappingDataAccount
+        let txid_mapping_usage = ctx.accounts.service_request_txid_mapping_data_account.mappings.len() * std::mem::size_of::<ServiceRequestTxidMapping>();
+        reallocate_account_data(&mut ctx.accounts.service_request_txid_mapping_data_account.to_account_info(), txid_mapping_usage)?;
+
+        // Reallocate AggregatedConsensusDataAccount
+        let consensus_data_usage = ctx.accounts.aggregated_consensus_data_account.consensus_data.len() * std::mem::size_of::<AggregatedConsensusData>();
+        reallocate_account_data(&mut ctx.accounts.aggregated_consensus_data_account.to_account_info(), consensus_data_usage)?;
+
+        msg!("Reallocation of bridge contract state and related PDAs completed.");
+        Ok(())
+    }
+}
+
 // Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
 pub fn generate_service_request_id(
     pastel_ticket_type_string: &String,
@@ -705,41 +764,125 @@ pub struct SubmitPriceQuote<'info> {
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
 }
 
+pub fn validate_price_quote_submission(
+    bridge_nodes_data_account: &BridgeNodesDataAccount, // Add this parameter
+    temp_service_requests_account: &TempServiceRequestsDataAccount,
+    price_quote_submission_account: &ServicePriceQuoteSubmissionAccount,
+    service_request_id: &[u8; 32],
+    bridge_node_pastel_id: &Pubkey,
+    quoted_price_lamports: u64,
+    quote_timestamp: u64,
+) -> Result<()> {
+
+    // Check if the service_request_id corresponds to an existing and pending service request
+    let service_request = temp_service_requests_account
+        .service_requests
+        .iter()
+        .find(|request| request.service_request_id == *service_request_id)
+        .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+    // Validate service request status
+    if service_request.status != RequestStatus::Pending {
+        msg!("Error: Service request is not in a pending state");
+        return Err(BridgeError::ServiceRequestNotPending.into());
+    }
+
+    // Check Maximum Quote Response Time
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    if quote_timestamp > service_request.service_request_creation_timestamp + MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE {
+        msg!("Error: Price quote submitted too late");
+        return Err(BridgeError::QuoteResponseTimeExceeded.into());
+    }
+
+    // Check if the bridge node is registered
+    let registered_bridge_node = bridge_nodes_data_account
+        .bridge_nodes
+        .iter()
+        .find(|node| &node.reward_address == bridge_node_pastel_id);
+
+    if let Some(bridge_node) = registered_bridge_node {
+        // Check if the bridge node is banned
+        if bridge_node.is_banned() {
+            msg!("Error: Bridge node is currently banned");
+            return Err(BridgeError::BridgeNodeBanned.into());
+        }
+    } else {
+        msg!("Error: Bridge node is not registered");
+        return Err(BridgeError::UnregisteredBridgeNode.into());
+    }
+
+    // Check if the quoted price in lamports is not zero
+    if quoted_price_lamports == 0 {
+        msg!("Error: Quoted price cannot be zero");
+        return Err(BridgeError::InvalidQuotedPrice.into());
+    }
+
+    // Check if the price quote status is set to 'Submitted'
+    if price_quote_submission_account.price_quote_status != ServicePriceQuoteStatus::Submitted {
+        msg!("Error: Price quote status is not set to 'Submitted'");
+        return Err(BridgeError::InvalidQuoteStatus.into());
+    }
+
+    // Time Validity of the Quote
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    if current_timestamp > price_quote_submission_account.price_quote.quote_timestamp + QUOTE_VALIDITY_DURATION {
+        msg!("Error: Price quote has expired");
+        return Err(BridgeError::QuoteExpired.into());
+    }
+
+    // Bridge Node Compliance and Reliability Scores for Reward
+    if registered_bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD || registered_bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
+        msg!("Error: Bridge node does not meet the minimum score requirements for rewards");
+        return Err(BridgeError::BridgeNodeScoreTooLow.into());
+    }
+
+    // Bridge Node Activity Status
+    if current_timestamp > registered_bridge_node.last_active_timestamp + BRIDGE_NODE_INACTIVITY_THRESHOLD {
+        msg!("Error: Bridge node is inactive");
+        return Err(BridgeError::BridgeNodeInactive.into());
+    }
+
+    // Bridge Node Ban Status
+    if registered_bridge_node.is_temporarily_banned(current_timestamp) || registered_bridge_node.is_permanently_banned() {
+        msg!("Error: Bridge node is banned");
+        return Err(BridgeError::BridgeNodeBanned.into());
+    }
+
+    Ok(())
+}
+
+
 impl<'info> SubmitPriceQuote<'info> {
     pub fn submit_price_quote(
         ctx: Context<SubmitPriceQuote>,
         service_request_id_string: String,
         bridge_node_pastel_id: Pubkey,
         quoted_price_lamports: u64,
-        quote_timestamp: u64,
     ) -> ProgramResult {
         // Convert the hexadecimal string to bytes
         let service_request_id = hex_string_to_bytes(&service_request_id_string)?;
 
-        // Determine the PDA for the price quote
-        let (price_quote_pda, _bump_seed) = Pubkey::find_program_address(
-            &[b"price_quote", &service_request_id, bridge_node_pastel_id.as_ref()],
-            ctx.program_id,
-        );
+        // Obtain the current timestamp
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+        
+        // Validate the price quote before processing
+        validate_price_quote_submission(
+            &ctx.accounts.bridge_nodes_data_account, 
+            &ctx.accounts.temp_service_requests_data_account, 
+            &ctx.accounts.price_quote_submission_account, 
+            &service_request_id, 
+            &bridge_node_pastel_id, 
+            quoted_price_lamports, 
+            current_timestamp
+        )?;
 
-        // Check if the PDA account already exists
-        match ctx.accounts.system_program.get_account_info(&price_quote_pda) {
-            Ok(_) => {
-                // If the account exists, reject the submission
-                return Err(BridgeError::DuplicatePriceQuote.into());
-            }
-            Err(_) => {
-                // If the account does not exist, continue processing
-            }
-        }
-
-        // Create or update the ServicePriceQuoteSubmissionAccount
+        // Add the price quote to the price_quote_submission_account
         let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
         price_quote_account.price_quote = ServicePriceQuote {
             service_request_id,
             bridge_node_pastel_id,
             quoted_price_lamports,
-            quote_timestamp,
+            quote_timestamp: current_timestamp, // Use internally generated timestamp
             price_quote_status: ServicePriceQuoteStatus::Submitted,
         };
 
@@ -749,7 +892,7 @@ impl<'info> SubmitPriceQuote<'info> {
         quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
             best_quote_account.best_bridge_node_pastel_id = bridge_node_pastel_id.to_string();
             best_quote_account.best_quoted_price_in_lamports = quoted_price_lamports;
-            best_quote_account.best_quote_timestamp = quote_timestamp;
+            best_quote_account.best_quote_timestamp = current_timestamp;
             best_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::BestQuoteSelected;
         }
 
@@ -758,7 +901,42 @@ impl<'info> SubmitPriceQuote<'info> {
 }
 
 
-fn get_aggregated_data<'a>(
+pub fn choose_best_price_quote(
+    best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
+    temp_service_requests_account: &mut TempServiceRequestsDataAccount,
+    bridge_nodes_data_account: &BridgeNodesDataAccount,
+    current_timestamp: u64
+) -> Result<()> {
+    // Find the service request corresponding to the best price quote
+    let service_request = temp_service_requests_account.service_requests
+        .iter_mut()
+        .find(|request| request.service_request_id == best_quote_account.service_request_id)
+        .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+    // Check if the quote is still valid
+    if current_timestamp > best_quote_account.best_quote_timestamp + QUOTE_VALIDITY_DURATION {
+        return Err(BridgeError::QuoteExpired.into());
+    }
+
+    // Update the service request with the selected bridge node details
+    service_request.selected_bridge_node_pastelid = Some(best_quote_account.best_bridge_node_pastel_id.clone());
+    service_request.best_quoted_price_in_lamports = Some(best_quote_account.best_quoted_price_in_lamports);
+    service_request.bridge_node_selection_timestamp = Some(current_timestamp);
+
+    // Update the bridge node's status
+    if let Some(bridge_node) = bridge_nodes_data_account.bridge_nodes.iter_mut().find(|node| node.pastel_id == best_quote_account.best_bridge_node_pastel_id) {
+        bridge_node.total_price_quotes_submitted += 1;
+        if current_timestamp - bridge_node.last_active_timestamp > BRIDGE_NODE_INACTIVITY_THRESHOLD {
+            bridge_node.is_recently_active = false;
+        } else {
+            bridge_node.is_recently_active = true;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn get_aggregated_data<'a>(
     aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
     txid: &str
 ) -> Option<&'a AggregatedConsensusData> {
@@ -766,7 +944,7 @@ fn get_aggregated_data<'a>(
         .find(|data| data.txid == txid)
 }
 
-fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
+pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
     let consensus_status = aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, weight)| weight)
         .map(|(index, _)| usize_to_txid_status(index).unwrap_or(TxidStatus::Invalid)).unwrap();
 
@@ -776,555 +954,162 @@ fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, 
     (consensus_status, consensus_hash)
 }
 
+pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
+    if !success {
+        bridge_node.failed_service_requests_count += 1;
 
-pub fn apply_bans(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    if !is_accurate {
-
-        if contributor.total_reports_submitted <= CONTRIBUTIONS_FOR_TEMPORARY_BAN && contributor.consensus_failures % TEMPORARY_BAN_THRESHOLD == 0 {
-            contributor.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
-            msg!("Contributor: {} is temporarily banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Ban expires on: {}", 
-            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, TEMPORARY_BAN_THRESHOLD, contributor.ban_expiry);
-        } else if contributor.total_reports_submitted >= CONTRIBUTIONS_FOR_PERMANENT_BAN && contributor.consensus_failures >= PERMANENT_BAN_THRESHOLD {
-            contributor.ban_expiry = u64::MAX;
-            msg!("Contributor: {} is permanently banned as of {} because they have submitted {} reports and have {} consensus failures, more than the maximum allowed consensus failures of {}. Removing from list of contributors!", 
-            contributor.reward_address, current_timestamp, contributor.total_reports_submitted, contributor.consensus_failures, PERMANENT_BAN_THRESHOLD);
+        if bridge_node.total_service_requests_attempted <= SERVICE_REQUESTS_FOR_TEMPORARY_BAN && bridge_node.failed_service_requests_count >= TEMPORARY_BAN_SERVICE_FAILURES_THRESHOLD {
+            bridge_node.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
+            msg!("Bridge Node: {} temporarily banned due to failed service requests", bridge_node.pastel_id);
+        } else if bridge_node.total_service_requests_attempted >= SERVICE_REQUESTS_FOR_PERMANENT_BAN {
+            bridge_node.ban_expiry = u64::MAX;
+            msg!("Bridge Node: {} permanently banned due to total service requests", bridge_node.pastel_id);
         }
+    } else {
+        bridge_node.failed_service_requests_count = 0;
     }
 }
 
-fn update_scores(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    let time_diff = current_timestamp.saturating_sub(contributor.last_active_timestamp);
+pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
+    let time_diff = current_timestamp.saturating_sub(bridge_node.last_active_timestamp);
     let hours_inactive: f32 = time_diff as f32 / 3_600.0;
 
-    // Dynamic scaling for accuracy
-    let accuracy_scaling = if is_accurate {
-        (1.0 + contributor.current_streak as f32 * 0.1).min(2.0) // Increasing bonus for consecutive accuracy
-    } else {
-        1.0
-    };
-
+    let success_scaling = if success { (1.0 + bridge_node.current_streak as f32 * 0.1).min(2.0) } else { 1.0 };
     let time_weight = 1.0 / (1.0 + hours_inactive / 480.0);
-
-    let base_score_increment = 20.0; // Adjusted base increment for a more gradual increase
-
-    let score_increment = base_score_increment * accuracy_scaling * time_weight;
-
-    // Exponential penalty for inaccuracies
-    let score_decrement = 20.0 * (1.0 + contributor.consensus_failures as f32 * 0.5).min(3.0); 
-
-    let decay_rate: f32 = 0.99; // Adjusted decay rate
+    let score_increment = 20.0 * success_scaling * time_weight;
+    let score_decrement = 20.0 * (1.0 + bridge_node.failed_service_requests_count as f32 * 0.5).min(3.0);
+    let decay_rate: f32 = 0.99;
     let decay_factor = decay_rate.powf(hours_inactive / 24.0);
 
-    let streak_bonus = if is_accurate {
-        (contributor.current_streak as f32 / 10.0).min(3.0).max(0.0) // Enhanced streak bonus
-    } else {
-        0.0
-    };
+    let streak_bonus = if success { (bridge_node.current_streak as f32 / 10.0).min(3.0).max(0.0) } else { 0.0 };
 
-    if is_accurate {
-        contributor.total_reports_submitted += 1;
-        contributor.accurate_reports_count += 1;
-        contributor.current_streak += 1;
-        contributor.compliance_score += score_increment + streak_bonus;
+    if success {
+        bridge_node.successful_service_requests_count += 1;
+        bridge_node.current_streak += 1;
+        bridge_node.compliance_score += score_increment + streak_bonus;
     } else {
-        contributor.total_reports_submitted += 1;
-        contributor.current_streak = 0;
-        contributor.consensus_failures += 1;
-        contributor.compliance_score = (contributor.compliance_score - score_decrement).max(0.0);
+        bridge_node.current_streak = 0;
+        bridge_node.compliance_score = (bridge_node.compliance_score - score_decrement).max(0.0);
     }
 
-    contributor.compliance_score *= decay_factor;
+    bridge_node.compliance_score *= decay_factor;
 
-    // Integrating reliability score into compliance score calculation
-    let reliability_factor = (contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32).clamp(0.0, 1.0);
-    contributor.compliance_score = (contributor.compliance_score * reliability_factor).min(100.0);
+    let reliability_factor = (bridge_node.successful_service_requests_count as f32 / bridge_node.total_service_requests_attempted as f32).clamp(0.0, 1.0);
+    bridge_node.compliance_score = (bridge_node.compliance_score * reliability_factor).min(100.0);
+    bridge_node.compliance_score = logistic_scale(bridge_node.compliance_score, 100.0, 0.1, 50.0);
+    bridge_node.reliability_score = reliability_factor * 100.0;
 
-    contributor.compliance_score = logistic_scale(contributor.compliance_score, 100.0, 0.1, 50.0); // Adjusted logistic scaling
+    if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD || bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
+        bridge_node.is_eligible_for_rewards = false;
+    } else {
+        bridge_node.is_eligible_for_rewards = true;
+    }
 
-    contributor.reliability_score = reliability_factor * 100.0;
-
-    log_score_updates(contributor);
+    log_score_updates(bridge_node);
 }
 
-fn logistic_scale(score: f32, max_value: f32, steepness: f32, midpoint: f32) -> f32 {
+pub fn logistic_scale(score: f32, max_value: f32, steepness: f32, midpoint: f32) -> f32 {
     max_value / (1.0 + (-steepness * (score - midpoint)).exp())
 }
 
-fn log_score_updates(contributor: &Contributor) {
-    msg!("Scores After Update: Address: {}, Compliance Score: {}, Reliability Score: {}",
-        contributor.reward_address, contributor.compliance_score, contributor.reliability_score);
+pub fn log_score_updates(bridge_node: &BridgeNode) {
+    msg!("Scores After Update: Pastel ID: {}, Compliance Score: {}, Reliability Score: {}",
+        bridge_node.pastel_id, bridge_node.compliance_score, bridge_node.reliability_score);
 }
 
-fn update_statuses(contributor: &mut Contributor, current_timestamp: u64) {
-    // Updating recently active status
-    let recent_activity_threshold = 86_400; // 24 hours in seconds
-    contributor.is_recently_active = current_timestamp - contributor.last_active_timestamp < recent_activity_threshold;
+pub fn update_bridge_node_status(
+    bridge_node: &mut BridgeNode,
+    success: bool,
+    current_timestamp: u64
+) {
+    bridge_node.total_service_requests_attempted += 1;
+    bridge_node.last_active_timestamp = current_timestamp;
 
-    // Updating reliability status
-    contributor.is_reliable = if contributor.total_reports_submitted > 0 {
-        let reliability_ratio = contributor.accurate_reports_count as f32 / contributor.total_reports_submitted as f32;
-        reliability_ratio >= 0.8 // Example threshold for reliability
+    if success {
+        bridge_node.successful_service_requests_count += 1;
+        bridge_node.current_streak += 1;
+
+        // Determine eligibility for rewards based on compliance and reliability scores
+        bridge_node.is_eligible_for_rewards = bridge_node.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
+                                            && bridge_node.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD;
+    } else {
+        bridge_node.failed_service_requests_count += 1;
+        bridge_node.current_streak = 0;
+
+        // Apply a temporary ban if the node has attempted enough service requests but has a high failure rate
+        if bridge_node.total_service_requests_attempted > SERVICE_REQUESTS_FOR_TEMPORARY_BAN 
+        && bridge_node.failed_service_requests_count > TEMPORARY_BAN_SERVICE_FAILURES_THRESHOLD {
+            bridge_node.ban_expiry = current_timestamp + TEMPORARY_BAN_DURATION;
+        }
+    }
+
+    update_scores(bridge_node, current_timestamp, success);
+    update_statuses(bridge_node, current_timestamp);
+}
+
+
+pub fn update_statuses(bridge_node: &mut BridgeNode, current_timestamp: u64) {
+    // Update the recently active status based on the last active timestamp and the inactivity threshold
+    bridge_node.is_recently_active = current_timestamp - bridge_node.last_active_timestamp < BRIDGE_NODE_INACTIVITY_THRESHOLD;
+
+    // Update the reliability status based on the ratio of successful to attempted service requests
+    bridge_node.is_reliable = if bridge_node.total_service_requests_attempted > 0 {
+        let success_ratio = bridge_node.successful_service_requests_count as f32 
+                            / bridge_node.total_service_requests_attempted as f32;
+        success_ratio >= MIN_RELIABILITY_SCORE_FOR_REWARD / 100.0
     } else {
         false
     };
 
-    // Updating eligibility for rewards
-    contributor.is_eligible_for_rewards = contributor.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
-        && contributor.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD 
-        && contributor.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD;
-}
-
-fn update_contributor(contributor: &mut Contributor, current_timestamp: u64, is_accurate: bool) {
-    // Check if the contributor is banned before proceeding. If so, just return.
-    if contributor.calculate_is_banned(current_timestamp) {
-        msg!("Contributor is currently banned and cannot be updated: {}", contributor.reward_address);
-        return; // We don't stop the process here, just skip this contributor.
-    }
-
-    // Updating scores
-    update_scores(contributor, current_timestamp, is_accurate);
-
-    // Applying bans based on report accuracy
-    apply_bans(contributor, current_timestamp, is_accurate);
-
-    // Updating contributor statuses
-    update_statuses(contributor, current_timestamp);
+    // Update the eligibility for rewards based on compliance and reliability scores
+    bridge_node.is_eligible_for_rewards = bridge_node.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD 
+                                        && bridge_node.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD;
 }
 
 
-fn calculate_consensus(
-    aggregated_data_account: &Account<AggregatedConsensusDataAccount>,    
-    temp_report_account: &TempTxStatusReportAccount,
-    contributor_data_account: &mut Account<ContributorDataAccount>,
-    txid: &str,
-) -> Result<()> {
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    let (consensus_status, consensus_hash) = get_aggregated_data(aggregated_data_account, txid)
-        .map(|data| compute_consensus(data))
-        .unwrap_or((TxidStatus::Invalid, String::new()));
-
-    let mut updated_contributors = Vec::new();
-    let mut contributor_count = 0;
-
-    for temp_report in temp_report_account.reports.iter() {
-        let common_data = &temp_report_account.common_reports[temp_report.common_data_ref as usize];
-        let specific_data = &temp_report.specific_data;
-    
-        if common_data.txid == txid && !updated_contributors.contains(&specific_data.contributor_reward_address) {
-            if let Some(contributor) = contributor_data_account.contributors.iter_mut().find(|c| c.reward_address == specific_data.contributor_reward_address) {
-                let is_accurate = common_data.txid_status == consensus_status &&
-                    common_data.first_6_characters_of_sha3_256_hash_of_corresponding_file.as_ref().map_or(false, |hash| hash == &consensus_hash);
-                update_contributor(contributor, current_timestamp, is_accurate);
-                updated_contributors.push(specific_data.contributor_reward_address);
-            }
-            contributor_count += 1;
-        }
-    }
-    msg!("Consensus reached for TXID: {}, Status: {:?}, Hash: {}, Number of Contributors Included: {}", txid, consensus_status, consensus_hash, contributor_count);
-
-    Ok(())
-}
-
-
-pub fn apply_permanent_bans(contributor_data_account: &mut Account<ContributorDataAccount>) {
-    // Collect addresses of contributors to be removed for efficient logging
-    let contributors_to_remove: Vec<String> = contributor_data_account.contributors.iter()
-        .filter(|c| c.ban_expiry == u64::MAX)
-        .map(|c| c.reward_address.to_string()) // Convert Pubkey to String
+pub fn apply_permanent_bans(bridge_nodes_data_account: &mut Account<BridgeNodesDataAccount>) {
+    // Collect Pastel IDs of bridge nodes to be removed for efficient logging
+    let bridge_nodes_to_remove: Vec<String> = bridge_nodes_data_account.bridge_nodes.iter()
+        .filter(|node| node.ban_expiry == u64::MAX)
+        .map(|node| node.pastel_id.clone()) // Clone the Pastel ID
         .collect();
 
     // Log information about the removal process
-    msg!("Now removing permanently banned contributors! Total number of contributors before removal: {}, Number of contributors to be removed: {}, Addresses of contributors to be removed: {:?}",
-        contributor_data_account.contributors.len(), contributors_to_remove.len(), contributors_to_remove);
+    msg!("Now removing permanently banned bridge nodes! Total number of bridge nodes before removal: {}, Number of bridge nodes to be removed: {}, Pastel IDs of bridge nodes to be removed: {:?}",
+        bridge_nodes_data_account.bridge_nodes.len(), bridge_nodes_to_remove.len(), bridge_nodes_to_remove);
 
-    // Retain only contributors who are not permanently banned
-    contributor_data_account.contributors.retain(|c| c.ban_expiry != u64::MAX);
+    // Retain only bridge nodes who are not permanently banned
+    bridge_nodes_data_account.bridge_nodes.retain(|node| node.ban_expiry != u64::MAX);
 }
 
-
 fn post_consensus_tasks(
-    txid_submission_counts_account: &mut Account<TxidSubmissionCountsAccount>,    
-    aggregated_data_account: &mut Account<AggregatedConsensusDataAccount>,
-    temp_report_account: &mut TempTxStatusReportAccount,
-    contributor_data_account: &mut Account<ContributorDataAccount>,
-    txid: &str,
+    bridge_nodes_data_account: &mut Account<BridgeNodesDataAccount>,
+    temp_service_requests_data_account: &mut Account<TempServiceRequestsDataAccount>,
+    service_request_txid_mapping_data_account: &mut Account<ServiceRequestTxidMappingDataAccount>,
+    current_timestamp: u64,
 ) -> Result<()> {
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    apply_permanent_bans(bridge_nodes_data_account);
 
-    apply_permanent_bans(contributor_data_account);
-
-    msg!("Now cleaning up unneeded data in TempTxStatusReportAccount...");
-    // Cleanup unneeded data in TempTxStatusReportAccount
-    temp_report_account.reports.retain(|temp_report| {
-        // Access the common data from the TempTxStatusReportAccount
-        let common_data = &temp_report_account.common_reports[temp_report.common_data_ref as usize];
-        let specific_data = &temp_report.specific_data;
-        common_data.txid != txid && current_timestamp - specific_data.timestamp < DATA_RETENTION_PERIOD
+    msg!("Now cleaning up unneeded data in TempServiceRequestsDataAccount...");
+    // Cleanup unneeded data in TempServiceRequestsDataAccount
+    temp_service_requests_data_account.service_requests.retain(|service_request| {
+        current_timestamp - service_request.service_request_creation_timestamp < SERVICE_REQUEST_VALIDITY
     });
 
-    msg!("Now cleaning up unneeded data in AggregatedConsensusDataAccount...");
-    // Cleanup unneeded data in AggregatedConsensusDataAccount
-    aggregated_data_account.consensus_data.retain(|data| {
-        current_timestamp - data.last_updated < DATA_RETENTION_PERIOD
-    });
-
-    msg!("Now cleaning up unneeded data in TxidSubmissionCountsAccount...");
-    // Cleanup old submission counts in TxidSubmissionCountsAccount
-    txid_submission_counts_account.submission_counts.retain(|count| {
-        current_timestamp - count.last_updated < SUBMISSION_COUNT_RETENTION_PERIOD
+    msg!("Now cleaning up unneeded data in ServiceRequestTxidMappingDataAccount...");
+    // Cleanup old mapping data in ServiceRequestTxidMappingDataAccount
+    service_request_txid_mapping_data_account.mappings.retain(|mapping| {
+        current_timestamp - mapping.timestamp < SUBMISSION_COUNT_RETENTION_PERIOD
     });
 
     msg!("Done with post-consensus tasks!");
     Ok(())
 }
 
-
-fn aggregate_consensus_data(
-    aggregated_data_account: &mut Account<AggregatedConsensusDataAccount>, 
-    report: &PastelTxStatusReport, 
-    weight: f32, 
-    txid: &str
-) -> Result<()> {
-    let scaled_weight = (weight * 100.0) as i32; // Scaling by a factor of 100
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
-
-    // Check if the txid already exists in the aggregated consensus data
-    if let Some(data_entry) = aggregated_data_account.consensus_data.iter_mut().find(|d| d.txid == txid) {
-        // Update existing data
-        data_entry.status_weights[report.txid_status as usize] += scaled_weight;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            update_hash_weight(&mut data_entry.hash_weights, hash, scaled_weight);
-        }
-        data_entry.last_updated = current_timestamp;
-    } else {
-        // Create new data
-        let mut new_data = AggregatedConsensusData {
-            txid: txid.to_string(),
-            status_weights: [0; TXID_STATUS_VARIANT_COUNT],
-            hash_weights: Vec::new(),
-            last_updated: current_timestamp,
-        };
-        new_data.status_weights[report.txid_status as usize] += scaled_weight;
-        if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-            new_data.hash_weights.push(HashWeight { hash: hash.clone(), weight: scaled_weight });
-        }
-        aggregated_data_account.consensus_data.push(new_data);
-    }
-
-    Ok(())
-}
-
-
-fn find_or_add_common_report_data(
-    temp_report_account: &mut TempTxStatusReportAccount, 
-    common_data: &CommonReportData
-) -> u64 {
-    if let Some((index, _)) = temp_report_account.common_reports.iter().enumerate().find(|(_, data)| *data == common_data) {
-        index as u64
-    } else {
-        temp_report_account.common_reports.push(common_data.clone());
-        (temp_report_account.common_reports.len() - 1) as u64
-    }
-}
-
-
-pub fn submit_data_report_helper(
-    ctx: Context<SubmitDataReport>, 
-    txid: String, 
-    report: PastelTxStatusReport,
-    contributor_reward_address: Pubkey
-) -> ProgramResult {
-    // Directly access accounts from the context
-    let txid_submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount> = &mut ctx.accounts.txid_submission_counts_account;
-    let aggregated_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
-    let temp_report_account = &mut ctx.accounts.temp_report_account;
-    let contributor_data_account = &mut ctx.accounts.contributor_data_account;
-
-
-    // Retrieve the submission count for the given txid from the PDA account
-    let txid_submission_count: usize = txid_submission_counts_account.submission_counts.iter()
-        .find(|c| c.txid == txid).map_or(0, |c| c.count as usize);
-
-    // Check if the number of submissions is already at or exceeds MIN_NUMBER_OF_ORACLES
-    if txid_submission_count >= MIN_NUMBER_OF_ORACLES {
-        msg!("Enough reports have already been submitted for this txid");
-        return Err(BridgeError::EnoughReportsSubmittedForTxid.into());
-    }    
-
-    // Validate the data report before any contributor-specific checks
-    // msg!("Validating data report: {:?}", report);
-    validate_data_contributor_report(&report)?;
-
-    // Check if the contributor is registered and not banned
-    // msg!("Checking if contributor is registered and not banned");    
-    let contributor = contributor_data_account.contributors
-        .iter()
-        .find(|c| c.reward_address == contributor_reward_address)
-        .ok_or(BridgeError::ContributorNotRegistered)?;
-
-    if contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64) {
-        return Err(BridgeError::ContributorBanned.into());
-    }
-
-    // Clone the String before using it
-    let first_6_characters_of_sha3_256_hash_of_corresponding_file = report.first_6_characters_of_sha3_256_hash_of_corresponding_file.clone();
-
-    // Extracting common data from the report
-    // msg!("Extracting common data from the report");
-    let common_data = CommonReportData {
-        txid: report.txid.clone(),
-        txid_status: report.txid_status,
-        pastel_ticket_type: report.pastel_ticket_type,
-        first_6_characters_of_sha3_256_hash_of_corresponding_file: first_6_characters_of_sha3_256_hash_of_corresponding_file,
-    };
-
-    // Finding or adding common report data
-    // msg!("Finding or adding common report data");
-    let common_data_index = find_or_add_common_report_data(temp_report_account, &common_data);
-
-    // Creating specific report data
-    // msg!("Creating specific report data");
-    let specific_report = SpecificReportData {
-        contributor_reward_address,
-        timestamp: report.timestamp,
-        common_data_ref: common_data_index,
-    };
-
-    // Creating a temporary report entry
-    // msg!("Creating a temporary report entry");
-    let temp_report: TempTxStatusReport = TempTxStatusReport {
-        common_data_ref: common_data_index,
-        specific_data: specific_report,
-    };
-
-    // Add the temporary report to the TempTxStatusReportAccount
-    // msg!("Adding the temporary report to the TempTxStatusReportAccount");
-    temp_report_account.reports.push(temp_report);
-
-    // Update submission count and consensus-related data
-    // msg!("Updating submission count and consensus-related data");
-    update_submission_count(txid_submission_counts_account, &txid)?;
-
-    let compliance_score = contributor.compliance_score;
-    let reliability_score = contributor.reliability_score;
-    let weight: f32 = compliance_score + reliability_score;
-    aggregate_consensus_data(aggregated_data_account, &report, weight, &txid)?;
-    
-    // Check for consensus and perform related tasks
-    if should_calculate_consensus(txid_submission_counts_account, &txid)? {
-
-        msg!("We now have enough reports to calculate consensus for txid: {}", txid);
-        
-        let contributor_data_account: &mut Account<'_, ContributorDataAccount> = &mut ctx.accounts.contributor_data_account;
-        msg!("Calculating consensus...");
-        calculate_consensus(aggregated_data_account, temp_report_account, contributor_data_account, &txid)?;
-
-        msg!("Performing post-consensus tasks...");
-        post_consensus_tasks(txid_submission_counts_account, aggregated_data_account, temp_report_account, contributor_data_account, &txid)?;
-    }
-
-    // Log the new size of temp_tx_status_reports
-    msg!("New size of temp_tx_status_reports in bytes after processing report for txid {} from contributor {}: {}", txid, contributor_reward_address, temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>());
-
-    Ok(())
-}
-
-
-#[derive(Accounts)]
-#[instruction(txid: String)]
-pub struct HandleConsensus<'info> {
-
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[account]
-pub struct PendingPaymentAccount {
-    pub pending_payment: PendingPayment,
-}
-
-#[derive(Accounts)]
-#[instruction(txid: String)]
-pub struct HandlePendingPayment<'info> {
-    #[account(
-        init_if_needed,
-        payer = user,
-        seeds = [create_seed("pending_payment", &txid, &user.key()).as_ref()],
-        bump,
-        space = 8 + std::mem::size_of::<PendingPayment>() + 64 // Adjusted for discriminator
-    )]
-    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
-
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-pub fn add_pending_payment_helper(
-    ctx: Context<HandlePendingPayment>, 
-    txid: String, 
-    pending_payment: PendingPayment
-) -> ProgramResult {
-    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
-
-    // Ensure the account is being initialized for the first time to avoid re-initialization
-    if !pending_payment_account.pending_payment.txid.is_empty() && pending_payment_account.pending_payment.txid != txid {
-        return Err(BridgeError::PendingPaymentAlreadyInitialized.into());
-    }
-
-    // Ensure txid is correct and other fields are properly set
-    if pending_payment.txid != txid {
-        return Err(BridgeError::InvalidTxid.into());
-    }
-
-    // Store the pending payment in the account
-    pending_payment_account.pending_payment = pending_payment;
-
-    msg!("Pending payment account initialized: TXID: {}, Expected Amount: {}, Status: {:?}", 
-        pending_payment_account.pending_payment.txid, 
-        pending_payment_account.pending_payment.expected_amount, 
-        pending_payment_account.pending_payment.payment_status);
-
-    Ok(())
-}
-
-
-
 #[account]
 pub struct BridgeNodeDataAccount {
     pub bridge_nodes: Vec<BridgeNode>,
 }
-
-#[account]
-pub struct TxidSubmissionCountsAccount {
-    pub submission_counts: Vec<TxidSubmissionCount>,
-}
-
-#[derive(Accounts)]
-pub struct ReallocateOracleState<'info> {
-    #[account(mut, has_one = admin_pubkey)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-    pub admin_pubkey: Signer<'info>,
-    pub system_program: Program<'info, System>,
-    #[account(mut)]
-    pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
-    #[account(mut)]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,
-    #[account(mut)]
-    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
-    #[account(mut)]
-    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
-}
-
-pub fn reallocate_temp_report_account(temp_report_account: &mut Account<'_, TempTxStatusReportAccount>) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
-    const REALLOCATION_THRESHOLD: f32 = 0.9;
-    const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
-
-    let current_size = temp_report_account.to_account_info().data_len();
-    let current_usage = temp_report_account.reports.len() * std::mem::size_of::<TempTxStatusReport>();
-    let usage_ratio = current_usage as f32 / current_size as f32;
-
-    if usage_ratio > REALLOCATION_THRESHOLD {
-        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        temp_report_account.to_account_info().realloc(new_size, false)?;
-        msg!("TempTxStatusReportAccount reallocated to new size: {}", new_size);
-    }
-    
-    Ok(())
-}
-
-pub fn reallocate_contributor_data_account(contributor_data_account: &mut Account<'_, ContributorDataAccount>) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
-    const REALLOCATION_THRESHOLD: f32 = 0.9;
-    const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
-
-    let current_size = contributor_data_account.to_account_info().data_len();
-    let current_usage = contributor_data_account.contributors.len() * std::mem::size_of::<Contributor>();
-    let usage_ratio = current_usage as f32 / current_size as f32;
-
-    if usage_ratio > REALLOCATION_THRESHOLD {
-        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        contributor_data_account.to_account_info().realloc(new_size, false)?;
-        msg!("ContributorDataAccount reallocated to new size: {}", new_size);
-    }
-    
-    Ok(())
-}
-
-pub fn reallocate_submission_counts_account(submission_counts_account: &mut Account<'_, TxidSubmissionCountsAccount>) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
-    const REALLOCATION_THRESHOLD: f32 = 0.9;
-    const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
-
-    let current_size = submission_counts_account.to_account_info().data_len();
-    let current_usage = submission_counts_account.submission_counts.len() * std::mem::size_of::<TxidSubmissionCount>();
-    let usage_ratio = current_usage as f32 / current_size as f32;
-
-    if usage_ratio > REALLOCATION_THRESHOLD {
-        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        submission_counts_account.to_account_info().realloc(new_size, false)?;
-        msg!("TxidSubmissionCountsAccount reallocated to new size: {}", new_size);
-    }
-    
-    Ok(())
-}
-
-pub fn reallocate_aggregated_consensus_data_account(aggregated_consensus_data_account: &mut Account<'_, AggregatedConsensusDataAccount>) -> Result<()> {
-    // Define the threshold at which to reallocate (e.g., 90% full)
-    const REALLOCATION_THRESHOLD: f32 = 0.9;
-    const ADDITIONAL_SPACE: usize = 10_240;
-    const MAX_SIZE: usize = 100 * 1024;
-
-    let current_size = aggregated_consensus_data_account.to_account_info().data_len();
-    let current_usage = aggregated_consensus_data_account.consensus_data.len() * std::mem::size_of::<AggregatedConsensusData>();
-    let usage_ratio = current_usage as f32 / current_size as f32;
-
-    if usage_ratio > REALLOCATION_THRESHOLD {
-        let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
-        aggregated_consensus_data_account.to_account_info().realloc(new_size, false)?;
-        msg!("AggregatedConsensusDataAccount reallocated to new size: {}", new_size);
-    }
-    
-    Ok(())
-}
-
-impl<'info> ReallocateOracleState<'info> {
-    pub fn execute(ctx: Context<ReallocateOracleState>) -> Result<()> {
-        let oracle_contract_state = &mut ctx.accounts.oracle_contract_state;
-
-        // Calculate new size; add 10,240 bytes for each reallocation
-        // Ensure not to exceed 100KB total size
-        let current_size = oracle_contract_state.to_account_info().data_len();
-        let additional_space = 10_240; // Increment size
-        let max_size = 100 * 1024; // 100KB
-        let new_size = std::cmp::min(current_size + additional_space, max_size);
-
-        // Perform reallocation
-        oracle_contract_state.to_account_info().realloc(new_size, false)?;
-
-        msg!("OracleContractState reallocated to new size: {}", new_size);
-        
-        reallocate_temp_report_account(&mut ctx.accounts.temp_report_account)?;
-        reallocate_contributor_data_account(&mut ctx.accounts.contributor_data_account)?;
-        reallocate_submission_counts_account(&mut ctx.accounts.txid_submission_counts_account)?;
-        reallocate_aggregated_consensus_data_account(&mut ctx.accounts.aggregated_consensus_data_account)?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct HashWeight {
     pub hash: String,
@@ -1509,7 +1294,7 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
 }
 
 
-impl Contributor {
+impl BridgeNode {
 
     // Check if the contributor is currently banned
     pub fn calculate_is_banned(&self, current_time: u64) -> bool {
@@ -1518,73 +1303,26 @@ impl Contributor {
 
     // Method to determine if the contributor is eligible for rewards
     pub fn calculate_is_eligible_for_rewards(&self) -> bool {
-        self.total_reports_submitted >= MIN_REPORTS_FOR_REWARD 
-            && self.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD 
-            && self.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
+        self.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD && self.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
     }
 
 }
 
 
 #[derive(Accounts)]
-pub struct SetBridgeContract<'info> {
+pub struct SetOracleContract<'info> {
     #[account(mut, has_one = admin_pubkey)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
     pub admin_pubkey: Signer<'info>,
 }
 
-impl<'info> SetBridgeContract<'info> {
-    pub fn set_bridge_contract(ctx: Context<SetBridgeContract>, bridge_contract_pubkey: Pubkey) -> Result<()> {
-        let state = &mut ctx.accounts.oracle_contract_state;
-        state.bridge_contract_pubkey = bridge_contract_pubkey;
-        msg!("Bridge contract pubkey updated: {:?}", bridge_contract_pubkey);
+impl<'info> SetOracleContract<'info> {
+    pub fn set_oracle_contract(ctx: Context<SetOracleContract>, oracle_contract_pubkey: Pubkey) -> Result<()> {
+        let state = &mut ctx.accounts.bridge_contract_state;
+        state.oracle_contract_pubkey = oracle_contract_pubkey;
+        msg!("Oracle contract pubkey updated: {:?}", oracle_contract_pubkey);
         Ok(())
     }
-}
-
-#[derive(Accounts)]
-#[instruction(txid: String)] // Include txid as part of the instruction
-pub struct ProcessPayment<'info> {
-    /// CHECK: This is checked in the handler function to verify it's the bridge contract.
-    #[account(signer)]
-    pub source_account: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    #[account(
-        mut,
-        seeds = [create_seed("pending_payment", &txid, &source_account.key()).as_ref()],
-        bump // You won't explicitly include the bump here; it's handled by Anchor
-    )]
-    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
-
-    pub system_program: Program<'info, System>,
-}
-
-
-pub fn process_payment_helper(
-    ctx: Context<ProcessPayment>, 
-    txid: String, 
-    amount: u64
-) -> Result<()> {
-    // Access the pending payment account using the txid as a seed
-    let pending_payment_account = &mut ctx.accounts.pending_payment_account;
-
-    // Ensure the payment corresponds to the provided txid
-    if pending_payment_account.pending_payment.txid != txid {
-        return Err(BridgeError::PaymentNotFound.into());
-    }
-
-    // Verify the payment amount matches the expected amount
-    if pending_payment_account.pending_payment.expected_amount != amount {
-        return Err(BridgeError::InvalidPaymentAmount.into());
-    }
-
-    // Mark the payment as received
-    pending_payment_account.pending_payment.payment_status = PaymentStatus::Received;
-
-    Ok(())
 }
 
 
@@ -1592,48 +1330,79 @@ pub fn process_payment_helper(
 pub struct WithdrawFunds<'info> {
     #[account(
         mut,
-        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ BridgeError::UnauthorizedWithdrawalAccount,
+        constraint = bridge_contract_state.admin_pubkey == *admin_account.key @ BridgeError::UnauthorizedWithdrawalAccount,
     )]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
 
-    /// CHECK: The admin_account is manually verified in the instruction to ensure it's the correct and authorized account for withdrawal operations. This includes checking if the account matches the admin_pubkey stored in oracle_contract_state.
+    /// CHECK: The admin_account is manually verified in the instruction to ensure it's the correct and authorized account for withdrawal operations. This includes checking if the account matches the admin_pubkey stored in bridge_contract_state.
     pub admin_account: AccountInfo<'info>,
 
     #[account(mut)]
-    pub reward_pool_account: Account<'info, RewardPool>,
+    pub reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
+
     #[account(mut)]
-    pub fee_receiving_contract_account: Account<'info, FeeReceivingContract>,
+    pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
+
+    #[account(mut)]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+
+    #[account(mut)]
+    pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
+
+    #[account(mut)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+
+    #[account(mut)]
+    pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
+
     pub system_program: Program<'info, System>,
 }
 
 impl<'info> WithdrawFunds<'info> {
-    pub fn execute(ctx: Context<WithdrawFunds>, reward_pool_amount: u64, fee_receiving_amount: u64) -> Result<()> {
+    pub fn execute(ctx: Context<WithdrawFunds>, 
+                reward_pool_amount: u64, 
+                fee_receiving_amount: u64,
+                escrow_amount: u64,
+                bridge_nodes_data_amount: u64,
+                temp_service_requests_data_amount: u64,
+                aggregated_consensus_data_amount: u64,
+                service_request_txid_mapping_data_amount: u64) -> Result<()> {
         if !ctx.accounts.admin_account.is_signer {
             return Err(BridgeError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account is a signer
-        } 
+        }
+
         let admin_account = &mut ctx.accounts.admin_account;
         let reward_pool_account = &mut ctx.accounts.reward_pool_account;
         let fee_receiving_contract_account = &mut ctx.accounts.fee_receiving_contract_account;
+        let bridge_escrow_account = &mut ctx.accounts.bridge_escrow_account;
+        let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
+        let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
+        let aggregated_consensus_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
+        let service_request_txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
 
-        // Transfer SOL from the reward pool account to the admin account
-        if **reward_pool_account.to_account_info().lamports.borrow() < reward_pool_amount {
-            return Err(BridgeError::InsufficientFunds.into());
+        // Function to withdraw funds from a specific account
+        fn withdraw_funds(from_account: &mut AccountInfo, to_account: &mut AccountInfo, amount: u64) -> Result<()> {
+            if **from_account.lamports.borrow() < amount {
+                return Err(BridgeError::InsufficientFunds.into());
+            }
+            **from_account.lamports.borrow_mut() -= amount;
+            **to_account.lamports.borrow_mut() += amount;
+            Ok(())
         }
-        **reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_pool_amount;
-        **admin_account.lamports.borrow_mut() += reward_pool_amount;
 
-        // Transfer SOL from the fee receiving contract account to the admin account
-        if **fee_receiving_contract_account.to_account_info().lamports.borrow() < fee_receiving_amount {
-            return Err(BridgeError::InsufficientFunds.into());
-        }
-        **fee_receiving_contract_account.to_account_info().lamports.borrow_mut() -= fee_receiving_amount;
-        **admin_account.lamports.borrow_mut() += fee_receiving_amount;
+        // Perform withdrawals
+        withdraw_funds(&mut reward_pool_account.to_account_info(), admin_account, reward_pool_amount)?;
+        withdraw_funds(&mut fee_receiving_contract_account.to_account_info(), admin_account, fee_receiving_amount)?;
+        withdraw_funds(&mut bridge_escrow_account.to_account_info(), admin_account, escrow_amount)?;
+        withdraw_funds(&mut bridge_nodes_data_account.to_account_info(), admin_account, bridge_nodes_data_amount)?;
+        withdraw_funds(&mut temp_service_requests_data_account.to_account_info(), admin_account, temp_service_requests_data_amount)?;
+        withdraw_funds(&mut aggregated_consensus_data_account.to_account_info(), admin_account, aggregated_consensus_data_amount)?;
+        withdraw_funds(&mut service_request_txid_mapping_data_account.to_account_info(), admin_account, service_request_txid_mapping_data_amount)?;
 
-        msg!("Withdrawal successful: {} lamports transferred from reward pool and {} lamports from fee receiving contract to admin account", reward_pool_amount, fee_receiving_amount);
+        msg!("Withdrawal successful: {} lamports transferred from various PDAs to admin account", reward_pool_amount + fee_receiving_amount + escrow_amount + bridge_nodes_data_amount + temp_service_requests_data_amount + aggregated_consensus_data_amount + service_request_txid_mapping_data_amount);
         Ok(())
     }
 }
-
 
 declare_id!("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
 
@@ -1660,8 +1429,8 @@ pub mod solana_pastel_bridge_program {
         Ok(())
     }
 
-    pub fn reallocate_oracle_state(ctx: Context<ReallocateOracleState>) -> Result<()> {
-        ReallocateOracleState::execute(ctx)
+    pub fn reallocate_bridge_state(ctx: Context<ReallocateBridgeState>) -> Result<()> {
+        ReallocateBridgeState::execute(ctx)
     }
 
     pub fn register_new_bridge_node(
@@ -1681,88 +1450,48 @@ pub mod solana_pastel_bridge_program {
         SubmitServiceRequest::submit_service_request(ctx, ipfs_cid, file_size_bytes)
     }
 
-    pub fn add_txid_for_monitoring(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
-        add_txid_for_monitoring_helper(ctx, data)
-    }
-
-    pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, expected_amount_str: String, payment_status_str: String) -> Result<()> {
-        let expected_amount = expected_amount_str.parse::<u64>()
-            .map_err(|_| BridgeError::PendingPaymentInvalidAmount)?;
-    
-        // Convert the payment status from string to enum
-        let payment_status = match payment_status_str.as_str() {
-            "Pending" => PaymentStatus::Pending,
-            "Received" => PaymentStatus::Received,
-            _ => return Err(BridgeError::InvalidPaymentStatus.into()),
-        };
-    
-        let pending_payment = PendingPayment {
-            txid: txid.clone(),
-            expected_amount,
-            payment_status,
-        };
-    
-        add_pending_payment_helper(ctx, txid, pending_payment)
-            .map_err(|e| e.into())
-    }
-    
-    
-    pub fn process_payment(ctx: Context<ProcessPayment>, txid: String, amount: u64) -> Result<()> {
-        process_payment_helper(ctx, txid, amount)
-    }
-
-    pub fn submit_data_report(
-        ctx: Context<SubmitDataReport>, 
-        txid: String, 
-        txid_status_str: String, 
-        pastel_ticket_type_str: String, 
-        first_6_characters_hash: String, 
-        contributor_reward_address: Pubkey
+    pub fn submit_price_quote_wrapper(
+        ctx: Context<SubmitPriceQuote>,
+        service_request_id_string: String,
+        bridge_node_pastel_id: Pubkey,
+        quoted_price_lamports: u64,
     ) -> ProgramResult {
-        msg!("In `submit_data_report` function -- Params: txid={}, txid_status_str={}, pastel_ticket_type_str={}, first_6_chars_hash={}, contributor_addr={}",
-            txid, txid_status_str, pastel_ticket_type_str, first_6_characters_hash, contributor_reward_address);
-    
-        // Conversion logic remains the same
-        let txid_status = match txid_status_str.as_str() {
-            "Invalid" => TxidStatus::Invalid,
-            "PendingMining" => TxidStatus::PendingMining,
-            "MinedPendingActivation" => TxidStatus::MinedPendingActivation,
-            "MinedActivated" => TxidStatus::MinedActivated,
-            _ => return Err(ProgramError::from(BridgeError::InvalidTxidStatus))
-        };
-    
-        let pastel_ticket_type = match pastel_ticket_type_str.as_str() {
-            "Sense" => PastelTicketType::Sense,
-            "Cascade" => PastelTicketType::Cascade,
-            "Nft" => PastelTicketType::Nft,
-            "InferenceApi" => PastelTicketType::InferenceApi,
-            _ => return Err(ProgramError::from(BridgeError::InvalidPastelTicketType))
-        };
-    
-        let timestamp = Clock::get()?.unix_timestamp as u64;
-    
-        let report = PastelTxStatusReport {
-            txid: txid.clone(),
-            txid_status,
-            pastel_ticket_type: Some(pastel_ticket_type),
-            first_6_characters_of_sha3_256_hash_of_corresponding_file: Some(first_6_characters_hash),
-            timestamp,
-            contributor_reward_address,
-        };
-    
-        submit_data_report_helper(ctx, txid, report, contributor_reward_address)
+        SubmitPriceQuote::submit_price_quote(
+            ctx,
+            service_request_id_string,
+            bridge_node_pastel_id,
+            quoted_price_lamports
+        )
     }
     
     pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
         request_reward_helper(ctx, contributor_address)
     }
 
-    pub fn set_bridge_contract(ctx: Context<SetBridgeContract>, bridge_contract_pubkey: Pubkey) -> Result<()> {
-        SetBridgeContract::set_bridge_contract(ctx, bridge_contract_pubkey)
+    pub fn set_oracle_contract(ctx: Context<SetOracleContract>, oracle_contract_pubkey: Pubkey) -> Result<()> {
+        SetOracleContract::set_oracle_contract(ctx, oracle_contract_pubkey)
     }
 
-    pub fn withdraw_funds(ctx: Context<WithdrawFunds>, reward_pool_amount: u64, fee_receiving_amount: u64) -> Result<()> {
-        WithdrawFunds::execute(ctx, reward_pool_amount, fee_receiving_amount)
+    pub fn withdraw_funds(
+        ctx: Context<WithdrawFunds>, 
+        reward_pool_amount: u64, 
+        fee_receiving_amount: u64,
+        escrow_amount: u64,
+        bridge_nodes_data_amount: u64,
+        temp_service_requests_data_amount: u64,
+        aggregated_consensus_data_amount: u64,
+        service_request_txid_mapping_data_amount: u64
+    ) -> Result<()> {
+        WithdrawFunds::execute(
+            ctx, 
+            reward_pool_amount, 
+            fee_receiving_amount,
+            escrow_amount,
+            bridge_nodes_data_amount,
+            temp_service_requests_data_amount,
+            aggregated_consensus_data_amount,
+            service_request_txid_mapping_data_amount
+        )
     }
 
 }
