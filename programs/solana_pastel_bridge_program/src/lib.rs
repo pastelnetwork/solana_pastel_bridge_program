@@ -80,7 +80,7 @@ pub enum BridgeError {
     InvalidBridgeNodeResponse,
 
     #[msg("Issues or failures in interacting with the oracle contract")]
-    OracleError,
+    BridgeError,
 
     #[msg("Bridge node fails to meet the minimum reliability score")]
     ReliabilityScoreViolation,
@@ -103,6 +103,9 @@ pub enum BridgeError {
     #[msg("Invalid or unrecognized Pastel transaction ID")]
     InvalidTxidStatus,
 
+    #[msg("Duplicate service request ID")]
+    DuplicateServiceRequestId,
+
     #[msg("Contract is paused and no operations are allowed")]
     ContractPaused,
 }
@@ -113,17 +116,6 @@ impl From<BridgeError> for ProgramError {
     }
 }
 
-pub fn create_seed(seed_preamble: &str, txid: &str, reward_address: &Pubkey) -> Hash {
-    // Concatenate the string representations. Reward address is Base58-encoded by default.
-    let preimage_string = format!("{}{}{}", seed_preamble, txid, reward_address);
-    // msg!("create_seed: generated preimage string: {}", preimage_string);
-    // Convert the concatenated string to bytes
-    let preimage_bytes = preimage_string.as_bytes();
-    // Compute hash
-    let seed_hash = hash(preimage_bytes);
-    // msg!("create_seed: generated seed hash: {:?}", seed_hash);
-    seed_hash
-}
 
 // Enums:
 
@@ -144,6 +136,15 @@ pub enum PastelTicketType {
     InferenceApi,
 }
 
+// This tracks the status of price quotes submitted by bridge nodes for service requests.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
+pub enum ServicePriceQuoteStatus {
+    Submitted,
+    RejectedAsInvalid,
+    RejectedAsTooHigh,
+    Accepted
+}
+
 // This tracks the status of Solana payments for service requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum PaymentStatus {
@@ -158,6 +159,21 @@ pub enum EmergencyAction {
     ResumeOperations, // Resume all contract operations.
     ModifyParameters { key: String, value: String }, // Modify certain operational parameters.
     // Additional emergency actions as needed...
+}
+
+// These are the various states that a service request can assume during its lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
+pub enum RequestStatus {
+    Pending, // The request has been created and is awaiting further action.
+    AwaitingPayment, // The request is waiting for SOL payment from the user.
+    PaymentReceived, // Payment for the request has been received and is held in escrow.
+    BridgeNodeSelected, // A bridge node has been selected to fulfill the service request.
+    InProgress, // The service is currently being rendered by the selected bridge node.
+    AwaitingCompletionConfirmation, // The service has been completed and is awaiting confirmation from the oracle.
+    Completed, // The service has been successfully completed and confirmed.
+    Failed, // The service request has failed or encountered an error.
+    Expired, // The request has expired due to inactivity or non-fulfillment.
+    Refunded, // Indicates that the request has been refunded to the user.
 }
 
 // The nodes that perform the service requests on behalf of the end users are called bridge nodes.
@@ -195,55 +211,39 @@ pub struct BridgeNode {
 // The bridge node's scores are then updated based on the outcome of the service request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServiceRequest {
-    pub request_id: String, // Unique identifier (UUID) for the service request.
+    pub service_request_id: [u8; 32], // Unique identifier for the service request; SHA256 hash of (service_type_as_str + first_6_characters_of_sha3_256_hash_of_corresponding_file + user_sol_address) expressed as a 32-byte array.
     pub service_type: PastelTicketType, // Type of service requested (e.g., Sense, Cascade, Nft).
-    pub file_hash: String, // SHA3-256 hash of the file involved in the service request.
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String, // First 6 characters of the SHA3-256 hash of the file involved in the service request.
     pub ipfs_cid: String, // IPFS Content Identifier for the file.
     pub file_size_bytes: u64, // Size of the file in bytes.
-    pub file_mime_type: String, // MIME type of the file (e.g., 'image/jpeg', 'application/pdf').
-    pub user_sol_address: Pubkey, // Solana address of the user who initiated the service request.
-    pub sol_received_from_user_timestamp: Option<u64>, // Timestamp when SOL payment is received from the end user.
-    pub selected_bridge_node_pastelid: String, // The Pastel ID of the bridge node selected to fulfill the service request.
-    pub quoted_price_in_lamports: u64, // Price quoted for the service in lamports.
+    pub user_sol_address: Pubkey, // Solana address of the end user who initiated the service request.
     pub status: RequestStatus, // Current status of the service request.
-    pub creation_timestamp: u64, // Timestamp when the service request was created.
-    pub selection_timestamp: Option<u64>, // Timestamp when a bridge node was selected for the service.
-    pub completion_timestamp: Option<u64>, // Timestamp when the service was completed.
-    pub request_expiry: u64, // Timestamp when the service request expires.
     pub payment_in_escrow: bool, // Indicates if the payment for the service is currently in escrow.
-    pub escrow_amount_sol: u64, // Amount of SOL held in escrow for this service request.
+    pub request_expiry: u64, // Timestamp when the service request expires.
+    pub sol_received_from_user_timestamp: Option<u64>, // Timestamp when SOL payment is received from the end user for the service request to be held in escrow.
+    pub selected_bridge_node_pastelid: Option<String>, // The Pastel ID of the bridge node selected to fulfill the service request.
+    pub best_quoted_price_in_lamports: Option<u64>, // Price quoted for the service in lamports.
+    pub service_request_creation_timestamp: u64, // Timestamp when the service request was created.
+    pub bridge_node_selection_timestamp: Option<u64>, // Timestamp when a bridge node was selected for the service.
+    pub bridge_node_submission_of_txid_timestamp: Option<u64>, // Timestamp when the bridge node submitted the Pastel transaction ID for the service request.
+    pub submission_of_txid_to_oracle_timestamp: Option<u64>, // Timestamp when the Pastel transaction ID was submitted by the bridge contract to the oracle contract for monitoring.
+    pub service_request_completion_timestamp: Option<u64>, // Timestamp when the service was completed.
     pub payment_received_timestamp: Option<u64>, // Timestamp when the payment was received into escrow.
     pub payment_release_timestamp: Option<u64>, // Timestamp when the payment was released from escrow, if applicable.    
-    pub pastel_txid: String, // The Pastel transaction ID for the service request once it is created.
-}
-
-// These are the various states that a service request can assume during its lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
-pub enum RequestStatus {
-    Pending, // The request has been created and is awaiting further action.
-    AwaitingPayment, // The request is waiting for SOL payment from the user.
-    PaymentReceived, // Payment for the request has been received and is held in escrow.
-    BridgeNodeSelected, // A bridge node has been selected to fulfill the service request.
-    InProgress, // The service is currently being rendered by the selected bridge node.
-    AwaitingCompletionConfirmation, // The service has been completed and is awaiting confirmation from the oracle.
-    Completed, // The service has been successfully completed and confirmed.
-    Failed, // The service request has failed or encountered an error.
-    Expired, // The request has expired due to inactivity or non-fulfillment.
-    Refunded, // Indicates that the request has been refunded to the user.
+    pub escrow_amount_lamports: Option<u64>, // Amount of SOL held in escrow for this service request.
+    pub service_fee_retained_by_bridge_contract_lamports: Option<u64>, // Amount of SOL retained by the bridge contract as a service fee, taken from the escrowed amount when the service request is completed.
+    pub service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: Option<u64>, // Amount of SOL remitted to the oracle contract by the bridge contract as a service fee, taken from the escrowed amount when the service request is completed.
+    pub pastel_txid: Option<String>, // The Pastel transaction ID for the service request once it is created.
 }
 
 // This holds the information for an individual price quote from a given bridge node for a particular service request.
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize, Copy)]
 pub struct ServicePriceQuote {
-    pub service_request_id: u64,
+    pub service_request_id: [u8; 32],
     pub bridge_node_pastel_id: Pubkey,
     pub quoted_price_lamports: u64,
     pub quote_timestamp: u64,
-}
-
-#[account]
-pub struct ServicePriceQuoteAccount {
-    pub service_price_quotes: Vec<ServicePriceQuote>,
+    pub price_quote_status: ServicePriceQuoteStatus,
 }
 
 // Struct to hold final consensus of the txid's status from the oracle contract
@@ -252,180 +252,296 @@ pub struct AggregatedConsensusData {
     pub txid: String,
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
     pub hash_weights: Vec<HashWeight>,
-    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: Option<String>,
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
     pub last_updated: u64, // Unix timestamp indicating the last update time
 }
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
-pub struct TxidSubmissionCount {
-    pub txid: String,
-    pub count: u32,
-    pub last_updated: u64,
+pub struct ServiceRequestTxidMapping {
+    pub service_request_id: [u8; 32],
+    pub pastel_txid: String,
 }
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct PendingPayment {
-    pub txid: String,
-    pub expected_amount: u64,
-    pub payment_status: PaymentStatus,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct TransactionLog {
-    pub log_id: String, // Unique identifier for this log entry.
-    pub service_request_id: String, // Associated service request ID for this transaction.
-    pub transaction_details: String, // Description or details of the transaction.
-    pub log_timestamp: u64, // Timestamp when the transaction was logged.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct OracleInteraction {
-    pub service_request_id: String, // Identifier for the service request related to this oracle interaction.
-    pub oracle_data_points: Vec<String>, // Data points or queries sent to the oracle.
-    pub oracle_response: Option<String>, // Response received from the oracle, if any.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct UserInteraction {
-    pub user_sol_address: Pubkey, // Solana address of the user involved in these interactions.
-    pub service_requests: Vec<String>, // List of service request IDs that the user has interacted with.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct ServiceRequestQueue {
-    pub queue_id: String, // A unique identifier to distinguish this specific queue.
-    pub requests: Vec<String>, // Stores a list of service request IDs awaiting processing.
-    pub max_size: u32, // Defines the capacity limit of the queue to prevent overload.
-    pub current_size: u32, // Tracks the current number of requests in the queue, ensuring it doesn't exceed max_size.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct TransactionFeeDistributionLog {
-    pub log_id: String, // Unique ID for this log entry, enabling easy tracking and retrieval.
-    pub service_request_id: String, // Links the log to a specific service request for auditing and tracking purposes.
-    pub total_fee: u64, // Represents the total fee in lamports charged for the transaction.
-    pub oracle_fee: u64, // The portion of the fee allocated to the oracle contract for its services.
-    pub bridge_node_fee: u64, // The fee portion received by the bridge node for fulfilling the service request.
-    pub timestamp: u64, // The exact time when the transaction occurred, crucial for record-keeping.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct ServiceRequestMetrics {
-    pub total_requests: u32, // Aggregate count of all service requests handled by the contract.
-    pub successful_requests: u32, // Tally of requests that were successfully completed.
-    pub failed_requests: u32, // Count of requests that could not be completed successfully.
-    pub average_response_time: f32, // Calculated mean response time for all requests, indicating efficiency.
-    pub user_satisfaction_rating: f32, // An aggregated score reflecting users' satisfaction with the service.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct BridgeNodePerformanceMetrics {
-    pub pastel_id: String, // The unique identifier of the bridge node in the Pastel network.
-    pub services_rendered: u32, // Total count of services provided by this bridge node.
-    pub successful_services: u32, // Number of services rendered successfully by this node.
-    pub failed_services: u32, // Count of services this node attempted but failed to render successfully.
-    pub average_service_time: f32, // The average time taken by this node to render a service.
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct AuditReport {
-    pub report_id: String, // A unique identifier for the audit report.
-    pub generated_timestamp: u64, // Timestamp when the report was generated.
-    pub total_bridge_nodes: u32, // Total number of registered bridge nodes.
-    pub active_bridge_nodes: u32, // Number of bridge nodes currently active.
-    pub inactive_bridge_nodes: u32, // Number of bridge nodes currently inactive.
-    pub total_service_requests: u32, // Total number of service requests processed.
-    pub successful_service_requests: u32, // Number of successfully completed service requests.
-    pub failed_service_requests: u32, // Number of service requests that failed.
-    pub pending_service_requests: u32, // Number of service requests that are still pending.
-    pub total_escrowed_amount: u64, // Total amount of SOL currently held in escrow across all service requests.
-    pub total_transaction_fees: u64, // Total transaction fees collected by the contract.
-    pub total_rewards_distributed: u64, // Total amount of rewards distributed to bridge nodes and oracles.
-    pub oracle_interaction_summary: OracleInteractionSummary, // Summary of interactions with the oracle contract.
-    pub bridge_node_performance_summary: Vec<BridgeNodePerformanceMetrics>, // Performance metrics for each bridge node.
-    pub recent_transaction_logs: Vec<TransactionLog>, // Recent transaction logs for audit purposes.
-    // Additional fields can be added as necessary for more detailed insights.
-}
-
-
-#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
-pub struct OracleInteractionSummary {
-    pub total_interactions: u32, // Total number of interactions with the oracle.
-    pub successful_interactions: u32, // Count of successful oracle interactions.
-    pub failed_interactions: u32, // Count of failed oracle interactions.
-    // Additional fields as needed.
-}
-
 
 #[account]
 pub struct BridgeContractState {
     pub is_initialized: bool,
     pub is_paused: bool,
     pub admin_pubkey: Pubkey,
-    pub reward_pool_account_pubkey: Pubkey,
-    pub escrow_account_pubkey: Pubkey,
     pub oracle_contract_pubkey: Pubkey,    
-    pub registered_bridge_nodes_pda: Pubkey,
-    pub active_service_requests_pda: Pubkey,
-    pub service_request_queue_pda: Pubkey,
-    pub aggregated_consensus_data_pda: Pubkey,    
-    pub transaction_fee_log_pda: Pubkey,
-    pub oracle_interactions_pda: Pubkey,
-    pub user_interactions_pda: Pubkey,
-    pub bridge_node_performance_pda: Pubkey,
-    pub service_request_metrics_pda: Pubkey,
-    pub transaction_logs_pda: Pubkey,
-    pub last_expired_escrow_check_time: u64,
+    pub oracle_fee_receiving_account_pubkey: Pubkey,
+    pub bridge_reward_pool_account_pda: Pubkey,
+    pub bridge_escrow_account_pda: Pubkey,
+    pub bridge_nodes_data_pda: Pubkey,
+    pub service_requests_data_pda: Pubkey,
+    pub service_price_quotes_data_pda: Pubkey,
+    pub aggregated_consensus_data_pda: Pubkey,
+    pub service_request_txid_mapping_account_pda: Pubkey,
 }
 
-
+// PDA that distributes rewards to bridge nodes for fulfilling service requests successfully
 #[account]
-pub struct RewardPool {
+pub struct BridgeRewardPoolAccount {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
 }
 
+// PDA that acts as a temporary escrow account for holding SOL while service requests are being processed
 #[account]
-pub struct FeeReceivingContract {
+pub struct BridgeEscrowAccount {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
 }
 
+// PDA to hold the list of bridge nodes and their details
 #[account]
-pub struct PastelTxStatusReportAccount {
-    pub report: PastelTxStatusReport,
+pub struct BridgeNodesDataAccount {
+    pub bridge_nodes: Vec<BridgeNode>,
 }
 
+// PDA to hold the corresponding txid for each service request id
+#[account]
+pub struct ServiceRequestTxidMappingDataAccount {
+    pub mappings: Vec<ServiceRequestTxidMapping>,
+}
+
+// Temporary account to hold service requests while they are being processed; these are cleared out after completion or expiration.
+#[account]
+pub struct TempServiceRequestsDataAccount {
+    pub service_requests: Vec<ServiceRequest>,
+}
+
+// Temporary account to hold price quotes while they are being processed; these are cleared out after completion or expiration.
+#[account]
+pub struct TempServicePriceQuotesDataAccount {
+    pub service_price_quotes: Vec<ServicePriceQuote>,
+}
+
+// Account to hold the aggregated consensus data about the status of service request TXIDs from the oracle contract; this is cleared out periodically.
+#[account]
+pub struct AggregatedConsensusDataAccount {
+    pub consensus_data: Vec<AggregatedConsensusData>,
+}
+
+// Main bridge contract state account that holds all the data for the bridge contract
 #[derive(Accounts)]
-#[instruction(txid: String, reward_address: Pubkey)]
-pub struct SubmitServiceRequestAccount<'info> {
-    #[account(
-        init_if_needed,
-        payer = user,
-        seeds = [create_seed("pastel_tx_status_report", &txid, &user.key()).as_ref()],
-        bump,
-        space = 8 + (64 + 1 + 2 + 7 + 8 + 32 + 128) // Discriminator +  txid String (max length of 64) + txid_status + pastel_ticket_type + first_6_characters_of_sha3_256_hash_of_corresponding_file + timestamp + contributor_reward_address + cushion
-    )]
-    pub report_account: Account<'info, PastelTxStatusReportAccount>,
-
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
+#[instruction(admin_pubkey: Pubkey)]
+pub struct Initialize<'info> {
+    #[account(init, payer = user, space = 10_240)] // Adjusted space
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
 
     #[account(mut)]
     pub user: Signer<'info>,
+
+    #[account(init, seeds = [b"bridge_reward_pool_account"], bump, payer = user, space = 1024)]
+    pub reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
+
+    #[account(init, seeds = [b"bridge_escrow_account"], bump, payer = user, space = 1024)]
+    pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
+
+    #[account(init, seeds = [b"bridge_nodes_data"], bump, payer = user, space = 10_240)]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+
+    #[account(init, seeds = [b"temp_service_requests_data"], bump, payer = user, space = 10_240)]
+    pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
+
+    #[account(init, seeds = [b"temp_service_price_quotes_data"], bump, payer = user, space = 10_240)]
+    pub temp_service_price_quotes_data_account: Account<'info, TempServicePriceQuotesDataAccount>,
+
+    #[account(init, seeds = [b"aggregated_consensus_data"], bump, payer = user, space = 10_240)]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+
+    #[account(init, seeds = [b"service_request_txid_mapping_data"], bump, payer = user, space = 10_240)]
+    pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
+
+    // System program is needed for account creation
+    pub system_program: Program<'info, System>,    
+}
+
+impl<'info> Initialize<'info> {
+    pub fn initialize_oracle_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
+        msg!("Setting up Oracle Contract State");
+
+        let state = &mut self.oracle_contract_state;
+        // Ensure the oracle_contract_state is not already initialized
+        if state.is_initialized {
+            return Err(BridgeError::AccountAlreadyInitialized.into());
+        }
+        state.is_initialized = true;
+        state.is_paused = false;
+        state.admin_pubkey = admin_pubkey;
+        msg!("Admin Pubkey set to: {:?}", admin_pubkey);
+
+
+        // Link to necessary PDAs
+        state.oracle_contract_pubkey = self.oracle_contract_state.key();
+        state.oracle_fee_receiving_account_pubkey = self.oracle_fee_receiving_account.key();
+        state.bridge_reward_pool_account_pda = self.reward_pool_account.key();
+        state.bridge_escrow_account_pda = self.escrow_account.key();
+        state.bridge_nodes_data_pda = self.bridge_nodes_data_account.key();
+        state.temp_service_requests_data_account = self.temp_service_requests_data_account.key();
+        state.temp_service_price_quotes_data_account = self.temp_service_price_quotes_data_account.key();
+        state.aggregated_consensus_data_pda = self.aggregated_consensus_data_account.key();
+
+        // Initialize bridge nodes data PDA
+        let bridge_nodes_data_account = &mut self.bridge_nodes_data_account;
+        bridge_nodes_data_account.bridge_nodes = Vec::new();
+
+        // Initialize temporary service requests data PDA
+        let temp_service_requests_data_account = &mut self.temp_service_requests_data_account;
+        temp_service_requests_data_account.service_requests = Vec::new();
+
+        // Initialize temporary service price quotes data PDA
+        let temp_service_price_quotes_data_account = &mut self.temp_service_price_quotes_data_account;
+        temp_service_price_quotes_data_account.service_price_quotes = Vec::new();
+
+        // Initialize aggregated consensus data PDA
+        let aggregated_consensus_data_account = &mut self.aggregated_consensus_data_account;
+        aggregated_consensus_data_account.consensus_data = Vec::new();
+
+        // Initialize service request TXID mapping data PDA
+        let service_request_txid_mapping_data_account = &mut self.service_request_txid_mapping_data_account;
+        service_request_txid_mapping_data_account.mappings = Vec::new();
     
-    #[account(mut, seeds = [b"temp_tx_status_report"], bump)]
-    pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
+        msg!("Oracle Contract State Initialization Complete");
+        Ok(())
+    }
+}
 
-    #[account(mut, seeds = [b"contributor_data"], bump)]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,
 
-    #[account(mut, seeds = [b"txid_submission_counts"], bump)]
-    pub txid_submission_counts_account: Account<'info, TxidSubmissionCountsAccount>,
+// Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
+pub fn generate_service_request_id(
+    pastel_ticket_type_string: &String,
+    first_6_chars_of_hash: &String,
+    user_sol_address: &Pubkey,
+) -> [u8; 32] {
+    let user_sol_address_str = user_sol_address.to_string();
+    let concatenated_str = format!(
+        "{}{}{}",
+        pastel_ticket_type_string,
+        first_6_chars_of_hash,
+        user_sol_address_str,
+    );
+
+    // Log the concatenated string
+    msg!("Concatenated string for service_request_id: {}", concatenated_str);
+
+    let hash_result: Hash = hash(concatenated_str.as_bytes());
+    let service_request_id = hash_result.to_bytes();
+
+    // Manually convert hash to hexadecimal string
+    let hex_string: String = service_request_id.iter().map(|byte| format!("{:02x}", byte)).collect();
+    msg!("Generated service_request_id (hex): {}", hex_string);
+
+    service_request_id
+}
+
+// Operational accounts for the bridge contract for handling submissions of service requests from end users and price quotes and service request updates from bridge nodes:
+
+#[account]
+pub struct ServiceRequestSubmissionAccount {
+    pub service_request: ServiceRequest,
+}
+
+// Operational PDA to receive service requests from end users
+#[derive(Accounts)]
+#[instruction(pastel_ticket_type_string: String, first_6_chars_of_hash: String)]
+pub struct SubmitServiceRequest<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        seeds = [generate_service_request_id(
+            &pastel_ticket_type_string, // Pass references directly
+            &first_6_chars_of_hash,
+            &user.key()
+        ).as_ref()],
+        bump,
+        space = 8 + std::mem::size_of::<ServiceRequest>()
+    )]
+    pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
+
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(mut, seeds = [b"temp_service_requests_data"], bump)]
+    pub temp_service_request_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
     #[account(mut, seeds = [b"aggregated_consensus_data"], bump)]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
     pub system_program: Program<'info, System>,
+
+    // Instruction arguments
+    pub pastel_ticket_type_string: String,
+    pub first_6_chars_of_hash: String,
 }
+
+impl<'info> SubmitServiceRequest<'info> {
+    pub fn submit_service_request(ctx: Context<SubmitServiceRequest>, ipfs_cid: String, file_size_bytes: u64) -> ProgramResult {
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+
+        // Convert the pastel_ticket_type_string to PastelTicketType enum
+        let service_type: PastelTicketType = match ctx.accounts.pastel_ticket_type_string.as_str() {
+            "Sense" => PastelTicketType::Sense,
+            "Cascade" => PastelTicketType::Cascade,
+            "Nft" => PastelTicketType::Nft,
+            "InferenceApi" => PastelTicketType::InferenceApi,
+            _ => return Err(ProgramError::InvalidArgument),
+        };
+
+        // Generate the service_request_id
+        let service_request_id = generate_service_request_id(
+            &ctx.accounts.pastel_ticket_type_string,
+            &ctx.accounts.first_6_chars_of_hash,
+            &ctx.accounts.user.key(),
+        );
+
+        // Check if a service request with the same ID already exists
+        let existing_request = ctx.accounts.temp_service_request_data_account
+            .service_requests
+            .iter()
+            .find(|request| request.service_request_id == service_request_id);
+
+        if existing_request.is_some() {
+            // Reject the request if a duplicate ID is found
+            return Err(BridgeError::DuplicateServiceRequestId.into());
+        }        
+
+        // Create or update the ServiceRequest struct
+        let mut service_request_account = &mut ctx.accounts.service_request_submission_account;
+        service_request_account.service_request = ServiceRequest {
+            service_request_id,
+            service_type,
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: ctx.accounts.first_6_chars_of_hash.clone(),
+            ipfs_cid,
+            file_size_bytes,
+            user_sol_address: *ctx.accounts.user.key,
+            status: RequestStatus::Pending,
+            payment_in_escrow: false,
+            request_expiry: 0, // Set appropriate expiry timestamp
+            sol_received_from_user_timestamp: None,
+            selected_bridge_node_pastelid: None,
+            best_quoted_price_in_lamports: None,
+            service_request_creation_timestamp: current_timestamp,
+            bridge_node_selection_timestamp: None,
+            bridge_node_submission_of_txid_timestamp: None,
+            submission_of_txid_to_oracle_timestamp: None,
+            service_request_completion_timestamp: None,
+            payment_received_timestamp: None,
+            payment_release_timestamp: None,
+            escrow_amount_lamports: None,
+            service_fee_retained_by_bridge_contract_lamports: None,
+            service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: None,
+            pastel_txid: None,
+        };
+
+        // Update other state as necessary (e.g., temp_service_request_data_account)
+        // ...
+
+        Ok(())
+    }
+}
+
 
 
 #[derive(Accounts)]
@@ -790,7 +906,7 @@ pub fn submit_data_report_helper(
     // Check if the number of submissions is already at or exceeds MIN_NUMBER_OF_ORACLES
     if txid_submission_count >= MIN_NUMBER_OF_ORACLES {
         msg!("Enough reports have already been submitted for this txid");
-        return Err(OracleError::EnoughReportsSubmittedForTxid.into());
+        return Err(BridgeError::EnoughReportsSubmittedForTxid.into());
     }    
 
     // Validate the data report before any contributor-specific checks
@@ -802,10 +918,10 @@ pub fn submit_data_report_helper(
     let contributor = contributor_data_account.contributors
         .iter()
         .find(|c| c.reward_address == contributor_reward_address)
-        .ok_or(OracleError::ContributorNotRegistered)?;
+        .ok_or(BridgeError::ContributorNotRegistered)?;
 
     if contributor.calculate_is_banned(Clock::get()?.unix_timestamp as u64) {
-        return Err(OracleError::ContributorBanned.into());
+        return Err(BridgeError::ContributorBanned.into());
     }
 
     // Clone the String before using it
@@ -920,12 +1036,12 @@ pub fn add_pending_payment_helper(
 
     // Ensure the account is being initialized for the first time to avoid re-initialization
     if !pending_payment_account.pending_payment.txid.is_empty() && pending_payment_account.pending_payment.txid != txid {
-        return Err(OracleError::PendingPaymentAlreadyInitialized.into());
+        return Err(BridgeError::PendingPaymentAlreadyInitialized.into());
     }
 
     // Ensure txid is correct and other fields are properly set
     if pending_payment.txid != txid {
-        return Err(OracleError::InvalidTxid.into());
+        return Err(BridgeError::InvalidTxid.into());
     }
 
     // Store the pending payment in the account
@@ -950,179 +1066,6 @@ pub struct BridgeNodeDataAccount {
 pub struct TxidSubmissionCountsAccount {
     pub submission_counts: Vec<TxidSubmissionCount>,
 }
-
-#[account]
-pub struct AggregatedConsensusDataAccount {
-    pub consensus_data: Vec<AggregatedConsensusData>,
-}
-
-
-
-#[derive(Accounts)]
-#[instruction(admin_pubkey: Pubkey)]
-pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 10_240)] // Adjusted space
-    pub bridge_contract_state: Account<'info, BridgeContractState>,
-
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    #[account(
-        init,
-        seeds = [b"reward_pool"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub reward_pool_account: Account<'info, RewardPool>,
-
-    #[account(
-        init,
-        seeds = [b"temp_tx_status_report"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub temp_report_account: Account<'info, TempTxStatusReportAccount>,
-
-    #[account(
-        init,
-        seeds = [b"contributor_data"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,
-
-    #[account(
-        init,
-        seeds = [b"registered_bridge_nodes"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub registered_bridge_nodes_account: Account<'info, TxidSubmissionCountsAccount>,
-
-    #[account(
-        init,
-        seeds = [b"active_service_requests"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub active_service_requests_account: Account<'info, ActiveServiceRequestsAccount>,
-
-    #[account(
-        init,
-        seeds = [b"service_request_queue"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub service_request_queue_account: Account<'info, ServiceRequestQueueAccount>,
-
-    #[account(
-        init,
-        seeds = [b"aggregated_consensus_data"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
-
-    #[account(
-        init,
-        seeds = [b"transaction_fee_log"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub transaction_fee_log_account: Account<'info, TransactionFeeLogAccount>,
-
-    #[account(
-        init,
-        seeds = [b"oracle_interactions"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub oracle_interactions_account: Account<'info, OracleInteractionsAccount>,
-
-    #[account(
-        init,
-        seeds = [b"user_interactions"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub user_interactions_account: Account<'info, UserInteractionsAccount>,
-
-    #[account(
-        init,
-        seeds = [b"bridge_node_performance"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub bridge_node_performance_account: Account<'info, BridgeNodePerformanceAccount>,
-
-    #[account(
-        init,
-        seeds = [b"service_request_metrics"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub service_request_metrics_account: Account<'info, ServiceRequestMetricsAccount>,
-
-    #[account(
-        init,
-        seeds = [b"transaction_logs"],
-        bump,
-        payer = user,
-        space = 10_240
-    )]
-    pub transaction_logs_account: Account<'info, TransactionLogsAccount>,
-
-
-    // System program is needed for account creation
-    pub system_program: Program<'info, System>,    
-}
-
-impl<'info> Initialize<'info> {
-    pub fn initialize_oracle_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
-        msg!("Setting up Oracle Contract State");
-
-        let state = &mut self.oracle_contract_state;
-        // Ensure the oracle_contract_state is not already initialized
-        if state.is_initialized {
-            return Err(OracleError::AccountAlreadyInitialized.into());
-        }
-
-        state.is_initialized = true;
-        state.admin_pubkey = admin_pubkey;
-        msg!("Admin Pubkey set to: {:?}", admin_pubkey);
-
-        // state.txid_submission_counts = Vec::new();
-        // msg!("Txid Submission Counts Vector initialized");
-
-        state.monitored_txids = Vec::new();
-        msg!("Monitored Txids Vector initialized");
-
-        // state.aggregated_consensus_data = Vec::new();
-        // msg!("Aggregated Consensus Data Vector initialized");
-
-        state.bridge_contract_pubkey = Pubkey::default();
-        msg!("Bridge Contract Pubkey set to default");
-
-        state.active_reliable_contributors_count = 0;
-        msg!("Active Reliable Contributors Count set to 0");
-
-        msg!("Oracle Contract State Initialization Complete");
-        Ok(())
-    }
-}
-
 
 #[derive(Accounts)]
 pub struct ReallocateOracleState<'info> {
@@ -1298,7 +1241,7 @@ pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: P
         }
     } else {
         msg!("Contributor not found: {}", contributor_address);
-        return Err(OracleError::UnregisteredOracle.into());
+        return Err(BridgeError::UnregisteredOracle.into());
     }
 
     // Handle reward transfer after determining eligibility
@@ -1311,7 +1254,7 @@ pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: P
     } else {
 
         msg!("Invalid Reward Request: Contributor: {}", contributor_address);
-        return Err(OracleError::NotEligibleForReward.into());
+        return Err(BridgeError::NotEligibleForReward.into());
     }
 
     Ok(())
@@ -1344,7 +1287,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
     // Check if the contributor is already registered
     if contributor_data_account.contributors.iter().any(|c| c.reward_address == *ctx.accounts.contributor_account.key) {
         msg!("Registration failed: Contributor already registered: {}", ctx.accounts.contributor_account.key);
-        return Err(OracleError::ContributorAlreadyRegistered.into());
+        return Err(BridgeError::ContributorAlreadyRegistered.into());
     }
 
     // Retrieve mutable references to the lamport balance
@@ -1356,7 +1299,7 @@ pub fn register_new_data_contributor_helper(ctx: Context<RegisterNewDataContribu
 
     // Check if the fee_receiving_contract_account received the registration fee
     if **fee_receiving_account_lamports < REGISTRATION_ENTRANCE_FEE_IN_LAMPORTS as u64 {
-        return Err(OracleError::RegistrationFeeNotPaid.into());
+        return Err(BridgeError::RegistrationFeeNotPaid.into());
     }
 
     msg!("Registration fee verified. Attempting to register new contributor {}", ctx.accounts.contributor_account.key);
@@ -1421,14 +1364,14 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     let state = &mut ctx.accounts.oracle_contract_state;
 
     if ctx.accounts.caller.key != &state.bridge_contract_pubkey {
-        return Err(OracleError::NotBridgeContractAddress.into());
+        return Err(BridgeError::NotBridgeContractAddress.into());
     }
 
     // Explicitly cast txid to String and ensure it meets requirements
     let txid = data.txid.clone();
     if txid.len() > MAX_TXID_LENGTH {
         msg!("TXID exceeds maximum length.");
-        return Err(OracleError::InvalidTxid.into());
+        return Err(BridgeError::InvalidTxid.into());
     }
 
     // Add the TXID to the monitored list
@@ -1505,25 +1448,25 @@ pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result
     // Direct return in case of invalid data, reducing nested if conditions
     if report.txid.trim().is_empty() {
         msg!("Error: InvalidTxid (TXID is empty)");
-        return Err(OracleError::InvalidTxid.into());
+        return Err(BridgeError::InvalidTxid.into());
     } 
     // Simplified TXID status validation
     if !matches!(report.txid_status, TxidStatus::MinedActivated | TxidStatus::MinedPendingActivation | TxidStatus::PendingMining | TxidStatus::Invalid) {
-        return Err(OracleError::InvalidTxidStatus.into());
+        return Err(BridgeError::InvalidTxidStatus.into());
     }
     // Direct return in case of missing data, reducing nested if conditions
     if report.pastel_ticket_type.is_none() {
         msg!("Error: Missing Pastel Ticket Type");
-        return Err(OracleError::MissingPastelTicketType.into());
+        return Err(BridgeError::MissingPastelTicketType.into());
     }
     // Direct return in case of invalid hash, reducing nested if conditions
     if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
         if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             msg!("Error: Invalid File Hash Length or Non-hex characters");
-            return Err(OracleError::InvalidFileHashLength.into());
+            return Err(BridgeError::InvalidFileHashLength.into());
         }
     } else {
-        return Err(OracleError::MissingFileHash.into());
+        return Err(BridgeError::MissingFileHash.into());
     }
     Ok(())
 }
@@ -1593,12 +1536,12 @@ pub fn process_payment_helper(
 
     // Ensure the payment corresponds to the provided txid
     if pending_payment_account.pending_payment.txid != txid {
-        return Err(OracleError::PaymentNotFound.into());
+        return Err(BridgeError::PaymentNotFound.into());
     }
 
     // Verify the payment amount matches the expected amount
     if pending_payment_account.pending_payment.expected_amount != amount {
-        return Err(OracleError::InvalidPaymentAmount.into());
+        return Err(BridgeError::InvalidPaymentAmount.into());
     }
 
     // Mark the payment as received
@@ -1612,7 +1555,7 @@ pub fn process_payment_helper(
 pub struct WithdrawFunds<'info> {
     #[account(
         mut,
-        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ OracleError::UnauthorizedWithdrawalAccount,
+        constraint = oracle_contract_state.admin_pubkey == *admin_account.key @ BridgeError::UnauthorizedWithdrawalAccount,
     )]
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
@@ -1629,7 +1572,7 @@ pub struct WithdrawFunds<'info> {
 impl<'info> WithdrawFunds<'info> {
     pub fn execute(ctx: Context<WithdrawFunds>, reward_pool_amount: u64, fee_receiving_amount: u64) -> Result<()> {
         if !ctx.accounts.admin_account.is_signer {
-            return Err(OracleError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account is a signer
+            return Err(BridgeError::UnauthorizedWithdrawalAccount.into()); // Check if the admin_account is a signer
         } 
         let admin_account = &mut ctx.accounts.admin_account;
         let reward_pool_account = &mut ctx.accounts.reward_pool_account;
@@ -1637,14 +1580,14 @@ impl<'info> WithdrawFunds<'info> {
 
         // Transfer SOL from the reward pool account to the admin account
         if **reward_pool_account.to_account_info().lamports.borrow() < reward_pool_amount {
-            return Err(OracleError::InsufficientFunds.into());
+            return Err(BridgeError::InsufficientFunds.into());
         }
         **reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_pool_amount;
         **admin_account.lamports.borrow_mut() += reward_pool_amount;
 
         // Transfer SOL from the fee receiving contract account to the admin account
         if **fee_receiving_contract_account.to_account_info().lamports.borrow() < fee_receiving_amount {
-            return Err(OracleError::InsufficientFunds.into());
+            return Err(BridgeError::InsufficientFunds.into());
         }
         **fee_receiving_contract_account.to_account_info().lamports.borrow_mut() -= fee_receiving_amount;
         **admin_account.lamports.borrow_mut() += fee_receiving_amount;
@@ -1691,13 +1634,13 @@ pub mod solana_pastel_bridge_program {
 
     pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, expected_amount_str: String, payment_status_str: String) -> Result<()> {
         let expected_amount = expected_amount_str.parse::<u64>()
-            .map_err(|_| OracleError::PendingPaymentInvalidAmount)?;
+            .map_err(|_| BridgeError::PendingPaymentInvalidAmount)?;
     
         // Convert the payment status from string to enum
         let payment_status = match payment_status_str.as_str() {
             "Pending" => PaymentStatus::Pending,
             "Received" => PaymentStatus::Received,
-            _ => return Err(OracleError::InvalidPaymentStatus.into()),
+            _ => return Err(BridgeError::InvalidPaymentStatus.into()),
         };
     
         let pending_payment = PendingPayment {
@@ -1732,7 +1675,7 @@ pub mod solana_pastel_bridge_program {
             "PendingMining" => TxidStatus::PendingMining,
             "MinedPendingActivation" => TxidStatus::MinedPendingActivation,
             "MinedActivated" => TxidStatus::MinedActivated,
-            _ => return Err(ProgramError::from(OracleError::InvalidTxidStatus))
+            _ => return Err(ProgramError::from(BridgeError::InvalidTxidStatus))
         };
     
         let pastel_ticket_type = match pastel_ticket_type_str.as_str() {
@@ -1740,7 +1683,7 @@ pub mod solana_pastel_bridge_program {
             "Cascade" => PastelTicketType::Cascade,
             "Nft" => PastelTicketType::Nft,
             "InferenceApi" => PastelTicketType::InferenceApi,
-            _ => return Err(ProgramError::from(OracleError::InvalidPastelTicketType))
+            _ => return Err(ProgramError::from(BridgeError::InvalidPastelTicketType))
         };
     
         let timestamp = Clock::get()?.unix_timestamp as u64;
