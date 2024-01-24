@@ -1,7 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program, web3, AnchorProvider, BN } from "@coral-xyz/anchor";
 import {
-  SolanaPasteBridgeProgram,
+  SolanaPastelBridgeProgram,
   IDL,
 } from "../target/types/solana_pastel_bridge_program";
 import { assert } from "chai";
@@ -16,7 +16,7 @@ anchor.setProvider(provider);
 const programID = new anchor.web3.PublicKey(
   "Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79"
 );
-const program = new Program<SolanaPasteBridgeProgram>(
+const program = new Program<SolanaPastelBridgeProgram>(
   IDL,
   programID,
   provider
