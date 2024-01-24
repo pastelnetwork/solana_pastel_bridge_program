@@ -267,7 +267,7 @@ pub enum RequestStatus {
 }
 
 // The nodes that perform the service requests on behalf of the end users are called bridge nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, AnchorSerialize, AnchorDeserialize)]
 pub struct BridgeNode {
     pub pastel_id: String, // The unique identifier of the bridge node in the Pastel network, used as the primary key throughout the bridge contract to identify the bridge node.
     pub reward_address: Pubkey, // The Solana address of the bridge node, used to send rewards to the bridge node.
@@ -301,7 +301,7 @@ pub struct BridgeNode {
 // The bridge node's scores are then updated based on the outcome of the service request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServiceRequest {
-    pub service_request_id: [u8; 32], // Unique identifier for the service request; SHA256 hash of (service_type_as_str + first_6_characters_of_sha3_256_hash_of_corresponding_file + user_sol_address) expressed as a 32-byte array.
+    pub service_request_id: String, // Unique identifier for the service request; SHA256 hash of (service_type_as_str + first_6_characters_of_sha3_256_hash_of_corresponding_file + user_sol_address) expressed as a 32-byte array.
     pub service_type: PastelTicketType, // Type of service requested (e.g., Sense, Cascade, Nft).
     pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String, // First 6 characters of the SHA3-256 hash of the file involved in the service request.
     pub ipfs_cid: String, // IPFS Content Identifier for the file.
@@ -327,9 +327,9 @@ pub struct ServiceRequest {
 }
 
 // This holds the information for an individual price quote from a given bridge node for a particular service request.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServicePriceQuote {
-    pub service_request_id: [u8; 32],
+    pub service_request_id: String,
     pub bridge_node_pastel_id: Pubkey,
     pub quoted_price_lamports: u64,
     pub quote_timestamp: u64,
@@ -337,7 +337,7 @@ pub struct ServicePriceQuote {
 }
 
 // Struct to hold final consensus of the txid's status from the oracle contract
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct AggregatedConsensusData {
     pub txid: String,
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
@@ -543,12 +543,13 @@ impl<'info> ReallocateBridgeState<'info> {
     }
 }
 
+
 // Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
 pub fn generate_service_request_id(
     pastel_ticket_type_string: &String,
     first_6_chars_of_hash: &String,
     user_sol_address: &Pubkey,
-) -> [u8; 32] {
+) -> String {
     let user_sol_address_str = user_sol_address.to_string();
     let concatenated_str = format!(
         "{}{}{}",
@@ -557,17 +558,19 @@ pub fn generate_service_request_id(
         user_sol_address_str,
     );
 
-    // Log the concatenated string
-    msg!("Concatenated string for service_request_id: {}", concatenated_str);
+    // Convert the concatenated string to bytes
+    let preimage_bytes = concatenated_str.as_bytes();
+    // Compute hash
+    let service_request_id_hash = hash(preimage_bytes);
+    
+    // Convert the first 20 bytes of Hash to a hex string
+    let service_request_id_truncated = &service_request_id_hash.to_bytes()[..20];
+    let hex_string: String = service_request_id_truncated.iter().map(|byte| format!("{:02x}", byte)).collect();
 
-    let hash_result: Hash = hash(concatenated_str.as_bytes());
-    let service_request_id = hash_result.to_bytes();
+    // Optional logging
+    msg!("Generated truncated service_request_id (hex): {}", hex_string);
 
-    // Manually convert hash to hexadecimal string
-    let hex_string: String = service_request_id.iter().map(|byte| format!("{:02x}", byte)).collect();
-    msg!("Generated service_request_id (hex): {}", hex_string);
-
-    service_request_id
+    hex_string
 }
 
 // Operational accounts for the bridge contract for handling submissions of service requests from end users and price quotes and service request updates from bridge nodes:
@@ -584,8 +587,8 @@ pub struct SubmitServiceRequest<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [b"service_request_data", generate_service_request_id(
-            &pastel_ticket_type_string, // Pass references directly
+        seeds = [b"svc_request", generate_service_request_id(
+            &pastel_ticket_type_string,
             &first_6_chars_of_hash,
             &user.key()
         ).as_ref()],
@@ -608,9 +611,6 @@ pub struct SubmitServiceRequest<'info> {
 
     pub system_program: Program<'info, System>,
 
-    // Instruction arguments
-    pub pastel_ticket_type_string: String,
-    pub first_6_chars_of_hash: String,
 }
 
 pub fn validate_service_request(request: &ServiceRequest) -> Result<()> {
@@ -667,80 +667,79 @@ pub fn validate_service_request(request: &ServiceRequest) -> Result<()> {
     Ok(())
 }
 
-impl<'info> SubmitServiceRequest<'info> {
-    pub fn submit_service_request(ctx: Context<SubmitServiceRequest>, ipfs_cid: String, file_size_bytes: u64) -> ProgramResult {
-        let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-        // Convert the pastel_ticket_type_string to PastelTicketType enum
-        let service_type: PastelTicketType = match ctx.accounts.pastel_ticket_type_string.as_str() {
-            "Sense" => PastelTicketType::Sense,
-            "Cascade" => PastelTicketType::Cascade,
-            "Nft" => PastelTicketType::Nft,
-            "InferenceApi" => PastelTicketType::InferenceApi,
-            _ => return Err(ProgramError::InvalidArgument),
-        };
+pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_ticket_type_string: String, first_6_chars_of_hash: String, ipfs_cid: String, file_size_bytes: u64) -> ProgramResult {
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-        // Generate the service_request_id
-        let service_request_id = generate_service_request_id(
-            &ctx.accounts.pastel_ticket_type_string,
-            &ctx.accounts.first_6_chars_of_hash,
-            &ctx.accounts.user.key(),
-        );
+    // Convert the pastel_ticket_type_string to PastelTicketType enum
+    let service_type: PastelTicketType = match pastel_ticket_type_string.as_str() {
+        "Sense" => PastelTicketType::Sense,
+        "Cascade" => PastelTicketType::Cascade,
+        "Nft" => PastelTicketType::Nft,
+        "InferenceApi" => PastelTicketType::InferenceApi,
+        _ => return Err(ProgramError::InvalidArgument),
+    };
 
-        // Determine the PDA for the service request
-        let (service_request_pda, _bump_seed) = Pubkey::find_program_address(
-            &[b"service_request_data", &service_request_id],
-            ctx.program_id,
-        );
+    // Generate the service_request_id
+    let service_request_id = generate_service_request_id(
+        &pastel_ticket_type_string,
+        &first_6_chars_of_hash,
+        &ctx.accounts.user.key(),
+    );
 
-        // Check if the PDA account already exists
-        match ctx.accounts.system_program.get_account_info(&service_request_pda) {
-            Ok(_) => {
-                // If the account exists, reject the submission
-                return Err(BridgeError::DuplicateServiceRequestId.into());
-            }
-            Err(_) => {
-                // If the account does not exist, continue processing
-            }
-        }        
+    // Determine the PDA for the service request
+    let (service_request_pda, _bump_seed) = Pubkey::find_program_address(
+        &[b"svc_request", &service_request_id],
+        ctx.program_id,
+    );
 
-        // Create or update the ServiceRequest struct
-        let mut service_request_account = &mut ctx.accounts.service_request_submission_account;
-        service_request_account.service_request = ServiceRequest {
-            service_request_id,
-            service_type,
-            first_6_characters_of_sha3_256_hash_of_corresponding_file: ctx.accounts.first_6_chars_of_hash.clone(),
-            ipfs_cid,
-            file_size_bytes,
-            user_sol_address: *ctx.accounts.user.key,
-            status: RequestStatus::Pending,
-            payment_in_escrow: false,
-            request_expiry: 0, // Set appropriate expiry timestamp
-            sol_received_from_user_timestamp: None,
-            selected_bridge_node_pastelid: None,
-            best_quoted_price_in_lamports: None,
-            service_request_creation_timestamp: current_timestamp,
-            bridge_node_selection_timestamp: None,
-            bridge_node_submission_of_txid_timestamp: None,
-            submission_of_txid_to_oracle_timestamp: None,
-            service_request_completion_timestamp: None,
-            payment_received_timestamp: None,
-            payment_release_timestamp: None,
-            escrow_amount_lamports: None,
-            service_fee_retained_by_bridge_contract_lamports: None,
-            service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: None,
-            pastel_txid: None,
-        };
+    // Check if the PDA account already exists
+    match ctx.accounts.system_program.get_account_info(&service_request_pda) {
+        Ok(_) => {
+            // If the account exists, reject the submission
+            return Err(BridgeError::DuplicateServiceRequestId.into());
+        }
+        Err(_) => {
+            // If the account does not exist, continue processing
+        }
+    }        
 
-        // Call validate_service_request function
-        validate_service_request(&service_request_account.service_request)?;        
+    // Create or update the ServiceRequest struct
+    let mut service_request_account = &mut ctx.accounts.service_request_submission_account;
+    service_request_account.service_request = ServiceRequest {
+        service_request_id,
+        service_type,
+        first_6_characters_of_sha3_256_hash_of_corresponding_file: first_6_chars_of_hash.clone(),
+        ipfs_cid,
+        file_size_bytes,
+        user_sol_address: *ctx.accounts.user.key,
+        status: RequestStatus::Pending,
+        payment_in_escrow: false,
+        request_expiry: 0, // Set appropriate expiry timestamp
+        sol_received_from_user_timestamp: None,
+        selected_bridge_node_pastelid: None,
+        best_quoted_price_in_lamports: None,
+        service_request_creation_timestamp: current_timestamp,
+        bridge_node_selection_timestamp: None,
+        bridge_node_submission_of_txid_timestamp: None,
+        submission_of_txid_to_oracle_timestamp: None,
+        service_request_completion_timestamp: None,
+        payment_received_timestamp: None,
+        payment_release_timestamp: None,
+        escrow_amount_lamports: None,
+        service_fee_retained_by_bridge_contract_lamports: None,
+        service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: None,
+        pastel_txid: None,
+    };
 
-        // Append the new service request to the temp_service_requests_data_account
-        let temp_service_requests_account = &mut ctx.accounts.temp_service_requests_data_account;
-        temp_service_requests_account.service_requests.push(service_request_account.service_request.clone());
+    // Call validate_service_request function
+    validate_service_request(&service_request_account.service_request)?;        
 
-        Ok(())
-    }
+    // Append the new service request to the temp_service_requests_data_account
+    let temp_service_requests_account = &mut ctx.accounts.temp_service_requests_data_account;
+    temp_service_requests_account.service_requests.push(service_request_account.service_request.clone());
+
+    Ok(())
 }
 
 #[account]
@@ -766,7 +765,7 @@ pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"price_quote", &hex_string_to_bytes(&service_request_id_string)?],
+        seeds = [b"px_quote", service_request_id],
         bump,
         space = 8 + std::mem::size_of::<ServicePriceQuote>()
     )]
@@ -781,9 +780,6 @@ pub struct SubmitPriceQuote<'info> {
     // System program for account creation
     pub system_program: Program<'info, System>,
 
-    // Instruction arguments
-    pub service_request_id_string: String,
-
     // Bridge Nodes Data Account
     #[account(mut)]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
@@ -791,11 +787,66 @@ pub struct SubmitPriceQuote<'info> {
     // Account to store the best price quote for a service request
     #[account(
         mut,
-        seeds = [b"best_price_quote", &hex_string_to_bytes(&service_request_id_string)?],
+        seeds = [b"bst_px_qt", service_request_id],
         bump
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
 }
+
+
+pub fn submit_price_quote(
+    ctx: Context<SubmitPriceQuote>,
+    service_request_id_string: String,
+    quoted_price_lamports: u64,
+) -> ProgramResult {
+    // Convert the hexadecimal string to bytes
+    let service_request_id = hex_string_to_bytes(&service_request_id_string);
+
+    // Obtain the current timestamp
+    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+
+    // Find the bridge node that is submitting the quote
+    let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
+        node.reward_address == ctx.accounts.user.key()
+    }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
+
+    // Validate the price quote before processing
+    validate_price_quote_submission(
+        &ctx.accounts.bridge_nodes_data_account, 
+        &ctx.accounts.temp_service_requests_data_account, 
+        &ctx.accounts.price_quote_submission_account, 
+        &service_request_id, 
+        &submitting_bridge_node.pastel_id, 
+        quoted_price_lamports, 
+        current_timestamp
+    )?;
+
+    // Update the total number of price quotes submitted by the bridge node
+    submitting_bridge_node.total_price_quotes_submitted += 1;
+
+    // Add the price quote to the price_quote_submission_account
+    let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
+    price_quote_account.price_quote = ServicePriceQuote {
+        service_request_id,
+        bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
+        quoted_price_lamports,
+        quote_timestamp: current_timestamp, // Use internally generated timestamp
+        price_quote_status: ServicePriceQuoteStatus::Submitted,
+    };
+
+    // Update best price quote if the new quote is better
+    let best_quote_account = &mut ctx.accounts.best_price_quote_account;
+    if best_quote_account.best_quote_selection_status == BestQuoteSelectionStatus::NoQuotesReceivedYet ||
+    quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
+        best_quote_account.best_bridge_node_pastel_id = submitting_bridge_node.pastel_id.clone();
+        best_quote_account.best_quoted_price_in_lamports = quoted_price_lamports;
+        best_quote_account.best_quote_timestamp = current_timestamp;
+        best_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::BestQuoteSelected;
+    }
+
+    Ok(())
+}
+
 
 pub fn validate_price_quote_submission(
     bridge_nodes_data_account: &BridgeNodesDataAccount, // Add this parameter
@@ -885,62 +936,6 @@ pub fn validate_price_quote_submission(
 }
 
 
-impl<'info> SubmitPriceQuote<'info> {
-    pub fn submit_price_quote(
-        ctx: Context<SubmitPriceQuote>,
-        service_request_id_string: String,
-        quoted_price_lamports: u64,
-    ) -> ProgramResult {
-        // Convert the hexadecimal string to bytes
-        let service_request_id = hex_string_to_bytes(&service_request_id_string)?;
-
-        // Obtain the current timestamp
-        let current_timestamp = Clock::get()?.unix_timestamp as u64;
-
-        // Find the bridge node that is submitting the quote
-        let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
-            node.reward_address == ctx.accounts.user.key()
-        }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
-
-        // Validate the price quote before processing
-        validate_price_quote_submission(
-            &ctx.accounts.bridge_nodes_data_account, 
-            &ctx.accounts.temp_service_requests_data_account, 
-            &ctx.accounts.price_quote_submission_account, 
-            &service_request_id, 
-            &submitting_bridge_node.pastel_id, 
-            quoted_price_lamports, 
-            current_timestamp
-        )?;
-
-        // Update the total number of price quotes submitted by the bridge node
-        submitting_bridge_node.total_price_quotes_submitted += 1;
-
-        // Add the price quote to the price_quote_submission_account
-        let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
-        price_quote_account.price_quote = ServicePriceQuote {
-            service_request_id,
-            bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
-            quoted_price_lamports,
-            quote_timestamp: current_timestamp, // Use internally generated timestamp
-            price_quote_status: ServicePriceQuoteStatus::Submitted,
-        };
-
-        // Update best price quote if the new quote is better
-        let best_quote_account = &mut ctx.accounts.best_price_quote_account;
-        if best_quote_account.best_quote_selection_status == BestQuoteSelectionStatus::NoQuotesReceivedYet ||
-        quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
-            best_quote_account.best_bridge_node_pastel_id = submitting_bridge_node.pastel_id.clone();
-            best_quote_account.best_quoted_price_in_lamports = quoted_price_lamports;
-            best_quote_account.best_quote_timestamp = current_timestamp;
-            best_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::BestQuoteSelected;
-        }
-
-        Ok(())
-    }
-}
-
-
 pub fn choose_best_price_quote(
     best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
     temp_service_requests_account: &mut TempServiceRequestsDataAccount,
@@ -1023,46 +1018,44 @@ pub struct SubmitPastelTxid<'info> {
     pub system_program: Program<'info, System>,
 }
 
-impl<'info> SubmitPastelTxid<'info> {
-    pub fn process(ctx: Context<SubmitPastelTxid>, service_request_id: [u8; 32], pastel_txid: String) -> ProgramResult {
-        let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
+pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>, service_request_id: [u8; 32], pastel_txid: String) -> ProgramResult {
+    let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
 
-        // Validate that the service_request_id matches
-        if service_request.service_request_id != service_request_id {
-            return Err(BridgeError::InvalidServiceRequestId.into());
-        }
-
-        // Validate the format and length of the Pastel TxID
-        if pastel_txid.is_empty() || pastel_txid.len() > MAX_TXID_LENGTH {
-            return Err(BridgeError::InvalidTxid.into());
-        }
-
-        // Find the bridge node that matches the selected_pastel_id
-        let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
-            node.pastel_id == service_request.selected_bridge_node_pastelid.as_ref().unwrap()
-        }).ok_or(BridgeError::BridgeNodeNotFound)?;
-
-        // Check if the transaction is being submitted by the selected bridge node
-        if selected_bridge_node.reward_address != ctx.accounts.system_program.key() {
-            return Err(BridgeError::UnauthorizedBridgeNode.into());
-        }
-
-        // Update the service request with the provided Pastel TxID
-        service_request.pastel_txid = Some(pastel_txid);
-        service_request.bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp as u64);
-
-        // Change the status of the service request to indicate that the TxID has been submitted
-        service_request.status = RequestStatus::TxidSubmitted;
-
-        // Log the TxID submission
-        msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", selected_bridge_node.pastel_id, service_request_id.to_string());
-
-        // Update the TxID mapping for the service request
-        let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-        update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
-
-        Ok(())
+    // Validate that the service_request_id matches
+    if service_request.service_request_id != service_request_id {
+        return Err(BridgeError::InvalidServiceRequestId.into());
     }
+
+    // Validate the format and length of the Pastel TxID
+    if pastel_txid.is_empty() || pastel_txid.len() > MAX_TXID_LENGTH {
+        return Err(BridgeError::InvalidTxid.into());
+    }
+
+    // Find the bridge node that matches the selected_pastel_id
+    let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
+        node.pastel_id == service_request.selected_bridge_node_pastelid.as_ref().unwrap()
+    }).ok_or(BridgeError::BridgeNodeNotFound)?;
+
+    // Check if the transaction is being submitted by the selected bridge node
+    if selected_bridge_node.reward_address != ctx.accounts.system_program.key() {
+        return Err(BridgeError::UnauthorizedBridgeNode.into());
+    }
+
+    // Update the service request with the provided Pastel TxID
+    service_request.pastel_txid = Some(pastel_txid);
+    service_request.bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp as u64);
+
+    // Change the status of the service request to indicate that the TxID has been submitted
+    service_request.status = RequestStatus::AwaitingCompletionConfirmation;
+
+    // Log the TxID submission
+    msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", selected_bridge_node.pastel_id, service_request_id.to_string());
+
+    // Update the TxID mapping for the service request
+    let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
+    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
+
+    Ok(())
 }
 
 fn is_valid_pastel_txid(txid: &str) -> bool {
@@ -1087,33 +1080,35 @@ pub struct SubmitTxidToOracle<'info> {
     pub system_program: Program<'info, System>,
 }
 
-impl<'info> SubmitTxidToOracle<'info> {
-    pub fn process(&self, pastel_txid: String) -> Result<()> {
-        let service_request = &self.service_request_submission_account.service_request;
-        if service_request.status != RequestStatus::TxidSubmitted {
-            return Err(BridgeError::InvalidRequestStatus.into());
-        }
 
-        let data = AddTxidForMonitoringData { txid: pastel_txid };
-
-        // Prepare the accounts for the CPI call
-        let cpi_accounts = AddTxidForMonitoring {
-            oracle_contract_state: self.bridge_contract_state.oracle_contract_state.to_account_info(),
-            caller: self.service_request_submission_account.to_account_info(),
-            pending_payment_account: self.pending_payment_account.to_account_info(),
-            user: self.payer.to_account_info(),
-            system_program: self.system_program.to_account_info(),
-        };
-
-        // Create the CPI context
-        let cpi_program = self.oracle_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-        // Invoke the oracle program's function
-        solana_pastel_oracle_program::add_txid_for_monitoring(cpi_ctx, data)?;
-
-        Ok(())
+pub fn submit_pastel_txid_to_oracle(
+    ctx: Context<SubmitTxidToOracle>,
+    pastel_txid: String
+) -> Result<()> {
+    let service_request = &ctx.accounts.service_request_submission_account.service_request;
+    if service_request.status != RequestStatus::AwaitingCompletionConfirmation {
+        return Err(BridgeError::InvalidRequestStatus.into());
     }
+
+    let data = AddTxidForMonitoringData { txid: pastel_txid };
+
+    // Prepare the accounts for the CPI call
+    let cpi_accounts = AddTxidForMonitoring {
+        oracle_contract_state: ctx.accounts.bridge_contract_state.oracle_contract_state.to_account_info(),
+        caller: ctx.accounts.service_request_submission_account.to_account_info(),
+        pending_payment_account: ctx.accounts.pending_payment_account.to_account_info(),
+        user: ctx.accounts.payer.to_account_info(),
+        system_program: ctx.accounts.system_program.to_account_info(),
+    };
+
+    // Create the CPI context
+    let cpi_program = ctx.accounts.oracle_program.to_account_info();
+    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+    // Invoke the oracle program's function
+    solana_pastel_oracle_program::add_txid_for_monitoring(cpi_ctx, data)?;
+
+    Ok(())
 }
 
 
@@ -1769,21 +1764,29 @@ pub mod solana_pastel_bridge_program {
         ipfs_cid: String,
         file_size_bytes: u64,
     ) -> ProgramResult {
-        SubmitServiceRequest::submit_service_request(ctx, ipfs_cid, file_size_bytes)
+        submit_service_request_helper(ctx, ipfs_cid, file_size_bytes)
     }
 
-    pub fn submit_price_quote_wrapper(
+    pub fn submit_price_quote(
         ctx: Context<SubmitPriceQuote>,
         service_request_id_string: String,
         quoted_price_lamports: u64,
     ) -> ProgramResult {
-        SubmitPriceQuote::submit_price_quote(
+        submit_price_quote_helper(
             ctx,
             service_request_id_string,
             quoted_price_lamports
         )
     }
-    
+
+    pub fn submit_pastel_txid_from_bridge_node(
+        ctx: Context<SubmitPastelTxid>,
+        service_request_id: [u8; 32],
+        pastel_txid: String,
+    ) -> ProgramResult {
+        submit_pastel_txid_from_bridge_node_helper(ctx, service_request_id, pastel_txid)
+    }
+
     // pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
     //     request_reward_helper(ctx, contributor_address)
     // }
