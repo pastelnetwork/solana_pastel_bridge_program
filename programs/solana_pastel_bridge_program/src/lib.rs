@@ -3,9 +3,12 @@ use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
-use oracle_program::{self, cpi::accounts::AddTxidForMonitoring};
-use oracle_program::AddTxidForMonitoringData;
-
+mod oracle_integration;
+use oracle_integration::{
+    solana_pastel_oracle_program, // Importing the module that contains the oracle program logic
+    AddTxidForMonitoring,   
+    PendingPaymentAccount
+};
 
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
@@ -1067,68 +1070,59 @@ fn is_valid_pastel_txid(txid: &str) -> bool {
     txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-
 #[derive(Accounts)]
 pub struct SubmitTxidToOracle<'info> {
-    // Service request submission account
     #[account(mut)]
     pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
 
-    // Bridge contract state
     #[account(mut)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
 
-    // Oracle program account
-    pub oracle_program: Program<'info, OracleProgram>,
-
-    // Pending payment account to be initialized
-    #[account(init, payer = payer, space = 8 + size_of::<PendingPaymentAccount>())]
+    #[account(init, payer = payer, space = 1024)]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
 
-    // Payer of the transaction
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    // System program
     pub system_program: Program<'info, System>,
 }
 
 impl<'info> SubmitTxidToOracle<'info> {
     pub fn process(&self, pastel_txid: String) -> Result<()> {
         let service_request = &self.service_request_submission_account.service_request;
-
-        // Ensure the service request is ready for oracle monitoring
         if service_request.status != RequestStatus::TxidSubmitted {
             return Err(BridgeError::InvalidRequestStatus.into());
         }
 
-        // Prepare data for oracle contract
         let data = AddTxidForMonitoringData { txid: pastel_txid };
 
-        // Create CPI context for the oracle program
+        // Prepare the accounts for the CPI call
         let cpi_accounts = AddTxidForMonitoring {
-            oracle_contract_state: self.oracle_program.to_account_info(),
+            oracle_contract_state: self.bridge_contract_state.oracle_contract_state.to_account_info(),
             caller: self.service_request_submission_account.to_account_info(),
             pending_payment_account: self.pending_payment_account.to_account_info(),
             user: self.payer.to_account_info(),
             system_program: self.system_program.to_account_info(),
         };
+
+        // Create the CPI context
         let cpi_program = self.oracle_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
         // Invoke the oracle program's function
-        oracle_program::cpi::add_txid_for_monitoring(cpi_ctx, data)?;
+        solana_pastel_oracle_program::add_txid_for_monitoring(cpi_ctx, data)?;
 
         Ok(())
     }
 }
+
 
 #[derive(Accounts)]
 pub struct AccessOracleData<'info> {
     #[account(
         seeds = [b"aggregated_consensus_data"],
         bump,
-        program = bridge_contract_state.oracle_contract_pubkey,
+        constraint = aggregated_consensus_data_account.owner == bridge_contract_state.oracle_contract_pubkey
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -1141,10 +1135,9 @@ pub struct AccessOracleData<'info> {
     #[account(mut)]
     pub temp_service_requests_account: Account<'info, TempServiceRequestsDataAccount>,
 
-    #[account]
+    #[account(mut)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
 }
-
 
 pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
     let consensus_status = aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, weight)| weight)
@@ -1496,54 +1489,54 @@ fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i3
 }
 
 
-#[derive(Accounts)]
-pub struct RequestReward<'info> {
-    #[account(mut)]
-    pub reward_pool_account: Account<'info, RewardPool>,
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-    #[account(mut)]
-    pub contributor_data_account: Account<'info, ContributorDataAccount>,
-    pub system_program: Program<'info, System>,
-}
+// #[derive(Accounts)]
+// pub struct RequestReward<'info> {
+//     #[account(mut)]
+//     pub reward_pool_account: Account<'info, RewardPool>,
+//     #[account(mut)]
+//     pub oracle_contract_state: Account<'info, OracleContractState>,
+//     #[account(mut)]
+//     pub contributor_data_account: Account<'info, ContributorDataAccount>,
+//     pub system_program: Program<'info, System>,
+// }
 
 
-pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
+// pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
 
-    // Temporarily store reward eligibility and amount
-    let mut reward_amount = 0;
-    let mut is_reward_valid = false;
+//     // Temporarily store reward eligibility and amount
+//     let mut reward_amount = 0;
+//     let mut is_reward_valid = false;
 
-    // Find the contributor in the PDA and check eligibility
-    if let Some(contributor) = ctx.accounts.contributor_data_account.contributors.iter().find(|c| c.reward_address == contributor_address) {
-        let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
-        let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
-        let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
+//     // Find the contributor in the PDA and check eligibility
+//     if let Some(contributor) = ctx.accounts.contributor_data_account.contributors.iter().find(|c| c.reward_address == contributor_address) {
+//         let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+//         let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
+//         let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
 
-        if is_eligible_for_rewards && !is_banned {
-            reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
-            is_reward_valid = true;
-        }
-    } else {
-        msg!("Contributor not found: {}", contributor_address);
-        return Err(BridgeError::UnregisteredOracle.into());
-    }
+//         if is_eligible_for_rewards && !is_banned {
+//             reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
+//             is_reward_valid = true;
+//         }
+//     } else {
+//         msg!("Contributor not found: {}", contributor_address);
+//         return Err(BridgeError::UnregisteredOracle.into());
+//     }
 
-    // Handle reward transfer after determining eligibility
-    if is_reward_valid {
-        // Transfer the reward from the reward pool to the contributor
-        **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
-        **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
+//     // Handle reward transfer after determining eligibility
+//     if is_reward_valid {
+//         // Transfer the reward from the reward pool to the contributor
+//         **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
+//         **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
 
-        msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
-    } else {
+//         msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
+//     } else {
 
-        msg!("Invalid Reward Request: Contributor: {}", contributor_address);
-        return Err(BridgeError::NotEligibleForReward.into());
-    }
+//         msg!("Invalid Reward Request: Contributor: {}", contributor_address);
+//         return Err(BridgeError::NotEligibleForReward.into());
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 #[derive(Accounts)]
 pub struct RegisterNewBridgeNode<'info> {
@@ -1620,35 +1613,6 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
         3 => Some(TxidStatus::MinedActivated),
         _ => None,
     }
-}
-
-
-// Function to handle the submission of Pastel transaction status reports
-pub fn validate_data_contributor_report(report: &PastelTxStatusReport) -> Result<()> {
-    // Direct return in case of invalid data, reducing nested if conditions
-    if report.txid.trim().is_empty() {
-        msg!("Error: InvalidTxid (TXID is empty)");
-        return Err(BridgeError::InvalidTxid.into());
-    } 
-    // Simplified TXID status validation
-    if !matches!(report.txid_status, TxidStatus::MinedActivated | TxidStatus::MinedPendingActivation | TxidStatus::PendingMining | TxidStatus::Invalid) {
-        return Err(BridgeError::InvalidTxidStatus.into());
-    }
-    // Direct return in case of missing data, reducing nested if conditions
-    if report.pastel_ticket_type.is_none() {
-        msg!("Error: Missing Pastel Ticket Type");
-        return Err(BridgeError::MissingPastelTicketType.into());
-    }
-    // Direct return in case of invalid hash, reducing nested if conditions
-    if let Some(hash) = &report.first_6_characters_of_sha3_256_hash_of_corresponding_file {
-        if hash.len() != 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            msg!("Error: Invalid File Hash Length or Non-hex characters");
-            return Err(BridgeError::InvalidFileHashLength.into());
-        }
-    } else {
-        return Err(BridgeError::MissingFileHash.into());
-    }
-    Ok(())
 }
 
 
@@ -1820,9 +1784,9 @@ pub mod solana_pastel_bridge_program {
         )
     }
     
-    pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
-        request_reward_helper(ctx, contributor_address)
-    }
+    // pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
+    //     request_reward_helper(ctx, contributor_address)
+    // }
 
     pub fn set_oracle_contract(ctx: Context<SetOracleContract>, oracle_contract_pubkey: Pubkey) -> Result<()> {
         SetOracleContract::set_oracle_contract(ctx, oracle_contract_pubkey)
