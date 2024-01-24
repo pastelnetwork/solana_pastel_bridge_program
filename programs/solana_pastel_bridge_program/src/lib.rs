@@ -1156,6 +1156,14 @@ pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStat
     (consensus_status, consensus_hash)
 }
 
+pub fn get_aggregated_data<'a>(
+    aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
+    txid: &str
+) -> Option<&'a AggregatedConsensusData> {
+    aggregated_data_account.consensus_data.iter()
+        .find(|data| data.txid == txid)
+}
+
 impl<'info> AccessOracleData<'info> {
     pub fn process(
         &self, 
@@ -1259,27 +1267,30 @@ impl<'info> AccessOracleData<'info> {
         consensus_data: &AggregatedConsensusData, 
         success: bool
     ) -> Result<()> {
-        // Retrieve the service request associated with the consensus data
-        let service_request_id = self.get_service_request_id_for_pastel_txid(consensus_data.txid.as_str())?;
+        let service_request_id = self.get_service_request_id_for_pastel_txid(&consensus_data.txid)?;
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+
+        // Retrieve the service request
         let service_request = self.temp_service_requests_account.service_requests.iter_mut()
             .find(|request| request.service_request_id == service_request_id)
             .ok_or(BridgeError::ServiceRequestNotFound)?;
 
-        // Retrieve the bridge node associated with the service request
+        // Retrieve the bridge node
         let bridge_node = self.bridge_nodes_data_account.bridge_nodes.iter_mut()
             .find(|node| node.pastel_id == service_request.selected_bridge_node_pastelid.clone().unwrap_or_default())
             .ok_or(BridgeError::BridgeNodeNotFound)?;
 
         if success {
-            // Release escrowed funds to the bridge node
-            let reward_amount = service_request.escrow_amount_lamports.unwrap_or_default();
+            // Release escrowed funds to the bridge node, deducting service fees
+            let service_fee = service_request.escrow_amount_lamports.unwrap_or_default() * TRANSACTION_FEE_PERCENTAGE as u64 / 100;
+            let oracle_fee = service_fee * ORACLE_REWARD_PERCENTAGE as u64 / 100;
+            let reward_amount = service_fee - oracle_fee;
+
             self.reward_pool_account.try_borrow_mut_lamports()?.checked_add(reward_amount)
                 .ok_or(BridgeError::EscrowReleaseError)?;
 
-            // Update bridge node's scores and performance metrics
-            bridge_node.successful_service_requests_count += 1;
-            bridge_node.current_streak += 1;
-            bridge_node.last_active_timestamp = Clock::get()?.unix_timestamp;
+            // Update bridge node's scores
+            update_bridge_node_status(bridge_node, true, current_timestamp);
 
             // Mark service request as completed
             service_request.status = RequestStatus::Completed;
@@ -1289,9 +1300,8 @@ impl<'info> AccessOracleData<'info> {
             *self.user.try_borrow_mut_lamports()? = self.user.lamports().checked_add(refund_amount)
                 .ok_or(BridgeError::EscrowRefundError)?;
 
-            // Adjust bridge node's scores and performance metrics
-            bridge_node.failed_service_requests_count += 1;
-            bridge_node.current_streak = 0;
+            // Adjust bridge node's scores
+            update_bridge_node_status(bridge_node, false, current_timestamp);
 
             // Mark service request as failed
             service_request.status = RequestStatus::Failed;
@@ -1299,16 +1309,9 @@ impl<'info> AccessOracleData<'info> {
 
         Ok(())
     }
+
 }
 
-
-pub fn get_aggregated_data<'a>(
-    aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
-    txid: &str
-) -> Option<&'a AggregatedConsensusData> {
-    aggregated_data_account.consensus_data.iter()
-        .find(|data| data.txid == txid)
-}
 
 pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
     if !success {
@@ -1491,7 +1494,6 @@ fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i3
         });
     }
 }
-
 
 
 #[derive(Accounts)]
@@ -1809,13 +1811,11 @@ pub mod solana_pastel_bridge_program {
     pub fn submit_price_quote_wrapper(
         ctx: Context<SubmitPriceQuote>,
         service_request_id_string: String,
-        bridge_node_pastel_id: Pubkey,
         quoted_price_lamports: u64,
     ) -> ProgramResult {
         SubmitPriceQuote::submit_price_quote(
             ctx,
             service_request_id_string,
-            bridge_node_pastel_id,
             quoted_price_lamports
         )
     }
