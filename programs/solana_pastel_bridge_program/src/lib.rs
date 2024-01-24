@@ -3,6 +3,9 @@ use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
+use oracle_program::{self, cpi::accounts::AddTxidForMonitoring};
+use oracle_program::AddTxidForMonitoringData;
+
 
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
@@ -27,6 +30,7 @@ const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the
 const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 24 * 60 * 60; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
+const MAX_ALLOWED_TIMESTAMP_DIFFERENCE: u64 = 600; // 10 minutes in seconds; maximum allowed time difference between the last update of the oracle's consensus data and the bridge contract's access to this data to ensure the bridge contract acts on timely and accurate data.
 
 
 #[error_code]
@@ -132,6 +136,30 @@ pub enum BridgeError {
 
     #[msg("Initial escrow amount and fees must be None or zero")]
     InvalidEscrowOrFeeAmounts,
+
+    #[msg("Invalid service request ID.")]
+    InvalidServiceRequestId,
+
+    #[msg("Invalid Pastel transaction ID.")]
+    InvalidPastelTxid,
+
+    #[msg("Bridge node has not been selected for the service request.")]
+    BridgeNodeNotSelected,
+
+    #[msg("Unauthorized bridge node.")]
+    UnauthorizedBridgeNode,
+
+    #[msg("Bridge contract is not initialized.")]
+    ContractNotInitialized,    
+
+    #[msg("Service request to Pastel transaction ID mapping not found")]
+    MappingNotFound,
+
+    #[msg("Pastel transaction ID does not match with any service request")]
+    TxidMismatch,
+
+    #[msg("Consensus data from the oracle is outdated")]
+    OutdatedConsensusData,    
 }
 
 
@@ -731,12 +759,11 @@ pub struct ServicePriceQuoteSubmissionAccount {
 
 // PDA to receive price quotes from bridge nodes
 #[derive(Accounts)]
-#[instruction(service_request_id_string: String, bridge_node_pastel_id: Pubkey)]
 pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"price_quote", &hex_string_to_bytes(&service_request_id_string)?, bridge_node_pastel_id.as_ref()],
+        seeds = [b"price_quote", &hex_string_to_bytes(&service_request_id_string)?],
         bump,
         space = 8 + std::mem::size_of::<ServicePriceQuote>()
     )]
@@ -753,7 +780,10 @@ pub struct SubmitPriceQuote<'info> {
 
     // Instruction arguments
     pub service_request_id_string: String,
-    pub bridge_node_pastel_id: Pubkey,
+
+    // Bridge Nodes Data Account
+    #[account(mut)]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
     // Account to store the best price quote for a service request
     #[account(
@@ -856,7 +886,6 @@ impl<'info> SubmitPriceQuote<'info> {
     pub fn submit_price_quote(
         ctx: Context<SubmitPriceQuote>,
         service_request_id_string: String,
-        bridge_node_pastel_id: Pubkey,
         quoted_price_lamports: u64,
     ) -> ProgramResult {
         // Convert the hexadecimal string to bytes
@@ -864,23 +893,31 @@ impl<'info> SubmitPriceQuote<'info> {
 
         // Obtain the current timestamp
         let current_timestamp = Clock::get()?.unix_timestamp as u64;
-        
+
+        // Find the bridge node that is submitting the quote
+        let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
+            node.reward_address == ctx.accounts.user.key()
+        }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
+
         // Validate the price quote before processing
         validate_price_quote_submission(
             &ctx.accounts.bridge_nodes_data_account, 
             &ctx.accounts.temp_service_requests_data_account, 
             &ctx.accounts.price_quote_submission_account, 
             &service_request_id, 
-            &bridge_node_pastel_id, 
+            &submitting_bridge_node.pastel_id, 
             quoted_price_lamports, 
             current_timestamp
         )?;
+
+        // Update the total number of price quotes submitted by the bridge node
+        submitting_bridge_node.total_price_quotes_submitted += 1;
 
         // Add the price quote to the price_quote_submission_account
         let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
         price_quote_account.price_quote = ServicePriceQuote {
             service_request_id,
-            bridge_node_pastel_id,
+            bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
             quoted_price_lamports,
             quote_timestamp: current_timestamp, // Use internally generated timestamp
             price_quote_status: ServicePriceQuoteStatus::Submitted,
@@ -890,7 +927,7 @@ impl<'info> SubmitPriceQuote<'info> {
         let best_quote_account = &mut ctx.accounts.best_price_quote_account;
         if best_quote_account.best_quote_selection_status == BestQuoteSelectionStatus::NoQuotesReceivedYet ||
         quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
-            best_quote_account.best_bridge_node_pastel_id = bridge_node_pastel_id.to_string();
+            best_quote_account.best_bridge_node_pastel_id = submitting_bridge_node.pastel_id.clone();
             best_quote_account.best_quoted_price_in_lamports = quoted_price_lamports;
             best_quote_account.best_quote_timestamp = current_timestamp;
             best_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::BestQuoteSelected;
@@ -923,26 +960,191 @@ pub fn choose_best_price_quote(
     service_request.best_quoted_price_in_lamports = Some(best_quote_account.best_quoted_price_in_lamports);
     service_request.bridge_node_selection_timestamp = Some(current_timestamp);
 
-    // Update the bridge node's status
-    if let Some(bridge_node) = bridge_nodes_data_account.bridge_nodes.iter_mut().find(|node| node.pastel_id == best_quote_account.best_bridge_node_pastel_id) {
-        bridge_node.total_price_quotes_submitted += 1;
-        if current_timestamp - bridge_node.last_active_timestamp > BRIDGE_NODE_INACTIVITY_THRESHOLD {
-            bridge_node.is_recently_active = false;
-        } else {
-            bridge_node.is_recently_active = true;
-        }
-    }
+    // Change the status of the service request to indicate that a bridge node has been selected
+    service_request.status = RequestStatus::BridgeNodeSelected;
 
     Ok(())
 }
 
-pub fn get_aggregated_data<'a>(
-    aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
-    txid: &str
-) -> Option<&'a AggregatedConsensusData> {
-    aggregated_data_account.consensus_data.iter()
-        .find(|data| data.txid == txid)
+
+fn update_txid_mapping(
+    txid_mapping_data_account: &mut Account<ServiceRequestTxidMappingDataAccount>, 
+    service_request_id: [u8; 32], 
+    pastel_txid: String
+) -> ProgramResult {
+    // Check if a mapping for the service_request_id already exists
+    if let Some(mapping) = txid_mapping_data_account.mappings.iter_mut().find(|m| m.service_request_id == service_request_id) {
+        mapping.pastel_txid = pastel_txid;
+    } else {
+        // Create a new mapping
+        txid_mapping_data_account.mappings.push(ServiceRequestTxidMapping {
+            service_request_id,
+            pastel_txid,
+        });
+    }
+    
+    Ok(())
 }
+
+#[derive(Accounts)]
+pub struct SubmitPastelTxid<'info> {
+    #[account(
+        mut,
+        constraint = service_request_submission_account.service_request.selected_bridge_node_pastelid.is_some() @ BridgeError::BridgeNodeNotSelected,
+        constraint = service_request_submission_account.service_request.status == RequestStatus::Pending @ BridgeError::InvalidRequestStatus,
+    )]
+    pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
+
+    // The bridge contract state
+    #[account(
+        mut,
+        constraint = bridge_contract_state.is_initialized @ BridgeError::ContractNotInitialized
+    )]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+
+    // Bridge Nodes Data Account
+    #[account(
+        mut,
+    )]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+
+    // Account for the ServiceRequestTxidMappingDataAccount PDA
+    #[account(
+        mut,
+        seeds = [b"service_request_txid_mapping_data"],
+        bump
+    )]
+    pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
+
+    // System program
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> SubmitPastelTxid<'info> {
+    pub fn process(ctx: Context<SubmitPastelTxid>, service_request_id: [u8; 32], pastel_txid: String) -> ProgramResult {
+        let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
+
+        // Validate that the service_request_id matches
+        if service_request.service_request_id != service_request_id {
+            return Err(BridgeError::InvalidServiceRequestId.into());
+        }
+
+        // Validate the format and length of the Pastel TxID
+        if pastel_txid.is_empty() || pastel_txid.len() > MAX_TXID_LENGTH {
+            return Err(BridgeError::InvalidTxid.into());
+        }
+
+        // Find the bridge node that matches the selected_pastel_id
+        let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
+            node.pastel_id == service_request.selected_bridge_node_pastelid.as_ref().unwrap()
+        }).ok_or(BridgeError::BridgeNodeNotFound)?;
+
+        // Check if the transaction is being submitted by the selected bridge node
+        if selected_bridge_node.reward_address != ctx.accounts.system_program.key() {
+            return Err(BridgeError::UnauthorizedBridgeNode.into());
+        }
+
+        // Update the service request with the provided Pastel TxID
+        service_request.pastel_txid = Some(pastel_txid);
+        service_request.bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp as u64);
+
+        // Change the status of the service request to indicate that the TxID has been submitted
+        service_request.status = RequestStatus::TxidSubmitted;
+
+        // Log the TxID submission
+        msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", selected_bridge_node.pastel_id, service_request_id.to_string());
+
+        // Update the TxID mapping for the service request
+        let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
+        update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
+
+        Ok(())
+    }
+}
+
+fn is_valid_pastel_txid(txid: &str) -> bool {
+    // Example validation: check length and character set
+    txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+
+#[derive(Accounts)]
+pub struct SubmitTxidToOracle<'info> {
+    // Service request submission account
+    #[account(mut)]
+    pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
+
+    // Bridge contract state
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+
+    // Oracle program account
+    pub oracle_program: Program<'info, OracleProgram>,
+
+    // Pending payment account to be initialized
+    #[account(init, payer = payer, space = 8 + size_of::<PendingPaymentAccount>())]
+    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
+
+    // Payer of the transaction
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    // System program
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> SubmitTxidToOracle<'info> {
+    pub fn process(&self, pastel_txid: String) -> Result<()> {
+        let service_request = &self.service_request_submission_account.service_request;
+
+        // Ensure the service request is ready for oracle monitoring
+        if service_request.status != RequestStatus::TxidSubmitted {
+            return Err(BridgeError::InvalidRequestStatus.into());
+        }
+
+        // Prepare data for oracle contract
+        let data = AddTxidForMonitoringData { txid: pastel_txid };
+
+        // Create CPI context for the oracle program
+        let cpi_accounts = AddTxidForMonitoring {
+            oracle_contract_state: self.oracle_program.to_account_info(),
+            caller: self.service_request_submission_account.to_account_info(),
+            pending_payment_account: self.pending_payment_account.to_account_info(),
+            user: self.payer.to_account_info(),
+            system_program: self.system_program.to_account_info(),
+        };
+        let cpi_program = self.oracle_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+        // Invoke the oracle program's function
+        oracle_program::cpi::add_txid_for_monitoring(cpi_ctx, data)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AccessOracleData<'info> {
+    #[account(
+        seeds = [b"aggregated_consensus_data"],
+        bump,
+        program = bridge_contract_state.oracle_contract_pubkey,
+    )]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+
+    #[account(
+        seeds = [b"service_request_txid_mapping_data"],
+        bump
+    )]
+    pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
+
+    #[account(mut)]
+    pub temp_service_requests_account: Account<'info, TempServiceRequestsDataAccount>,
+
+    #[account]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+}
+
 
 pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
     let consensus_status = aggregated_data.status_weights.iter().enumerate().max_by_key(|&(_, weight)| weight)
@@ -952,6 +1154,160 @@ pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStat
         .map(|hash_weight| hash_weight.hash.clone()).unwrap_or_default();
 
     (consensus_status, consensus_hash)
+}
+
+impl<'info> AccessOracleData<'info> {
+    pub fn process(
+        &self, 
+        txid: String, 
+        service_request_id: &[u8; 32], 
+        service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>
+    ) -> Result<()> {
+        // Search for the aggregated data matching the given txid
+        if let Some(consensus_data) = get_aggregated_data(&self.aggregated_consensus_data_account, &txid) {
+            // Validate the consensus data
+            self.validate_consensus_data(consensus_data, service_request_id, service_request_txid_mapping_account)?;
+
+            // Process the consensus data as required
+            if self.is_txid_mined_and_file_hash_matches(consensus_data, service_request_txid_mapping_account, service_request_id) {
+                // Release the escrowed amount to the bridge node and update the bridge node score
+                self.handle_escrow_transactions(consensus_data, true)?;
+
+                // Update the service request state to Completed
+                self.update_service_request_state_to_completed(consensus_data)?;
+            } else {
+                // Handle failure case: refund escrowed funds to user and adjust bridge node score
+                self.handle_escrow_transactions(consensus_data, false)?;
+            }
+        } else {
+            // Handle the case where the txid is not found in the oracle data
+            return Err(BridgeError::TxidNotFound.into());
+        }
+
+        Ok(())
+    }
+
+    fn validate_consensus_data(
+        &self,
+        consensus_data: &AggregatedConsensusData,
+        service_request_id: &[u8; 32],
+        service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>
+    ) -> Result<()> {
+        // Validate the txid
+        let mapping = service_request_txid_mapping_account.mappings
+            .iter()
+            .find(|mapping| mapping.service_request_id == *service_request_id)
+            .ok_or(BridgeError::MappingNotFound)?;
+        if mapping.pastel_txid != consensus_data.txid {
+            return Err(BridgeError::TxidMismatch.into());
+        }
+
+        // Check if the last_updated timestamp is recent enough
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+        if current_timestamp > consensus_data.last_updated + MAX_ALLOWED_TIMESTAMP_DIFFERENCE {
+            return Err(BridgeError::OutdatedConsensusData.into());
+        }
+
+        Ok(())
+    }
+
+    fn is_txid_mined_and_file_hash_matches(
+        &self, 
+        consensus_data: &AggregatedConsensusData, 
+        txid_mappings: &Account<ServiceRequestTxidMappingDataAccount>,
+        service_request_id: &[u8; 32]
+    ) -> bool {
+        let (consensus_status, consensus_hash) = compute_consensus(consensus_data);
+
+        if consensus_status != TxidStatus::MinedActivated {
+            return false;
+        }
+
+        // Find the service request and check if the hashes match
+        if let Some(mapping) = txid_mappings.mappings.iter().find(|m| m.service_request_id == *service_request_id) {
+            mapping.pastel_txid == consensus_data.txid && mapping.first_6_characters_of_sha3_256_hash_of_corresponding_file == consensus_hash
+        } else {
+            false
+        }
+    }
+
+    fn update_service_request_state_to_completed(&self, consensus_data: &AggregatedConsensusData) -> Result<()> {
+        // Retrieve the mapping between service_request_id and pastel_txid
+        let service_request_id = self.get_service_request_id_for_pastel_txid(consensus_data.txid.as_str())?;
+
+        // Find the service request by ID and update its status
+        let service_request = self.temp_service_requests_account.service_requests.iter_mut()
+            .find(|request| request.service_request_id == service_request_id)
+            .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+        // Update the status to Completed
+        service_request.status = RequestStatus::Completed;
+        service_request.service_request_completion_timestamp = Some(Clock::get()?.unix_timestamp);
+
+        Ok(())
+    }
+
+    fn get_service_request_id_for_pastel_txid(&self, txid: &str) -> Result<[u8; 32]> {
+        self.service_request_txid_mapping_data_account.mappings.iter()
+            .find(|mapping| mapping.pastel_txid == txid)
+            .map(|mapping| mapping.service_request_id)
+            .ok_or(BridgeError::TxidMappingNotFound.into())
+    }    
+
+    fn handle_escrow_transactions(
+        &self, 
+        consensus_data: &AggregatedConsensusData, 
+        success: bool
+    ) -> Result<()> {
+        // Retrieve the service request associated with the consensus data
+        let service_request_id = self.get_service_request_id_for_pastel_txid(consensus_data.txid.as_str())?;
+        let service_request = self.temp_service_requests_account.service_requests.iter_mut()
+            .find(|request| request.service_request_id == service_request_id)
+            .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+        // Retrieve the bridge node associated with the service request
+        let bridge_node = self.bridge_nodes_data_account.bridge_nodes.iter_mut()
+            .find(|node| node.pastel_id == service_request.selected_bridge_node_pastelid.clone().unwrap_or_default())
+            .ok_or(BridgeError::BridgeNodeNotFound)?;
+
+        if success {
+            // Release escrowed funds to the bridge node
+            let reward_amount = service_request.escrow_amount_lamports.unwrap_or_default();
+            self.reward_pool_account.try_borrow_mut_lamports()?.checked_add(reward_amount)
+                .ok_or(BridgeError::EscrowReleaseError)?;
+
+            // Update bridge node's scores and performance metrics
+            bridge_node.successful_service_requests_count += 1;
+            bridge_node.current_streak += 1;
+            bridge_node.last_active_timestamp = Clock::get()?.unix_timestamp;
+
+            // Mark service request as completed
+            service_request.status = RequestStatus::Completed;
+        } else {
+            // Refund escrowed funds to the user
+            let refund_amount = service_request.escrow_amount_lamports.unwrap_or_default();
+            *self.user.try_borrow_mut_lamports()? = self.user.lamports().checked_add(refund_amount)
+                .ok_or(BridgeError::EscrowRefundError)?;
+
+            // Adjust bridge node's scores and performance metrics
+            bridge_node.failed_service_requests_count += 1;
+            bridge_node.current_streak = 0;
+
+            // Mark service request as failed
+            service_request.status = RequestStatus::Failed;
+        }
+
+        Ok(())
+    }
+}
+
+
+pub fn get_aggregated_data<'a>(
+    aggregated_data_account: &'a Account<AggregatedConsensusDataAccount>,
+    txid: &str
+) -> Option<&'a AggregatedConsensusData> {
+    aggregated_data_account.consensus_data.iter()
+        .find(|data| data.txid == txid)
 }
 
 pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
