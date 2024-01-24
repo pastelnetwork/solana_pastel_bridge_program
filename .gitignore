@@ -34,3 +34,4 @@ test-ledger
 
 # Generated files (for example, when using cbindgen)
 *.generated.rs
+yarn.lock
