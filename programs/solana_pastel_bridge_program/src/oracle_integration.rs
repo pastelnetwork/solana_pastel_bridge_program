@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::prelude::ProgramError;
 use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
@@ -1097,6 +1098,19 @@ pub struct AddTxidForMonitoringData {
 }
 
 #[derive(Accounts)]
+pub struct AddTxidForMonitoringCpi<'info> {
+    #[account(mut)]
+    pub oracle_contract_state: AccountInfo<'info>,
+    #[account(mut)]
+    pub pending_payment_account: AccountInfo<'info>,
+    /// CHECK: This is checked in the instruction logic
+    pub caller: AccountInfo<'info>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct AddTxidForMonitoring<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
@@ -1111,9 +1125,9 @@ pub struct AddTxidForMonitoring<'info> {
 
     #[account(mut)]
     pub user: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
-
 
 pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
     let state = &mut ctx.accounts.oracle_contract_state;
@@ -1143,7 +1157,6 @@ pub fn add_txid_for_monitoring_helper(ctx: Context<AddTxidForMonitoring>, data: 
     msg!("Added Pastel TXID for Monitoring: {}", pending_payment_account.pending_payment.txid);
     Ok(())
 }
-
 
 #[derive(Accounts)]
 pub struct ProcessPastelTxStatusReport<'info> {
@@ -1384,6 +1397,50 @@ pub mod solana_pastel_oracle_program {
 
     pub fn add_txid_for_monitoring(ctx: Context<AddTxidForMonitoring>, data: AddTxidForMonitoringData) -> Result<()> {
         add_txid_for_monitoring_helper(ctx, data)
+    }
+
+    pub fn add_txid_for_monitoring_cpi<'info>(
+        ctx: CpiContext<'_, '_, '_, 'info, AddTxidForMonitoringCpi<'info>>,
+        data: AddTxidForMonitoringData
+    ) -> Result<()> {
+        // Access and deserialize the oracle contract state
+        let oracle_contract_state_info = &ctx.accounts.oracle_contract_state;
+        let oracle_contract_state_data = oracle_contract_state_info.data.borrow_mut();
+        let mut oracle_contract_state_data_slice: &[u8] = &oracle_contract_state_data;
+        let mut state = match OracleContractState::try_deserialize(&mut oracle_contract_state_data_slice) {
+            Ok(s) => s,
+            Err(_) => return Err(ProgramError::InvalidAccountData.into()),
+        };
+
+        // Check caller key
+        if *ctx.accounts.caller.key != state.bridge_contract_pubkey {
+            return Err(OracleError::NotBridgeContractAddress.into());
+        }
+
+        // Validate and add the TXID
+        if data.txid.len() > MAX_TXID_LENGTH {
+            msg!("TXID exceeds maximum length.");
+            return Err(OracleError::InvalidTxid.into());
+        }
+        state.monitored_txids.push(data.txid.clone());
+
+        // Access and deserialize the pending payment account
+        let pending_payment_account_info = &ctx.accounts.pending_payment_account;
+        let pending_payment_account_data = pending_payment_account_info.data.borrow_mut();
+        let mut pending_payment_account_data_slice: &[u8] = &pending_payment_account_data;
+        let mut pending_payment = match PendingPaymentAccount::try_deserialize(&mut pending_payment_account_data_slice) {
+            Ok(p) => p,
+            Err(_) => return Err(ProgramError::InvalidAccountData.into()),
+        };
+        // Initialize the pending payment
+        pending_payment.pending_payment = PendingPayment {
+            txid: data.txid,
+            expected_amount: COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING,
+            payment_status: PaymentStatus::Pending,
+        };
+
+        msg!("Added Pastel TXID for Monitoring via CPI");
+        Ok(())
     }
 
     pub fn add_pending_payment(ctx: Context<HandlePendingPayment>, txid: String, expected_amount_str: String, payment_status_str: String) -> Result<()> {

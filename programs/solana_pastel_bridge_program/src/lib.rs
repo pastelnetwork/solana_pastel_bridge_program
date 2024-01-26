@@ -4,11 +4,12 @@ use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
 mod oracle_integration;
-use oracle_integration::{
-    solana_pastel_oracle_program, // Importing the module that contains the oracle program logic
-    AddTxidForMonitoring,   
-    PendingPaymentAccount
-};
+use oracle_integration::solana_pastel_oracle_program;
+use oracle_integration::{AddTxidForMonitoringCpi, 
+                        AddTxidForMonitoringData,
+                        OracleContractState,
+                        PendingPaymentAccount};
+
 
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
@@ -1127,6 +1128,7 @@ pub struct SubmitPastelTxid<'info> {
     pub system_program: Program<'info, System>,
 }
 
+
 pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>, service_request_id: String, pastel_txid: String) -> ProgramResult {
     let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
 
@@ -1142,7 +1144,7 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
 
     // Find the bridge node that matches the selected_pastel_id
     let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
-        node.pastel_id == service_request.selected_bridge_node_pastelid.as_ref().unwrap()
+        node.pastel_id == *service_request.selected_bridge_node_pastelid.as_ref().unwrap()
     }).ok_or(BridgeError::UnregisteredBridgeNode)?;
 
     // Check if the transaction is being submitted by the selected bridge node
@@ -1168,17 +1170,20 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
 }
 
 fn is_valid_pastel_txid(txid: &str) -> bool {
-    // Example validation: check length and character set
-    txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit())
+    txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) // Check length and character set
 }
 
+
 #[derive(Accounts)]
-pub struct SubmitTxidToOracle<'info> {
+pub struct SubmitPastelTxidToOracle<'info> {
     #[account(mut)]
     pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
 
     #[account(mut)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
+
+    #[account(mut)]
+    pub oracle_contract_state: Account<'info, OracleContractState>,
 
     #[account(init, payer = payer, space = 1024)]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
@@ -1186,40 +1191,39 @@ pub struct SubmitTxidToOracle<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    #[account(address = bridge_contract_state.oracle_contract_pubkey)]
+    pub oracle_program: Program<'info, System>,
+
     pub system_program: Program<'info, System>,
 }
 
-
 pub fn submit_pastel_txid_to_oracle(
-    ctx: Context<SubmitTxidToOracle>,
-    pastel_txid: String
+    ctx: Context<SubmitPastelTxidToOracle>,
+    pastel_txid: String,
 ) -> Result<()> {
-    let service_request = &ctx.accounts.service_request_submission_account.service_request;
-    if service_request.status != RequestStatus::AwaitingCompletionConfirmation {
-        return Err(BridgeError::InvalidRequestStatus.into());
-    }
-
+    // Prepare data for CPI call
     let data = AddTxidForMonitoringData { txid: pastel_txid };
 
-    // Prepare the accounts for the CPI call
-    let cpi_accounts = AddTxidForMonitoring {
-        oracle_contract_state: ctx.accounts.bridge_contract_state.oracle_contract_state.to_account_info(),
-        caller: ctx.accounts.service_request_submission_account.to_account_info(),
+    // Create CPI accounts structure
+    let cpi_accounts = AddTxidForMonitoringCpi {
+        oracle_contract_state: ctx.accounts.oracle_contract_state.to_account_info(),
         pending_payment_account: ctx.accounts.pending_payment_account.to_account_info(),
-        user: ctx.accounts.payer.to_account_info(),
-        system_program: ctx.accounts.system_program.to_account_info(),
+        caller: ctx.accounts.service_request_submission_account.to_account_info(),
+        user: ctx.accounts.payer,
+        system_program: ctx.accounts.system_program,
     };
 
     // Create the CPI context
-    let cpi_program = ctx.accounts.oracle_program.to_account_info();
-    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.oracle_program.to_account_info(),
+        cpi_accounts
+    );
 
-    // Invoke the oracle program's function
-    solana_pastel_oracle_program::add_txid_for_monitoring(cpi_ctx, data)?;
+    // Invoke the CPI function
+    solana_pastel_oracle_program::add_txid_for_monitoring_cpi(cpi_ctx, data)?;
 
     Ok(())
 }
-
 
 #[derive(Accounts)]
 pub struct AccessOracleData<'info> {
@@ -1638,10 +1642,6 @@ fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i3
 //     Ok(())
 // }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct AddTxidForMonitoringData {
-    pub txid: String,
-}
 
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
     match index {
@@ -1822,13 +1822,6 @@ pub mod solana_pastel_bridge_program {
         )
     }
 
-    pub fn submit_pastel_txid_from_bridge_node(
-        ctx: Context<SubmitPastelTxid>,
-        service_request_id: String,
-        pastel_txid: String,
-    ) -> ProgramResult {
-        submit_pastel_txid_from_bridge_node_helper(ctx, service_request_id, pastel_txid)
-    }
 
     // pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
     //     request_reward_helper(ctx, contributor_address)
