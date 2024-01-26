@@ -209,6 +209,9 @@ pub enum BridgeError {
 
     #[msg("Insufficient funds for withdrawal request")]
     InsufficientFunds,
+    
+    #[msg("Timestamp conversion error")]
+    TimestampConversionError,
 }
 
 
@@ -1230,7 +1233,7 @@ pub struct AccessOracleData<'info> {
     #[account(
         seeds = [b"aggregated_consensus_data"],
         bump,
-        constraint = aggregated_consensus_data_account.owner == bridge_contract_state.oracle_contract_pubkey
+        constraint = aggregated_consensus_data_account.to_account_info().owner == &bridge_contract_state.oracle_contract_pubkey
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -1245,6 +1248,16 @@ pub struct AccessOracleData<'info> {
 
     #[account(mut)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
+
+    #[account(mut)]
+    pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+
+    #[account(mut)]
+    pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
+
+    // The user's account to refund in case of failure
+    #[account(mut)]
+    pub user_account: AccountInfo<'info>,
 }
 
 pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
@@ -1269,7 +1282,7 @@ impl<'info> AccessOracleData<'info> {
     pub fn process(
         &self, 
         txid: String, 
-        service_request_id: &[u8; 32], 
+        service_request_id: &String, 
         service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>
     ) -> Result<()> {
         // Search for the aggregated data matching the given txid
@@ -1279,14 +1292,30 @@ impl<'info> AccessOracleData<'info> {
 
             // Process the consensus data as required
             if self.is_txid_mined_and_file_hash_matches(consensus_data, service_request_txid_mapping_account, service_request_id) {
+                // Retrieve the end user's Solana address
+                let user_sol_address = self.get_user_sol_address(service_request_id)?;
+    
                 // Release the escrowed amount to the bridge node and update the bridge node score
-                self.handle_escrow_transactions(consensus_data, true)?;
+                self.handle_escrow_transactions(
+                    consensus_data, 
+                    true, 
+                    &mut self.bridge_reward_pool_account.to_account_info(), 
+                    &mut self.user_account.to_account_info()
+                )?;
 
                 // Update the service request state to Completed
                 self.update_service_request_state_to_completed(consensus_data)?;
             } else {
+                // Retrieve the end user's Solana address
+                let user_sol_address = self.get_user_sol_address(service_request_id)?;
+
                 // Handle failure case: refund escrowed funds to user and adjust bridge node score
-                self.handle_escrow_transactions(consensus_data, false)?;
+                self.handle_escrow_transactions(
+                    consensus_data, 
+                    false, 
+                    &mut self.bridge_reward_pool_account.to_account_info(), 
+                    &mut self.user_account.to_account_info()
+                )?;
             }
         } else {
             // Handle the case where the txid is not found in the oracle data
@@ -1296,10 +1325,17 @@ impl<'info> AccessOracleData<'info> {
         Ok(())
     }
 
+    fn get_user_sol_address(&self, service_request_id: &String) -> Result<Pubkey> {
+        self.temp_service_requests_data_account.service_requests.iter()
+            .find(|request| &request.service_request_id == service_request_id)
+            .map(|request| request.user_sol_address)
+            .ok_or(BridgeError::ServiceRequestNotFound.into())
+    }
+
     fn validate_consensus_data(
         &self,
         consensus_data: &AggregatedConsensusData,
-        service_request_id: &[u8; 32],
+        service_request_id: &String,
         service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>
     ) -> Result<()> {
         // Validate the txid
@@ -1324,22 +1360,25 @@ impl<'info> AccessOracleData<'info> {
         &self, 
         consensus_data: &AggregatedConsensusData, 
         txid_mappings: &Account<ServiceRequestTxidMappingDataAccount>,
-        service_request_id: &[u8; 32]
+        service_request_id: &String
     ) -> bool {
         let (consensus_status, consensus_hash) = compute_consensus(consensus_data);
-
+    
         if consensus_status != TxidStatus::MinedActivated {
             return false;
         }
-
-        // Find the service request and check if the hashes match
-        if let Some(mapping) = txid_mappings.mappings.iter().find(|m| m.service_request_id == *service_request_id) {
-            mapping.pastel_txid == consensus_data.txid && mapping.first_6_characters_of_sha3_256_hash_of_corresponding_file == consensus_hash
-        } else {
-            false
+    
+        // Find the service request and check if the txid matches
+        if let Some(mapping) = txid_mappings.mappings.iter().find(|m| &m.service_request_id == service_request_id) {
+            if mapping.pastel_txid == consensus_data.txid {
+                // Here, we assume that consensus_data contains the aggregated data for the txid in the mapping
+                return consensus_data.first_6_characters_of_sha3_256_hash_of_corresponding_file == consensus_hash;
+            }
         }
+    
+        false
     }
-
+    
     fn update_service_request_state_to_completed(&self, consensus_data: &AggregatedConsensusData) -> Result<()> {
         // Retrieve the mapping between service_request_id and pastel_txid
         let service_request_id = self.get_service_request_id_for_pastel_txid(consensus_data.txid.as_str())?;
@@ -1351,12 +1390,17 @@ impl<'info> AccessOracleData<'info> {
 
         // Update the status to Completed
         service_request.status = RequestStatus::Completed;
-        service_request.service_request_completion_timestamp = Some(Clock::get()?.unix_timestamp);
-
+        service_request.service_request_completion_timestamp = Some(
+            Clock::get()?
+                .unix_timestamp
+                .try_into()
+                .map_err(|_| BridgeError::TimestampConversionError)?
+        );
+        
         Ok(())
     }
 
-    fn get_service_request_id_for_pastel_txid(&self, txid: &str) -> Result<[u8; 32]> {
+    fn get_service_request_id_for_pastel_txid(&self, txid: &str) -> Result<String> {
         self.service_request_txid_mapping_data_account.mappings.iter()
             .find(|mapping| mapping.pastel_txid == txid)
             .map(|mapping| mapping.service_request_id)
@@ -1366,7 +1410,9 @@ impl<'info> AccessOracleData<'info> {
     fn handle_escrow_transactions(
         &self, 
         consensus_data: &AggregatedConsensusData, 
-        success: bool
+        success: bool,
+        reward_pool_account: &mut AccountInfo<'info>,
+        user_account: &mut AccountInfo<'info>,
     ) -> Result<()> {
         let service_request_id = self.get_service_request_id_for_pastel_txid(&consensus_data.txid)?;
         let current_timestamp = Clock::get()?.unix_timestamp as u64;
@@ -1387,8 +1433,8 @@ impl<'info> AccessOracleData<'info> {
             let oracle_fee = service_fee * ORACLE_REWARD_PERCENTAGE as u64 / 100;
             let reward_amount = service_fee - oracle_fee;
 
-            self.reward_pool_account.try_borrow_mut_lamports()?.checked_add(reward_amount)
-                .ok_or(BridgeError::EscrowReleaseError)?;
+            // Update the lamports of the reward pool account
+            **reward_pool_account.try_borrow_mut_lamports()? += reward_amount;
 
             // Update bridge node's scores
             update_bridge_node_status(bridge_node, true, current_timestamp);
@@ -1398,8 +1444,9 @@ impl<'info> AccessOracleData<'info> {
         } else {
             // Refund escrowed funds to the user
             let refund_amount = service_request.escrow_amount_lamports.unwrap_or_default();
-            *self.user.try_borrow_mut_lamports()? = self.user.lamports().checked_add(refund_amount)
-                .ok_or(BridgeError::EscrowRefundError)?;
+
+            // Update the lamports of the user account
+            **user_account.try_borrow_mut_lamports()? += refund_amount;
 
             // Adjust bridge node's scores
             update_bridge_node_status(bridge_node, false, current_timestamp);
@@ -1410,6 +1457,7 @@ impl<'info> AccessOracleData<'info> {
 
         Ok(())
     }
+
 
 }
 
@@ -1559,7 +1607,14 @@ fn post_consensus_tasks(
     msg!("Now cleaning up unneeded data in ServiceRequestTxidMappingDataAccount...");
     // Cleanup old mapping data in ServiceRequestTxidMappingDataAccount
     service_request_txid_mapping_data_account.mappings.retain(|mapping| {
-        current_timestamp - mapping.timestamp < SUBMISSION_COUNT_RETENTION_PERIOD
+        // Find the corresponding service request for this mapping
+        if let Some(service_request) = temp_service_requests_data_account.service_requests.iter().find(|sr| sr.service_request_id == mapping.service_request_id) {
+            // Retain the mapping if it's within the validity period
+            current_timestamp - service_request.service_request_creation_timestamp < SUBMISSION_COUNT_RETENTION_PERIOD
+        } else {
+            // If there is no corresponding service request, do not retain the mapping
+            false
+        }
     });
 
     msg!("Done with post-consensus tasks!");
@@ -1698,7 +1753,7 @@ pub struct WithdrawFunds<'info> {
     pub admin_account: AccountInfo<'info>,
 
     #[account(mut)]
-    pub reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
+    pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
 
     #[account(mut)]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
@@ -1732,8 +1787,7 @@ impl<'info> WithdrawFunds<'info> {
         }
 
         let admin_account = &mut ctx.accounts.admin_account;
-        let reward_pool_account = &mut ctx.accounts.reward_pool_account;
-        let fee_receiving_contract_account = &mut ctx.accounts.fee_receiving_contract_account;
+        let bridge_reward_pool_account = &mut ctx.accounts.bridge_reward_pool_account;
         let bridge_escrow_account = &mut ctx.accounts.bridge_escrow_account;
         let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
         let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
@@ -1751,8 +1805,7 @@ impl<'info> WithdrawFunds<'info> {
         }
 
         // Perform withdrawals
-        withdraw_funds(&mut reward_pool_account.to_account_info(), admin_account, reward_pool_amount)?;
-        withdraw_funds(&mut fee_receiving_contract_account.to_account_info(), admin_account, fee_receiving_amount)?;
+        withdraw_funds(&mut bridge_reward_pool_account.to_account_info(), admin_account, reward_pool_amount)?;
         withdraw_funds(&mut bridge_escrow_account.to_account_info(), admin_account, escrow_amount)?;
         withdraw_funds(&mut bridge_nodes_data_account.to_account_info(), admin_account, bridge_nodes_data_amount)?;
         withdraw_funds(&mut temp_service_requests_data_account.to_account_info(), admin_account, temp_service_requests_data_amount)?;
@@ -1779,7 +1832,7 @@ pub mod solana_pastel_bridge_program {
         msg!("Bridge Contract State Initialized with Admin Pubkey: {:?}", admin_pubkey);
     
         // Logging PDAs for confirmation
-        msg!("Bridge Reward Pool Account PDA: {:?}", ctx.accounts.reward_pool_account.key());
+        msg!("Bridge Reward Pool Account PDA: {:?}", ctx.accounts.bridge_reward_pool_account.key());
         msg!("Bridge Escrow Account PDA: {:?}", ctx.accounts.bridge_escrow_account.key());
         msg!("Bridge Nodes Data Account PDA: {:?}", ctx.accounts.bridge_nodes_data_account.key());
         msg!("Temporary Service Requests Data Account PDA: {:?}", ctx.accounts.temp_service_requests_data_account.key());
