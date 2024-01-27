@@ -5,11 +5,7 @@ use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::{hash, Hash};
 mod oracle_integration;
 use oracle_integration::solana_pastel_oracle_program;
-use oracle_integration::{AddTxidForMonitoringCpi, 
-                        AddTxidForMonitoringData,
-                        OracleContractState,
-                        PendingPaymentAccount};
-
+use oracle_integration::{AddTxidForMonitoringCpi, AddTxidForMonitoringData, OracleContractState, PendingPaymentAccount};
 
 const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
@@ -602,13 +598,15 @@ pub struct BridgeNodeDataAccount {
 pub struct RegisterNewBridgeNode<'info> {
     /// CHECK: Manual checks are performed in the instruction to ensure the bridge_node_account is valid and safe to use.
     #[account(mut, signer)]
+    pub user: AccountInfo<'info>, // User's Solana account
+
+    #[account(mut, signer)]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
     #[account(mut)]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
 
 }
-
 
 pub fn register_new_bridge_node_helper(ctx: Context<RegisterNewBridgeNode>, pastel_id: String, bridge_node_psl_address: String) -> Result<()> {
     let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
@@ -619,29 +617,32 @@ pub fn register_new_bridge_node_helper(ctx: Context<RegisterNewBridgeNode>, past
         return Err(BridgeError::BridgeNodeAlreadyRegistered.into());
     }
 
-    // Fee checking logic
-    let bridge_node_account_info = ctx.accounts.bridge_nodes_data_account.to_account_info();
-    if bridge_node_account_info.lamports() < BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS {
+    // User's account as the signer
+    let user_account_info = ctx.accounts.user.to_account_info();
+
+    // Check if the user has enough lamports for the registration fee
+    if **user_account_info.lamports.borrow() < BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS {
         msg!("Registration failed: Insufficient registration fee for Pastel ID: {}", pastel_id);
         return Err(BridgeError::InsufficientRegistrationFee.into());
     }
 
-    // Transferring the fee to the reward pool account
+    // Transfer the registration fee from the user's account to the reward pool account
     **ctx.accounts.bridge_reward_pool_account.to_account_info().lamports.borrow_mut() += BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
-    **bridge_node_account_info.lamports.borrow_mut() -= BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
-
+    **user_account_info.lamports.borrow_mut() -= BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
     msg!("Registration fee transferred to reward pool.");
+
+    // Time of registration
     let last_active_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Create and add the new bridge node
+    // Create the new bridge node
     let new_bridge_node = BridgeNode {
-        pastel_id,
-        reward_address: *ctx.accounts.bridge_nodes_data_account.to_account_info().key, // Use the key of the signer
+        pastel_id: pastel_id.clone(), // Clone the pastel_id here
+        reward_address: *user_account_info.key, // User who is registering as a bridge node
         bridge_node_psl_address,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
         compliance_score: 1.0, // Initial compliance score
         reliability_score: 1.0, // Initial reliability score
-        last_active_timestamp,
+        last_active_timestamp, // Set to current timestamp
         total_price_quotes_submitted: 0,
         total_service_requests_attempted: 0,
         successful_service_requests_count: 0,
@@ -654,14 +655,21 @@ pub fn register_new_bridge_node_helper(ctx: Context<RegisterNewBridgeNode>, past
         is_banned: false,
     };
 
+    // Mutable borrow of bridge_nodes_data_account starts here
+    let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
+
+    // Check if the bridge node is already registered
+    if bridge_nodes_data_account.bridge_nodes.iter().any(|node| node.pastel_id == pastel_id) {
+        msg!("Registration failed: Bridge Node already registered with Pastel ID: {}", pastel_id);
+        return Err(BridgeError::BridgeNodeAlreadyRegistered.into());
+    }
+
     // Append the new bridge node to the BridgeNodesDataAccount
     bridge_nodes_data_account.bridge_nodes.push(new_bridge_node);
 
-    // Logging for debug purposes
-    msg!("New Bridge Node successfully Registered! Complete information on the new Bridge Node: {:?}", new_bridge_node);
+    msg!("New Bridge Node successfully Registered: {}", pastel_id);
     Ok(())
 }
-
 
 
 // Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
@@ -907,7 +915,7 @@ pub struct SubmitPriceQuote<'info> {
 }
 
 
-pub fn submit_price_quote(
+pub fn submit_price_quote_helper(
     ctx: Context<SubmitPriceQuote>,
     bridge_node_pastel_id: String,
     service_request_id: String,
@@ -917,28 +925,21 @@ pub fn submit_price_quote(
     // Obtain the current timestamp
     let quote_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Find the bridge node that is submitting the quote
-    let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
-        node.reward_address == ctx.accounts.user.key()
-    }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
-
-    // Convert service_request_id to &[u8] for PDA seed generation
-    let service_request_id_bytes = service_request_id.as_bytes();
-
-    // Create seeds for PDAs using the byte array
-    let seeds_price_quote = &[b"px_quote", service_request_id_bytes];
-    let seeds_best_quote = &[b"bst_px_qt", service_request_id_bytes];
-
     // Validate the price quote
     validate_price_quote_submission(
         &ctx.accounts.bridge_nodes_data_account,
         &ctx.accounts.temp_service_requests_data_account,
         &ctx.accounts.price_quote_submission_account,
-        service_request_id,
+        service_request_id.clone(),
         bridge_node_pastel_id,
         quoted_price_lamports,
         quote_timestamp,
     )?;
+
+    // Find the bridge node that is submitting the quote and get a mutable reference
+    let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter_mut().find(|node| {
+        node.reward_address == ctx.accounts.user.key()
+    }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
 
     // Update the total number of price quotes submitted by the bridge node
     submitting_bridge_node.total_price_quotes_submitted += 1;
@@ -946,7 +947,7 @@ pub fn submit_price_quote(
     // Add the price quote to the price_quote_submission_account
     let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
     price_quote_account.price_quote = ServicePriceQuote {
-        service_request_id,
+        service_request_id: service_request_id.clone(),
         bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
         quoted_price_lamports,
         quote_timestamp, // Use internally generated timestamp
@@ -1156,7 +1157,7 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
     }
 
     // Update the service request with the provided Pastel TxID
-    service_request.pastel_txid = Some(pastel_txid);
+    service_request.pastel_txid = Some(pastel_txid.clone());
     service_request.bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp as u64);
 
     // Change the status of the service request to indicate that the TxID has been submitted
@@ -1167,7 +1168,7 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
 
     // Update the TxID mapping for the service request
     let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
+    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid.clone())?;
 
     Ok(())
 }
@@ -1175,7 +1176,6 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
 fn is_valid_pastel_txid(txid: &str) -> bool {
     txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) // Check length and character set
 }
-
 
 #[derive(Accounts)]
 pub struct SubmitPastelTxidToOracle<'info> {
@@ -1188,11 +1188,13 @@ pub struct SubmitPastelTxidToOracle<'info> {
     #[account(mut)]
     pub oracle_contract_state: Account<'info, OracleContractState>,
 
-    #[account(init, payer = payer, space = 1024)]
+    #[account(init, payer = bridge_reward_pool_pda, space = 1024)]
     pub pending_payment_account: Account<'info, PendingPaymentAccount>,
 
-    #[account(mut)]
-    pub payer: Signer<'info>,
+    /// CHECK: This is the PDA account for the bridge reward pool, which will pay the fees.
+    /// Seeds are ['bridge_reward_pool_account'.as_ref(), bridge_contract_state.key().as_ref()]
+    #[account(mut, seeds = [b"bridge_reward_pool_account", bridge_contract_state.key().as_ref()], bump)]
+    pub bridge_reward_pool_pda: AccountInfo<'info>,
 
     #[account(address = bridge_contract_state.oracle_contract_pubkey)]
     pub oracle_program: Program<'info, System>,
@@ -1200,30 +1202,48 @@ pub struct SubmitPastelTxidToOracle<'info> {
     pub system_program: Program<'info, System>,
 }
 
+
 pub fn submit_pastel_txid_to_oracle(
     ctx: Context<SubmitPastelTxidToOracle>,
     pastel_txid: String,
+    bridge_reward_pool_bump: u8,
 ) -> Result<()> {
-    // Prepare data for CPI call
-    let data = AddTxidForMonitoringData { txid: pastel_txid };
+    let data = oracle_integration::AddTxidForMonitoringData { txid: pastel_txid };
 
-    // Create CPI accounts structure
-    let cpi_accounts = AddTxidForMonitoringCpi {
-        oracle_contract_state: ctx.accounts.oracle_contract_state.to_account_info(),
-        pending_payment_account: ctx.accounts.pending_payment_account.to_account_info(),
-        caller: ctx.accounts.service_request_submission_account.to_account_info(),
-        user: ctx.accounts.payer,
-        system_program: ctx.accounts.system_program,
+    let oracle_contract_state = ctx.accounts.oracle_contract_state.to_account_info().clone();
+    let pending_payment_account = ctx.accounts.pending_payment_account.to_account_info().clone();
+    let caller = ctx.accounts.service_request_submission_account.to_account_info().clone();
+    let user = ctx.accounts.bridge_reward_pool_pda.to_account_info().clone();
+    let system_program = ctx.accounts.system_program.clone();
+    let oracle_program = ctx.accounts.oracle_program.clone();
+
+    let bridge_contract_state_key = ctx.accounts.bridge_contract_state.key();
+    let bridge_reward_pool_seeds: &[&[u8]] = &[
+        b"bridge_reward_pool_account".as_ref(), 
+        bridge_contract_state_key.as_ref(),
+        &[bridge_reward_pool_bump]
+    ];
+
+    // Construct CPI accounts using the cloned references
+    let cpi_accounts = oracle_integration::AddTxidForMonitoringCpi {
+        oracle_contract_state,
+        pending_payment_account,
+        caller,
+        user,
+        system_program,
     };
 
-    // Create the CPI context
-    let cpi_ctx = CpiContext::new(
-        ctx.accounts.oracle_program.to_account_info(),
-        cpi_accounts
+    // Use a let binding for bridge_reward_pool_seeds to extend its lifetime
+    let signer_seeds: &[&[&[u8]]] = &[bridge_reward_pool_seeds];
+
+    // Create CPI context with the correctly scoped signer seeds
+    let cpi_ctx = CpiContext::new_with_signer(
+        oracle_program.to_account_info(),
+        cpi_accounts,
+        signer_seeds,
     );
 
-    // Invoke the CPI function
-    solana_pastel_oracle_program::add_txid_for_monitoring_cpi(cpi_ctx, data)?;
+    oracle_integration::solana_pastel_oracle_program::add_txid_for_monitoring_cpi(cpi_ctx, data)?;
 
     Ok(())
 }
@@ -1857,24 +1877,27 @@ pub mod solana_pastel_bridge_program {
 
     pub fn submit_service_request(
         ctx: Context<SubmitServiceRequest>,
+        pastel_ticket_type_string: String,
+        first_6_chars_of_hash: String,
         ipfs_cid: String,
         file_size_bytes: u64,
     ) -> ProgramResult {
-        submit_service_request_helper(ctx, ipfs_cid, file_size_bytes)
+        submit_service_request_helper(ctx, pastel_ticket_type_string, first_6_chars_of_hash, ipfs_cid, file_size_bytes)
     }
 
     pub fn submit_price_quote(
         ctx: Context<SubmitPriceQuote>,
+        bridge_node_pastel_id: String,
         service_request_id_string: String,
         quoted_price_lamports: u64,
     ) -> ProgramResult {
         submit_price_quote_helper(
             ctx,
+            bridge_node_pastel_id,
             service_request_id_string,
             quoted_price_lamports
         )
     }
-
 
     // pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
     //     request_reward_helper(ctx, contributor_address)
@@ -1903,7 +1926,7 @@ pub mod solana_pastel_bridge_program {
             temp_service_requests_data_amount,
             aggregated_consensus_data_amount,
             service_request_txid_mapping_data_amount
-        )
-    }
+        )}
 
 }
+    

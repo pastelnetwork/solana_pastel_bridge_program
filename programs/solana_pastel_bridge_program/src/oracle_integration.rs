@@ -1105,8 +1105,11 @@ pub struct AddTxidForMonitoringCpi<'info> {
     pub pending_payment_account: AccountInfo<'info>,
     /// CHECK: This is checked in the instruction logic
     pub caller: AccountInfo<'info>,
+
+    /// This is a PDA, but we'll treat it as a Signer in the CPI context.
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub user: AccountInfo<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
