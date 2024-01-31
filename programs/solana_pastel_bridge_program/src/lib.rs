@@ -20,7 +20,6 @@ const SERVICE_REQUESTS_FOR_PERMANENT_BAN: u32 = 250; //
 const SERVICE_REQUESTS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 service requests
 const TEMPORARY_BAN_SERVICE_FAILURES_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
 const TEMPORARY_BAN_DURATION: u64 =  24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
-const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE: u64 = 2 * 60; // Maximum duration in seconds from service quote request before selecting the best quote (e.g., 2 minutes)
 const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
@@ -40,35 +39,14 @@ pub enum BridgeError {
     #[msg("Action attempted by an unregistered bridge node")]
     UnregisteredBridgeNode,
 
-    #[msg("Bridge node is not eligible for reward")]
-    NotEligibleForReward,
-
     #[msg("Service request is invalid or malformed")]
     InvalidServiceRequest,
-
-    #[msg("Service request not fulfilled within specified time limit")]
-    ServiceRequestTimeout,
-
-    #[msg("Bridge node submitted a quote that is too high or unreasonable")]
-    QuoteTooHigh,
-
-    #[msg("Bridge node submitted an invalid or malformed price quote")]
-    InvalidQuote,
 
     #[msg("Escrow account for service request is not adequately funded")]
     EscrowNotFunded,
 
-    #[msg("Invalid or unrecognized escrow account address")]
-    InvalidEscrowAddress,
-
-    #[msg("Transaction fee specified is invalid or not within acceptable limits")]
-    InvalidTransactionFee,
-
     #[msg("File size exceeds the maximum allowed limit")]
     InvalidFileSize,
-
-    #[msg("Service request has not been funded by the user")]
-    ServiceRequestNotFunded,
 
     #[msg("Invalid or unsupported service type in service request")]
     InvalidServiceType,
@@ -76,44 +54,14 @@ pub enum BridgeError {
     #[msg("Submitted price quote has expired and is no longer valid")]
     QuoteExpired,
 
-    #[msg("Service request has expired due to lack of fulfillment or response")]
-    RequestExpired,
-
-    #[msg("SOL payment amount does not match required or quoted amount")]
-    InvalidPaymentAmount,
-
-    #[msg("Invalid or inappropriate response by a bridge node to a service request")]
-    InvalidBridgeNodeResponse,
-
-    #[msg("Issues or failures in interacting with the oracle contract")]
-    OracleContractError,
-
-    #[msg("Bridge node fails to meet the minimum reliability score")]
-    ReliabilityScoreViolation,
-
     #[msg("Bridge node is inactive based on defined inactivity threshold")]
     BridgeNodeInactive,
 
     #[msg("Insufficient funds in escrow to cover the transaction")]
     InsufficientEscrowFunds,
 
-    #[msg("Transaction fee exceeds specified limits")]
-    ExcessiveTransactionFee,
-
-    #[msg("Errors related to operations of the service request queue")]
-    InvalidRequestQueueOperation,
-
-    #[msg("Bridge node has not paid the required registration fee")]
-    RegistrationFeeNotPaid,
-
-    #[msg("Invalid or unrecognized Pastel transaction ID")]
-    InvalidTxidStatus,
-
     #[msg("Duplicate service request ID")]
     DuplicateServiceRequestId,
-
-    #[msg("Duplicate price quote for service request sent by the same bridge node")]
-    DuplicatePriceQuote,
 
     #[msg("Contract is paused and no operations are allowed")]
     ContractPaused,
@@ -189,12 +137,6 @@ pub enum BridgeError {
 
     #[msg("Txid to Service Request ID Mapping account not found")]
     TxidMappingNotFound,
-
-    #[msg("There was a problem releasing the escrowed funds to the selected bridge node")]
-    EscrowReleaseError,
-
-    #[msg("There was a problem refunding the escrowed funds to the end user")]
-    EscrowRefundError,
 
     #[msg("Insufficient registration fee paid by bridge node")]
     InsufficientRegistrationFee,
@@ -1658,56 +1600,6 @@ pub struct HashWeight {
     pub weight: i32,
 }
 
-#[derive(Accounts)]
-pub struct RequestReward<'info> {
-    #[account(mut)]
-    pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
-    #[account(mut)]
-    pub bridge_contract_state: Account<'info, BridgeContractState>,
-    #[account(mut)]
-    pub bridge_node_data_account: Account<'info, BridgeNodeDataAccount>,
-    pub system_program: Program<'info, System>,
-}
-
-
-pub fn request_reward_helper(ctx: Context<RequestReward>, bridge_node_reward_address: Pubkey) -> Result<()> {
-
-    // Temporarily store reward eligibility and amount
-    let mut reward_amount = 0;
-    let mut is_reward_valid = false;
-
-    // Find the bridge node in the PDA and check eligibility
-    if let Some(bridge_node) = ctx.accounts.bridge_node_data_account.bridge_nodes.iter().find(|c| c.reward_address == bridge_node_reward_address) {
-        let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
-        let is_eligible_for_rewards = bridge_node.is_eligible_for_rewards;
-        let is_banned = bridge_node.calculate_is_banned(current_unix_timestamp);
-
-        if is_eligible_for_rewards && !is_banned {
-            reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
-            is_reward_valid = true;
-        }
-    } else {
-        msg!("Bridge node with Solana address {} not found!", bridge_node_reward_address);
-        return Err(BridgeError::UnregisteredBridgeNode.into());
-    }
-
-    // Handle reward transfer after determining eligibility
-    if is_reward_valid {
-        // Transfer the reward from the reward pool to the contributor
-        **ctx.accounts.bridge_reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
-        **ctx.accounts.bridge_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
-
-        msg!("Paid out Valid Reward Request: Bridge Node Solana Address: {}, Amount in Lamports: {}", bridge_node_reward_address, reward_amount);
-    } else {
-
-        msg!("Invalid Reward Request: Bridge Node Solana Address: {}", bridge_node_reward_address);
-        return Err(BridgeError::NotEligibleForReward.into());
-    }
-
-    Ok(())
-}
-
-
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
     match index {
         0 => Some(TxidStatus::Invalid),
@@ -1717,7 +1609,6 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
         _ => None,
     }
 }
-
 
 impl BridgeNode {
 
@@ -1888,10 +1779,6 @@ pub mod solana_pastel_bridge_program {
             quoted_price_lamports
         )
     }
-
-    // pub fn request_reward(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
-    //     request_reward_helper(ctx, contributor_address)
-    // }
 
     pub fn set_oracle_contract(ctx: Context<SetOracleContract>, oracle_contract_pubkey: Pubkey) -> Result<()> {
         SetOracleContract::set_oracle_contract(ctx, oracle_contract_pubkey)
