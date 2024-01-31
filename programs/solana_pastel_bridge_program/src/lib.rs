@@ -2,19 +2,15 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::solana_program::account_info::AccountInfo;
 use anchor_lang::solana_program::sysvar::clock::Clock;
-use anchor_lang::solana_program::hash::{hash, Hash};
-mod oracle_integration;
-use oracle_integration::solana_pastel_oracle_program;
-use oracle_integration::{AddTxidForMonitoringCpi, AddTxidForMonitoringData, OracleContractState, PendingPaymentAccount};
+use anchor_lang::solana_program::hash::hash;
+use anchor_lang::solana_program::program::invoke;
+use anchor_lang::solana_program::system_instruction;
 
-const COST_IN_LAMPORTS_OF_ADDING_PASTEL_TXID_FOR_MONITORING: u64 = 100_000; // 0.0001 SOL in lamports
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
 const QUOTE_VALIDITY_DURATION: u64 = 21_600; // The time for which a submitted price quote remains valid. e.g., 6 hours in seconds
 const ESCROW_DURATION: u64 = 7_200; // Duration to hold SOL in escrow in seconds (2 hours); if the service request is not fulfilled within this time, the SOL is refunded to the user and the bridge node won't receive any payment even if they fulfill the request later.
-const DURATION_IN_SECONDS_TO_WAIT_BEFORE_CHECKING_TXID_STATUS_AFTER_SUBMITTING_TO_ORACLE_CONTRACT: u64 = 300; // amount of time to wait before checking the status of a txid submitted to the oracle contract
 const DURATION_IN_SECONDS_TO_WAIT_AFTER_ANNOUNCING_NEW_PENDING_SERVICE_REQUEST_BEFORE_SELECTING_BEST_QUOTE: u64 = 300; // amount of time to wait after advertising pending service requests to select the best quote
-const TRANSACTION_FEE_PERCENTAGE: u8 = 2; // Percentage of transaction fee
-const ORACLE_REWARD_PERCENTAGE: u8 = 20; // Percentage of the transaction fee allocated to the oracle contract
+const TRANSACTION_FEE_PERCENTAGE: u8 = 2; // Percentage of the selected (best) quoted price in SOL to be retained as a fee by the bridge contract for each successfully completed service request; the rest should be paid to the bridge node. If the bridge node fails to fulfill the service request, the full escrow  is refunded to the user without any deduction for the service fee. 
 const BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS: u64 = 1_000_000; // Registration fee for bridge nodes in lamports
 const SERVICE_REQUEST_VALIDITY: u64 = 86_400; // Time until a service request expires if not responded to. e.g., 24 hours in seconds
 const BRIDGE_NODE_INACTIVITY_THRESHOLD: u64 = 86_400; // e.g., 24 hours in seconds
@@ -27,10 +23,10 @@ const TEMPORARY_BAN_DURATION: u64 =  24 * 60 * 60; // Duration of temporary ban 
 const BASE_REWARD_AMOUNT_IN_LAMPORTS: u64 = 100_000; // 0.0001 SOL in lamports is the base reward amount
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE: u64 = 2 * 60; // Maximum duration in seconds from service quote request before selecting the best quote (e.g., 2 minutes)
 const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
-const SUBMISSION_COUNT_RETENTION_PERIOD: u64 = 24 * 60 * 60; // Number of seconds to retain submission counts (i.e., 24 hours)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
 const MAX_ALLOWED_TIMESTAMP_DIFFERENCE: u64 = 600; // 10 minutes in seconds; maximum allowed time difference between the last update of the oracle's consensus data and the bridge contract's access to this data to ensure the bridge contract acts on timely and accurate data.
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000; // Number of lamports in one SOL
 
 
 #[error_code]
@@ -43,6 +39,9 @@ pub enum BridgeError {
 
     #[msg("Action attempted by an unregistered bridge node")]
     UnregisteredBridgeNode,
+
+    #[msg("Bridge node is not eligible for reward")]
+    NotEligibleForReward,
 
     #[msg("Service request is invalid or malformed")]
     InvalidServiceRequest,
@@ -217,31 +216,6 @@ impl From<BridgeError> for ProgramError {
     }
 }
 
-// Function to convert a hexadecimal string to a [u8; 32] array
-fn hex_string_to_bytes(hex_string: &str) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-
-    if hex_string.len() != 64 {
-        // If the string length is incorrect, log an error and return zeros
-        eprintln!("Error: Hex string must be 64 characters long");
-        return bytes;
-    }
-
-    for (i, chunk) in hex_string.chars().collect::<Vec<char>>().chunks(2).enumerate() {
-        // Combine two characters into a slice and parse
-        let pair = chunk.iter().collect::<String>();
-        match u8::from_str_radix(&pair, 16) {
-            Ok(b) => bytes[i] = b,
-            Err(_) => {
-                // Log an error and return zeros if there's an invalid hex character
-                eprintln!("Error: Invalid hex character in chunk: {}", pair);
-                return bytes;
-            }
-        };
-    }
-
-    bytes
-}
 
 // Enums:
 
@@ -337,14 +311,14 @@ pub struct BridgeNode {
 // These requests initially come in with the type of service requested, the file hash, the IPFS CID, the file size, and the file MIME type;
 // Then the bridge nodes submit price quotes for the service request, and the contract selects the best quote and selects a bridge node to fulfill the request.
 // The end user then pays the quoted amount in SOL to the Bridge contract, which holds this amount in escrow until the service is completed successfully.
-// The selected bridge node then performs the service and submits the Pastel transaction ID to the bridge contract when it's available; the bridge contract then
-// submits the Pastel transaction ID to the oracle contract for monitoring. When the oracle contract confirms the status of the transaction as being mined and activated,
-// the bridge contract confirms the service confirms that the ticket has been activated and that the file referenced in the ticket matches the file hash submitted in the
+// The selected bridge node then performs the service and submits the Pastel transaction ID to the bridge contract when it's available; the bridge node ALSO submits the same
+// Pastel transaction ID (txid) to the oracle contract for monitoring. When the oracle contract confirms the status of the transaction as being mined and activated,
+// the bridge contract confirms that the ticket has been activated and that the file referenced in the ticket matches the file hash submitted in the
 // service request. If the file hash matches, the escrowed SOL is released to the bridge node (minus the service fee paid to the Bridge contract) and the service request is marked as completed.
 // If the file hash does not match, or if the oracle contract does not confirm the transaction as being mined and activated within the specified time limit, the escrowed SOL is refunded to the end user.
 // If the bridge node fails to submit the Pastel transaction ID within the specified time limit, the service request is marked as failed and the escrowed SOL is refunded to the end user.
-// The retained service fee (assuming a successful service request) is distributed to the the bridge contract's reward pool, with a portion sent to the oracle contract's reward pool.
-// The bridge node's scores are then updated based on the outcome of the service request.
+// The retained service fee (assuming a successful service request) is distributed to the the bridge contract's reward pool and the selected bridge node's scores are then
+// updated based on the outcome of the service request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServiceRequest {
     pub service_request_id: String, // Unique identifier for the service request; SHA256 hash of (service_type_as_str + first_6_characters_of_sha3_256_hash_of_corresponding_file + user_sol_address) expressed as a 32-byte array.
@@ -368,7 +342,6 @@ pub struct ServiceRequest {
     pub payment_release_timestamp: Option<u64>, // Timestamp when the payment was released from escrow, if applicable.    
     pub escrow_amount_lamports: Option<u64>, // Amount of SOL held in escrow for this service request.
     pub service_fee_retained_by_bridge_contract_lamports: Option<u64>, // Amount of SOL retained by the bridge contract as a service fee, taken from the escrowed amount when the service request is completed.
-    pub service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: Option<u64>, // Amount of SOL remitted to the oracle contract by the bridge contract as a service fee, taken from the escrowed amount when the service request is completed.
     pub pastel_txid: Option<String>, // The Pastel transaction ID for the service request once it is created.
 }
 
@@ -404,7 +377,6 @@ pub struct BridgeContractState {
     pub is_paused: bool,
     pub admin_pubkey: Pubkey,
     pub oracle_contract_pubkey: Pubkey,    
-    pub oracle_fee_receiving_account_pubkey: Pubkey,
     pub bridge_reward_pool_account_pubkey: Pubkey,
     pub bridge_escrow_account_pubkey: Pubkey,
     pub bridge_nodes_data_account_pubkey: Pubkey,
@@ -504,10 +476,6 @@ impl<'info> Initialize<'info> {
 
         state.oracle_contract_pubkey = Pubkey::default();
         msg!("Oracle Contract Pubkey set to default");
-
-        state.oracle_fee_receiving_account_pubkey = Pubkey::default();
-        msg!("Oracle Fee Receiving Account Pubkey set to default; run the set_oracle_contract_pubkey instruction to set this value");
-
         // Initialize bridge nodes data PDA
         let bridge_nodes_data_account = &mut self.bridge_nodes_data_account;
         bridge_nodes_data_account.bridge_nodes = Vec::new();
@@ -786,7 +754,7 @@ pub fn validate_service_request(request: &ServiceRequest) -> Result<()> {
         return Err(BridgeError::InvalidInitialFieldValues.into());
     }
 
-    if request.escrow_amount_lamports.is_some() || request.service_fee_retained_by_bridge_contract_lamports.is_some() || request.service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports.is_some() {
+    if request.escrow_amount_lamports.is_some() || request.service_fee_retained_by_bridge_contract_lamports.is_some() {
         msg!("Error: Initial escrow amount and fees must be None or zero");
         return Err(BridgeError::InvalidEscrowOrFeeAmounts.into());
     }
@@ -813,7 +781,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
         &first_6_chars_of_hash,
         &ctx.accounts.user.key(),
     );
-
+    
     // Check for duplicate service_request_id
     let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
     if temp_service_requests_data_account.service_requests.iter().any(|request| request.service_request_id == service_request_id) {
@@ -822,7 +790,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
     }
 
     // Create or update the ServiceRequest struct
-    let mut service_request_account = &mut ctx.accounts.service_request_submission_account;
+    let service_request_account = &mut ctx.accounts.service_request_submission_account;
     service_request_account.service_request = ServiceRequest {
         service_request_id,
         service_type,
@@ -832,7 +800,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
         user_sol_address: *ctx.accounts.user.key,
         status: RequestStatus::Pending,
         payment_in_escrow: false,
-        request_expiry: 0, // Set appropriate expiry timestamp
+        request_expiry: current_timestamp + ESCROW_DURATION, // Set appropriate expiry timestamp
         sol_received_from_user_timestamp: None,
         selected_bridge_node_pastelid: None,
         best_quoted_price_in_lamports: None,
@@ -845,7 +813,6 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
         payment_release_timestamp: None,
         escrow_amount_lamports: None,
         service_fee_retained_by_bridge_contract_lamports: None,
-        service_fee_remitted_to_oracle_contract_by_bridge_contract_lamports: None,
         pastel_txid: None,
     };
 
@@ -925,6 +892,17 @@ pub fn submit_price_quote_helper(
     // Obtain the current timestamp
     let quote_timestamp = Clock::get()?.unix_timestamp as u64;
 
+    // Find the service request using the service_request_id_string
+    let service_request = ctx.accounts.temp_service_requests_data_account.service_requests.iter()
+        .find(|request| request.service_request_id == service_request_id)
+        .ok_or(ProgramError::Custom(BridgeError::ServiceRequestNotFound as u32))?;
+
+    // Check if the current timestamp is within the allowed window for quote submission
+    if quote_timestamp < service_request.service_request_creation_timestamp + DURATION_IN_SECONDS_TO_WAIT_AFTER_ANNOUNCING_NEW_PENDING_SERVICE_REQUEST_BEFORE_SELECTING_BEST_QUOTE {
+        msg!("Quote submission is too early. Please wait until the waiting period is over.");
+        return Err(ProgramError::Custom(BridgeError::QuoteResponseTimeExceeded as u32));
+    }
+
     // Validate the price quote
     validate_price_quote_submission(
         &ctx.accounts.bridge_nodes_data_account,
@@ -991,6 +969,12 @@ pub fn validate_price_quote_submission(
         return Err(BridgeError::ServiceRequestNotPending.into());
     }
 
+    // Ensure the price quote is submitted within MAX_QUOTE_RESPONSE_TIME seconds of service request creation
+    if quote_timestamp > service_request.service_request_creation_timestamp + MAX_QUOTE_RESPONSE_TIME {
+        msg!("Error: Price quote submitted beyond the maximum response time");
+        return Err(BridgeError::QuoteResponseTimeExceeded.into());
+    }
+
     // Check Maximum Quote Response Time
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
     if quote_timestamp > service_request.service_request_creation_timestamp + MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE {
@@ -1053,7 +1037,6 @@ pub fn validate_price_quote_submission(
 pub fn choose_best_price_quote(
     best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
     temp_service_requests_data_account: &mut TempServiceRequestsDataAccount,
-    bridge_nodes_data_account: &BridgeNodesDataAccount,
     current_timestamp: u64
 ) -> Result<()> {
     // Find the service request corresponding to the best price quote
@@ -1132,7 +1115,6 @@ pub struct SubmitPastelTxid<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
 pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>, service_request_id: String, pastel_txid: String) -> ProgramResult {
     let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
 
@@ -1173,81 +1155,6 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
     Ok(())
 }
 
-fn is_valid_pastel_txid(txid: &str) -> bool {
-    txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) // Check length and character set
-}
-
-#[derive(Accounts)]
-pub struct SubmitPastelTxidToOracle<'info> {
-    #[account(mut)]
-    pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
-
-    #[account(mut)]
-    pub bridge_contract_state: Account<'info, BridgeContractState>,
-
-    #[account(mut)]
-    pub oracle_contract_state: Account<'info, OracleContractState>,
-
-    #[account(init, payer = bridge_reward_pool_pda, space = 1024)]
-    pub pending_payment_account: Account<'info, PendingPaymentAccount>,
-
-    /// CHECK: This is the PDA account for the bridge reward pool, which will pay the fees.
-    /// Seeds are ['bridge_reward_pool_account'.as_ref(), bridge_contract_state.key().as_ref()]
-    #[account(mut, seeds = [b"bridge_reward_pool_account", bridge_contract_state.key().as_ref()], bump)]
-    pub bridge_reward_pool_pda: AccountInfo<'info>,
-
-    #[account(address = bridge_contract_state.oracle_contract_pubkey)]
-    pub oracle_program: Program<'info, System>,
-
-    pub system_program: Program<'info, System>,
-}
-
-
-pub fn submit_pastel_txid_to_oracle(
-    ctx: Context<SubmitPastelTxidToOracle>,
-    pastel_txid: String,
-    bridge_reward_pool_bump: u8,
-) -> Result<()> {
-    let data = oracle_integration::AddTxidForMonitoringData { txid: pastel_txid };
-
-    let oracle_contract_state = ctx.accounts.oracle_contract_state.to_account_info().clone();
-    let pending_payment_account = ctx.accounts.pending_payment_account.to_account_info().clone();
-    let caller = ctx.accounts.service_request_submission_account.to_account_info().clone();
-    let user = ctx.accounts.bridge_reward_pool_pda.to_account_info().clone();
-    let system_program = ctx.accounts.system_program.clone();
-    let oracle_program = ctx.accounts.oracle_program.clone();
-
-    let bridge_contract_state_key = ctx.accounts.bridge_contract_state.key();
-    let bridge_reward_pool_seeds: &[&[u8]] = &[
-        b"bridge_reward_pool_account".as_ref(), 
-        bridge_contract_state_key.as_ref(),
-        &[bridge_reward_pool_bump]
-    ];
-
-    // Construct CPI accounts using the cloned references
-    let cpi_accounts = oracle_integration::AddTxidForMonitoringCpi {
-        oracle_contract_state,
-        pending_payment_account,
-        caller,
-        user,
-        system_program,
-    };
-
-    // Use a let binding for bridge_reward_pool_seeds to extend its lifetime
-    let signer_seeds: &[&[&[u8]]] = &[bridge_reward_pool_seeds];
-
-    // Create CPI context with the correctly scoped signer seeds
-    let cpi_ctx = CpiContext::new_with_signer(
-        oracle_program.to_account_info(),
-        cpi_accounts,
-        signer_seeds,
-    );
-
-    oracle_integration::solana_pastel_oracle_program::add_txid_for_monitoring_cpi(cpi_ctx, data)?;
-
-    Ok(())
-}
-
 #[derive(Accounts)]
 pub struct AccessOracleData<'info> {
     #[account(
@@ -1275,9 +1182,13 @@ pub struct AccessOracleData<'info> {
     #[account(mut)]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
 
-    // The user's account to refund in case of failure
+    #[account(mut)]
+    pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
+
     #[account(mut)]
     pub user_account: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 pub fn compute_consensus(aggregated_data: &AggregatedConsensusData) -> (TxidStatus, String) {
@@ -1300,49 +1211,87 @@ pub fn get_aggregated_data<'a>(
 
 impl<'info> AccessOracleData<'info> {
     pub fn process(
-        &self, 
+        &mut self, 
         txid: String, 
-        service_request_id: &String, 
-        service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>
+        service_request_id: &String,
+        bridge_escrow_account: &mut AccountInfo<'info>,
+        system_program: &Program<'info, System>,
+        service_request_txid_mapping_account: &Account<ServiceRequestTxidMappingDataAccount>,
     ) -> Result<()> {
-        // Search for the aggregated data matching the given txid
-        if let Some(consensus_data) = get_aggregated_data(&self.aggregated_consensus_data_account, &txid) {
-            // Validate the consensus data
-            self.validate_consensus_data(consensus_data, service_request_id, service_request_txid_mapping_account)?;
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-            // Process the consensus data as required
-            if self.is_txid_mined_and_file_hash_matches(consensus_data, service_request_txid_mapping_account, service_request_id) {
-                // Retrieve the end user's Solana address
-                let user_sol_address = self.get_user_sol_address(service_request_id)?;
-    
-                // Release the escrowed amount to the bridge node and update the bridge node score
+        let service_request = self.temp_service_requests_data_account.service_requests.iter()
+            .find(|request| &request.service_request_id == service_request_id)
+            .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+        let service_request_data = (
+            service_request.user_sol_address,
+            service_request.escrow_amount_lamports,
+        );
+                    
+        if current_timestamp > service_request.request_expiry {
+            let user_sol_address = self.get_user_sol_address(service_request_id)?;
+            send_sol(
+                bridge_escrow_account,
+                user_sol_address,
+                service_request.escrow_amount_lamports.unwrap_or_default(),
+                system_program,
+            )?;
+            self.update_service_request_state(service_request_id, RequestStatus::Failed)?;
+            return Ok(());
+        }
+
+        // Fetch the aggregated data and drop the borrow immediately
+        let consensus_data = {
+            let consensus_data_option = get_aggregated_data(&self.aggregated_consensus_data_account, &txid);
+            consensus_data_option.cloned() // Clone the data to drop the borrow
+        };
+
+        // Extract the necessary data before the if-else block
+        let bridge_reward_pool_account_key = self.bridge_reward_pool_account.to_account_info().key();
+
+        if let Some(consensus_data) = consensus_data {
+            self.validate_consensus_data(&consensus_data, service_request_id, service_request_txid_mapping_account)?;
+            let txid_mined_and_matched = self.is_txid_mined_and_file_hash_matches(&consensus_data, &self.service_request_txid_mapping_data_account, service_request_id);
+
+            if txid_mined_and_matched {
                 self.handle_escrow_transactions(
-                    consensus_data, 
-                    true, 
-                    &mut self.bridge_reward_pool_account.to_account_info(), 
-                    &mut self.user_account.to_account_info()
+                    &consensus_data,
+                    bridge_escrow_account,
+                    bridge_reward_pool_account_key,
+                    true, // success
+                    service_request_id,
+                    system_program,
+                    service_request_data,
                 )?;
-
-                // Update the service request state to Completed
-                self.update_service_request_state_to_completed(consensus_data)?;
             } else {
-                // Retrieve the end user's Solana address
-                let user_sol_address = self.get_user_sol_address(service_request_id)?;
-
-                // Handle failure case: refund escrowed funds to user and adjust bridge node score
                 self.handle_escrow_transactions(
-                    consensus_data, 
-                    false, 
-                    &mut self.bridge_reward_pool_account.to_account_info(), 
-                    &mut self.user_account.to_account_info()
+                    &consensus_data,
+                    bridge_escrow_account,
+                    bridge_reward_pool_account_key,
+                    false, // failure (refund)
+                    service_request_id,
+                    system_program,
+                    service_request_data,
                 )?;
             }
         } else {
-            // Handle the case where the txid is not found in the oracle data
             return Err(BridgeError::TxidNotFound.into());
         }
 
         Ok(())
+    }
+
+    fn get_selected_bridge_node_sol_address(&self, service_request_id: &String) -> Result<Pubkey> {
+        let bridge_node_pastelid = self.temp_service_requests_data_account.service_requests.iter()
+            .find(|request| &request.service_request_id == service_request_id)
+            .and_then(|request| request.selected_bridge_node_pastelid.as_ref())
+            .ok_or(BridgeError::BridgeNodeNotSelected)?;
+    
+        self.bridge_nodes_data_account.bridge_nodes.iter()
+            .find(|node| &node.pastel_id == bridge_node_pastelid)
+            .map(|node| node.reward_address)
+            .ok_or(BridgeError::BridgeNodeNotSelected.into())
     }
 
     fn get_user_sol_address(&self, service_request_id: &String) -> Result<Pubkey> {
@@ -1398,8 +1347,22 @@ impl<'info> AccessOracleData<'info> {
     
         false
     }
+
+    fn update_service_request_state(
+        &mut self, 
+        service_request_id: &String, 
+        status: RequestStatus
+    ) -> Result<()> {
+        let service_request = self.temp_service_requests_data_account.service_requests.iter_mut()
+            .find(|request| request.service_request_id == *service_request_id)
+            .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+        service_request.status = status;
+
+        Ok(())
+    }    
     
-    fn update_service_request_state_to_completed(&self, consensus_data: &AggregatedConsensusData) -> Result<()> {
+    fn update_service_request_state_to_completed(&mut self, consensus_data: &AggregatedConsensusData) -> Result<()> {
         // Retrieve the mapping between service_request_id and pastel_txid
         let service_request_id = self.get_service_request_id_for_pastel_txid(consensus_data.txid.as_str())?;
 
@@ -1423,64 +1386,111 @@ impl<'info> AccessOracleData<'info> {
     fn get_service_request_id_for_pastel_txid(&self, txid: &str) -> Result<String> {
         self.service_request_txid_mapping_data_account.mappings.iter()
             .find(|mapping| mapping.pastel_txid == txid)
-            .map(|mapping| mapping.service_request_id)
+            .map(|mapping| mapping.service_request_id.clone()) // Clone the string
             .ok_or(BridgeError::TxidMappingNotFound.into())
-    }    
+    }
 
     fn handle_escrow_transactions(
-        &self, 
-        consensus_data: &AggregatedConsensusData, 
-        success: bool,
-        reward_pool_account: &mut AccountInfo<'info>,
-        user_account: &mut AccountInfo<'info>,
+        &mut self,
+        consensus_data: &AggregatedConsensusData,
+        bridge_escrow_account: &mut AccountInfo<'info>,
+        bridge_reward_pool_account_key: Pubkey,
+        is_success: bool,
+        service_request_id: &String,
+        system_program: &Program<'info, System>,
+        service_request_data: (Pubkey, Option<u64>),
     ) -> Result<()> {
-        let service_request_id = self.get_service_request_id_for_pastel_txid(&consensus_data.txid)?;
-        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+        let (user_sol_address, escrow_amount_lamports) = service_request_data;
+        let escrow_amount = escrow_amount_lamports.ok_or(BridgeError::EscrowNotFunded)?;
+    
+        if is_success {
+            // Calculate the service fee
+            let service_fee = escrow_amount * TRANSACTION_FEE_PERCENTAGE as u64 / 100;
+            let amount_to_bridge_node = escrow_amount - service_fee;
+    
+            // Transfer the service fee to the bridge reward pool account
+            send_sol(
+                bridge_escrow_account,
+                bridge_reward_pool_account_key,
+                service_fee,
+                system_program,
+            )?;
+    
+            // Send the remaining amount to the bridge node
+            send_sol(
+                bridge_escrow_account,
+                self.get_selected_bridge_node_sol_address(service_request_id)?,
+                amount_to_bridge_node,
+                system_program,
+            )?;
+    
+            // Update the service request state to Completed
+            self.update_service_request_state_to_completed(consensus_data)?;
+    
+            msg!("Service Request ID: {} completed successfully! Sent {} SOL to Bridge Node at address: {} and transferred the service fee of {} SOL to the Bridge Reward Pool",
+                service_request_id,
+                amount_to_bridge_node as f64 / LAMPORTS_PER_SOL as f64,
+                self.get_selected_bridge_node_sol_address(service_request_id)?,
+                service_fee as f64 / LAMPORTS_PER_SOL as f64,
+            );
 
-        // Retrieve the service request
-        let service_request = self.temp_service_requests_data_account.service_requests.iter_mut()
-            .find(|request| request.service_request_id == service_request_id)
-            .ok_or(BridgeError::ServiceRequestNotFound)?;
-
-        // Retrieve the bridge node
-        let bridge_node = self.bridge_nodes_data_account.bridge_nodes.iter_mut()
-            .find(|node| node.pastel_id == service_request.selected_bridge_node_pastelid.clone().unwrap_or_default())
-            .ok_or(BridgeError::UnregisteredBridgeNode)?;
-
-        if success {
-            // Release escrowed funds to the bridge node, deducting service fees
-            let service_fee = service_request.escrow_amount_lamports.unwrap_or_default() * TRANSACTION_FEE_PERCENTAGE as u64 / 100;
-            let oracle_fee = service_fee * ORACLE_REWARD_PERCENTAGE as u64 / 100;
-            let reward_amount = service_fee - oracle_fee;
-
-            // Update the lamports of the reward pool account
-            **reward_pool_account.try_borrow_mut_lamports()? += reward_amount;
-
-            // Update bridge node's scores
-            update_bridge_node_status(bridge_node, true, current_timestamp);
-
-            // Mark service request as completed
-            service_request.status = RequestStatus::Completed;
         } else {
-            // Refund escrowed funds to the user
-            let refund_amount = service_request.escrow_amount_lamports.unwrap_or_default();
-
-            // Update the lamports of the user account
-            **user_account.try_borrow_mut_lamports()? += refund_amount;
-
-            // Adjust bridge node's scores
-            update_bridge_node_status(bridge_node, false, current_timestamp);
-
-            // Mark service request as failed
-            service_request.status = RequestStatus::Failed;
+            // Refund the full escrow amount to the user in case of failure
+            send_sol(
+                bridge_escrow_account,
+                user_sol_address,
+                escrow_amount,
+                system_program,
+            )?;
+    
+            // Update the service request state to Failed
+            self.update_service_request_state(service_request_id, RequestStatus::Failed)?;
         }
-
+    
         Ok(())
     }
 
-
 }
 
+
+// Refactored to be standalone functions
+pub fn send_sol<'info>(
+    from_account: &mut AccountInfo<'info>, 
+    to_pubkey: Pubkey, 
+    amount: u64,
+    system_program: &Program<'info, System>,
+) -> ProgramResult {
+    let ix = system_instruction::transfer(
+        from_account.key, 
+        &to_pubkey, 
+        amount,
+    );
+
+    invoke(
+        &ix,
+        &[
+            from_account.clone(),
+            system_program.to_account_info(),
+        ],
+    )
+}
+
+pub fn refund_escrow_to_user(
+    escrow_account: &mut AccountInfo<'_>, 
+    user_account: &mut AccountInfo<'_>, 
+    refund_amount: u64
+) -> ProgramResult {
+    // Check if escrow account has enough balance
+    if **escrow_account.lamports.borrow() < refund_amount {
+        return Err(BridgeError::InsufficientEscrowFunds.into());
+    }
+
+    // Transfer the refund from the escrow account to the user account
+    **escrow_account.try_borrow_mut_lamports()? -= refund_amount;
+    **user_account.try_borrow_mut_lamports()? += refund_amount;
+
+    Ok(())
+}
 
 pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
     if !success {
@@ -1610,7 +1620,8 @@ pub fn apply_permanent_bans(bridge_nodes_data_account: &mut Account<BridgeNodesD
     bridge_nodes_data_account.bridge_nodes.retain(|node| node.ban_expiry != u64::MAX);
 }
 
-fn post_consensus_tasks(
+
+pub fn handle_post_transaction_tasks(
     bridge_nodes_data_account: &mut Account<BridgeNodesDataAccount>,
     temp_service_requests_data_account: &mut Account<TempServiceRequestsDataAccount>,
     service_request_txid_mapping_data_account: &mut Account<ServiceRequestTxidMappingDataAccount>,
@@ -1630,7 +1641,7 @@ fn post_consensus_tasks(
         // Find the corresponding service request for this mapping
         if let Some(service_request) = temp_service_requests_data_account.service_requests.iter().find(|sr| sr.service_request_id == mapping.service_request_id) {
             // Retain the mapping if it's within the validity period
-            current_timestamp - service_request.service_request_creation_timestamp < SUBMISSION_COUNT_RETENTION_PERIOD
+            current_timestamp - service_request.service_request_creation_timestamp < DATA_RETENTION_PERIOD
         } else {
             // If there is no corresponding service request, do not retain the mapping
             false
@@ -1647,75 +1658,54 @@ pub struct HashWeight {
     pub weight: i32,
 }
 
-// Function to update hash weight
-fn update_hash_weight(hash_weights: &mut Vec<HashWeight>, hash: &str, weight: i32) {
-    let mut found = false;
-
-    for hash_weight in hash_weights.iter_mut() {
-        if hash_weight.hash.as_str() == hash {
-            hash_weight.weight += weight;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        hash_weights.push(HashWeight {
-            hash: hash.to_string(), // Clone only when necessary
-            weight,
-        });
-    }
+#[derive(Accounts)]
+pub struct RequestReward<'info> {
+    #[account(mut)]
+    pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    #[account(mut)]
+    pub bridge_node_data_account: Account<'info, BridgeNodeDataAccount>,
+    pub system_program: Program<'info, System>,
 }
 
 
-// #[derive(Accounts)]
-// pub struct RequestReward<'info> {
-//     #[account(mut)]
-//     pub reward_pool_account: Account<'info, RewardPool>,
-//     #[account(mut)]
-//     pub oracle_contract_state: Account<'info, OracleContractState>,
-//     #[account(mut)]
-//     pub contributor_data_account: Account<'info, ContributorDataAccount>,
-//     pub system_program: Program<'info, System>,
-// }
+pub fn request_reward_helper(ctx: Context<RequestReward>, bridge_node_reward_address: Pubkey) -> Result<()> {
 
+    // Temporarily store reward eligibility and amount
+    let mut reward_amount = 0;
+    let mut is_reward_valid = false;
 
-// pub fn request_reward_helper(ctx: Context<RequestReward>, contributor_address: Pubkey) -> Result<()> {
+    // Find the bridge node in the PDA and check eligibility
+    if let Some(bridge_node) = ctx.accounts.bridge_node_data_account.bridge_nodes.iter().find(|c| c.reward_address == bridge_node_reward_address) {
+        let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
+        let is_eligible_for_rewards = bridge_node.is_eligible_for_rewards;
+        let is_banned = bridge_node.calculate_is_banned(current_unix_timestamp);
 
-//     // Temporarily store reward eligibility and amount
-//     let mut reward_amount = 0;
-//     let mut is_reward_valid = false;
+        if is_eligible_for_rewards && !is_banned {
+            reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
+            is_reward_valid = true;
+        }
+    } else {
+        msg!("Bridge node with Solana address {} not found!", bridge_node_reward_address);
+        return Err(BridgeError::UnregisteredBridgeNode.into());
+    }
 
-//     // Find the contributor in the PDA and check eligibility
-//     if let Some(contributor) = ctx.accounts.contributor_data_account.contributors.iter().find(|c| c.reward_address == contributor_address) {
-//         let current_unix_timestamp = Clock::get()?.unix_timestamp as u64;
-//         let is_eligible_for_rewards = contributor.is_eligible_for_rewards;
-//         let is_banned = contributor.calculate_is_banned(current_unix_timestamp);
+    // Handle reward transfer after determining eligibility
+    if is_reward_valid {
+        // Transfer the reward from the reward pool to the contributor
+        **ctx.accounts.bridge_reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
+        **ctx.accounts.bridge_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
 
-//         if is_eligible_for_rewards && !is_banned {
-//             reward_amount = BASE_REWARD_AMOUNT_IN_LAMPORTS; // Adjust based on your logic
-//             is_reward_valid = true;
-//         }
-//     } else {
-//         msg!("Contributor not found: {}", contributor_address);
-//         return Err(BridgeError::UnregisteredOracle.into());
-//     }
+        msg!("Paid out Valid Reward Request: Bridge Node Solana Address: {}, Amount in Lamports: {}", bridge_node_reward_address, reward_amount);
+    } else {
 
-//     // Handle reward transfer after determining eligibility
-//     if is_reward_valid {
-//         // Transfer the reward from the reward pool to the contributor
-//         **ctx.accounts.reward_pool_account.to_account_info().lamports.borrow_mut() -= reward_amount;
-//         **ctx.accounts.oracle_contract_state.to_account_info().lamports.borrow_mut() += reward_amount;
+        msg!("Invalid Reward Request: Bridge Node Solana Address: {}", bridge_node_reward_address);
+        return Err(BridgeError::NotEligibleForReward.into());
+    }
 
-//         msg!("Paid out Valid Reward Request: Contributor: {}, Amount: {}", contributor_address, reward_amount);
-//     } else {
-
-//         msg!("Invalid Reward Request: Contributor: {}", contributor_address);
-//         return Err(BridgeError::NotEligibleForReward.into());
-//     }
-
-//     Ok(())
-// }
+    Ok(())
+}
 
 
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
