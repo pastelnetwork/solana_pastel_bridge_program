@@ -1,5 +1,5 @@
 # Solana-Pastel Bridge Program
-This program is a complex Solana smart contract designed for a bridge between the Solana blockchain and the Pastel Network. It manages service requests, price quotes, escrow payments, and bridge node operations. Here is a detailed explanation of its workings, step-by-step reasoning, and underlying design principles:
+This Solana smart contract defines a bridge between the Solana blockchain and the Pastel Network. It manages service requests, price quotes, escrow payments, and bridge node operations. Here is a detailed explanation of its workings, step-by-step reasoning, and underlying design principles:
 
 ### Overview
 
