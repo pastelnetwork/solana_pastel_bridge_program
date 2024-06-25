@@ -1,7 +1,7 @@
 # Solana-Pastel Bridge Program
 This Solana smart contract defines a bridge between the Solana blockchain and the Pastel Network. It manages service requests, price quotes, escrow payments, and bridge node operations. Here is a detailed explanation of its workings, step-by-step reasoning, and underlying design principles:
 
-### Overview
+## Overview
 
 The program facilitates decentralized service requests from end-users on the Solana blockchain to bridge nodes on the Pastel Network. It ensures fair pricing, escrowed payments, and reliable execution of services such as Sense, Cascade, NFT creation, and Inference API. It also includes mechanisms for node registration, service request submission, price quote submission, reward distribution, and fund withdrawal.
 
@@ -88,6 +88,7 @@ The program facilitates decentralized service requests from end-users on the Sol
 ### Install Solana Testnet on Ubuntu
 
 #### Install Rustup
+
 ```bash
 curl https://sh.rustup.rs -sSf | sh
 rustup default nightly  
@@ -96,6 +97,7 @@ rustc --version
 ```
 
 #### Install Solana
+
 ```bash
 sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y  
 sudo apt install libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang make -y         
@@ -125,7 +127,7 @@ anchor test
 
 ---
 
-## Step-by-Step Narrative of How the System Works:
+## Step-by-Step Narrative of How the System Works
 
 #### 1. Initialization
 
@@ -241,7 +243,6 @@ anchor test
 4. **First Quote Submission**: Since Bob's quote is the first one submitted, it automatically becomes the best quote.
 5. **Subsequent Quotes**: Later, another bridge node, Alice, submits a quote for the same service request, quoting 45,000 lamports. The contract compares Alice's quote with Bob's and updates the best quote to Alice's, as her quote is lower.
 6. **Finalizing Best Quote**: After the waiting period for quotes has elapsed, the contract selects Alice's quote as the best quote for the service request.
-
 
 ### 5. Selecting the Bridge Node
 
@@ -413,23 +414,3 @@ anchor test
 - **Escrow and Other Accounts**:
   - **Functionality**: Besides the reward pool, the admin can also withdraw from the `BridgeEscrowAccount` and other operational accounts if necessary.
   - **Implementation**: Similar to reward pool withdrawals, the contract ensures that withdrawals from these accounts are securely executed and only authorized by the admin. It checks the available balance in the accounts to ensure that sufficient funds are present before allowing the withdrawal.
-
-### Conclusion
-
-**Decentralized System**:
-- The contract establishes a decentralized system where users can interact with bridge nodes without relying on a central authority. This decentralization is crucial for the trustless nature of blockchain applications.
-
-**Security**:
-- The contract ensures security through multiple layers of validation, including verifying service requests, price quotes, and Pastel transaction IDs. Emergency actions provide additional security measures for the admin to handle potential threats.
-
-**Fairness**:
-- Fairness is achieved through competitive quoting, ensuring users receive the best possible price for services. The scoring and banning mechanisms ensure that only reliable bridge nodes participate, maintaining the integrity of the network.
-
-**Transparency**:
-- All actions, from service requests to price quotes and admin actions, are recorded on the blockchain, ensuring transparency. Users and bridge nodes can audit the contract's operations to verify fairness and accuracy.
-
-**Scalability**:
-- The contract's modular design, with separate PDAs for different data sets and operations, allows it to handle increasing volumes of service requests and node registrations without compromising performance.
-
-**Flexibility**:
-- The ability to modify parameters, handle emergencies, and update critical components like the oracle contract public key ensures the contract can adapt to changing conditions and requirements.
