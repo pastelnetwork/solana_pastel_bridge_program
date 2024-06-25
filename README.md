@@ -61,8 +61,8 @@ anchor --version
 ### Get Code and Test
 
 ```bash
-git clone https://github.com/pastelnetwork/solana_pastel_oracle_program.git
-cd solana_pastel_oracle_program
+git clone https://github.com/pastelnetwork/solana_pastel_bridge_program.git                                                                                                                                                         INT ✘  base   at 12:33:21 PM 
+cd solana_pastel_bridge_program
 anchor test
 ```
 
