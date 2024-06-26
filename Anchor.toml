@@ -1,4 +1,6 @@
 [toolchain]
+anchor_version = "0.29.0"
+solana_version = "1.17.0"
 
 [features]
 seeds = false
@@ -11,7 +13,7 @@ solana_pastel_bridge_program = "Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "localnet"
 wallet = "/home/ubuntu/.config/solana/id.json"
 
 [scripts]

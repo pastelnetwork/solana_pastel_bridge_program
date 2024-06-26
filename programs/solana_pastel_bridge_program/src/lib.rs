@@ -1127,6 +1127,7 @@ pub struct AccessOracleData<'info> {
     #[account(mut)]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
 
+    /// CHECK: This account is provided by the user and is manually checked in the program logic to ensure it matches the user who created the service request.
     #[account(mut)]
     pub user_account: AccountInfo<'info>,
 
@@ -1165,6 +1166,11 @@ impl<'info> AccessOracleData<'info> {
         let service_request = self.temp_service_requests_data_account.service_requests.iter()
             .find(|request| &request.service_request_id == service_request_id)
             .ok_or(BridgeError::ServiceRequestNotFound)?;
+
+        // Validate user account
+        if service_request.user_sol_address != *self.user_account.key {
+            return Err(BridgeError::InvalidUserSolAddress.into());
+        }
 
         let service_request_data = (
             service_request.user_sol_address,
