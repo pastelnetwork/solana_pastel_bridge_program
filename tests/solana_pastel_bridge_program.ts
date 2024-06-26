@@ -372,62 +372,63 @@ describe("Solana Pastel Bridge Program Tests", () => {
       );
     });
   });
+    
+// Submit Price Quotes
+it("Submits price quotes for service requests", async () => {
+  // Find the PDA for the TempServiceRequestsDataAccount
+  const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("temp_service_requests_data")],
+    program.programId
+  );
 
-  // Submit Price Quotes
-  it("Submits price quotes for service requests", async () => {
-    // Find the PDA for the TempServiceRequestsDataAccount
-    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("temp_service_requests_data")],
-      program.programId
+  // Find the PDA for the BestPriceQuoteReceivedForServiceRequest
+  const [bestPriceQuoteAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("best_price_quote_account")],
+    program.programId
+  );
+
+  for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+    const serviceRequestId = serviceRequestIds[i];
+    const bridgeNode = bridgeNodes[i % bridgeNodes.length];
+    const quotedPriceLamports = new BN(Math.floor(Math.random() * 1000000) + 1); // Random price between 1 and 1,000,000 lamports
+
+    // Submit the price quote
+    await program.methods
+      .submitPriceQuote(bridgeNode.publicKey.toString(), serviceRequestId, quotedPriceLamports)
+      .accounts({
+        priceQuoteSubmissionAccount: web3.Keypair.generate().publicKey,
+        bridgeContractState: bridgeContractState.publicKey,
+        tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+        user: bridgeNode.publicKey,
+        bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
+        bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+        systemProgram: web3.SystemProgram.programId,
+      })
+      .signers([bridgeNode])
+      .rpc();
+
+    console.log(`Price quote for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.publicKey.toBase58()}`);
+  }
+
+  // Fetch the BestPriceQuoteReceivedForServiceRequest to verify the best price quotes are selected
+  const bestPriceQuoteData = await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+    bestPriceQuoteAccountPDA
+  );
+  console.log(
+    "Best price quotes received for service requests:",
+    bestPriceQuoteData
+  );
+
+  // Verify the best price quotes are selected for each service request
+  serviceRequestIds.forEach((serviceRequestId, index) => {
+    const bestQuote = bestPriceQuoteData.serviceRequestId === serviceRequestId;
+    assert.isTrue(
+      bestQuote,
+      `Best price quote should be selected for service request ${index + 1}`
     );
-
-    // Find the PDA for the BestPriceQuoteReceivedForServiceRequest
-    const [bestPriceQuoteAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("best_price_quote_account")],
-      program.programId
-    );
-
-    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      const serviceRequestId = serviceRequestIds[i];
-      const bridgeNode = bridgeNodes[i % bridgeNodes.length];
-      const quotedPriceLamports = new BN(Math.floor(Math.random() * 1000000) + 1); // Random price between 1 and 1,000,000 lamports
-
-      // Submit the price quote
-      await program.methods
-        .submitPriceQuote(bridgeNode.publicKey.toString(), serviceRequestId, quotedPriceLamports)
-        .accounts({
-          priceQuoteSubmissionAccount: web3.Keypair.generate().publicKey,
-          bridgeContractState: bridgeContractState.publicKey,
-          tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-          user: bridgeNode.publicKey,
-          bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
-          bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .signers([bridgeNode])
-        .rpc();
-
-      console.log(`Price quote for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.publicKey.toBase58()}`);
-    }
-
-    // Fetch the BestPriceQuoteReceivedForServiceRequest to verify the best price quotes are selected
-    const bestPriceQuoteData = await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
-      bestPriceQuoteAccountPDA
-    );
-    console.log(
-      "Best price quotes received for service requests:",
-      bestPriceQuoteData
-    );
-
-    // Verify the best price quotes are selected for each service request
-    serviceRequestIds.forEach((serviceRequestId, index) => {
-      assert.equal(
-        bestPriceQuoteData.serviceRequestId,
-        serviceRequestId,
-        `Best price quote should be selected for service request ${index + 1}`
-      );
-    });
   });
+});
+
 
   // Submit Pastel TxIDs
   it("Submits Pastel TxIDs for service requests", async () => {
