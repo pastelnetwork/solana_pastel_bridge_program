@@ -1725,19 +1725,18 @@ impl<'info> WithdrawFunds<'info> {
 }
 
 declare_id!("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
-
 #[program]
 pub mod solana_pastel_bridge_program {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, admin_pubkey: Pubkey) -> Result<()> {
         msg!("Initializing Bridge Contract State");
-        
+
         // Call the initialize_bridge_state method from the Initialize implementation
         ctx.accounts.initialize_bridge_state(admin_pubkey)?;
 
         msg!("Bridge Contract State Initialized with Admin Pubkey: {:?}", admin_pubkey);
-    
+
         // Logging PDAs for confirmation
         msg!("Bridge Reward Pool Account PDA: {:?}", ctx.accounts.bridge_reward_pool_account.key());
         msg!("Bridge Escrow Account PDA: {:?}", ctx.accounts.bridge_escrow_account.key());
@@ -1786,6 +1785,14 @@ pub mod solana_pastel_bridge_program {
         )
     }
 
+    pub fn submit_pastel_txid(
+        ctx: Context<SubmitPastelTxid>,
+        service_request_id: String,
+        pastel_txid: String,
+    ) -> ProgramResult {
+        submit_pastel_txid_from_bridge_node_helper(ctx, service_request_id, pastel_txid)
+    }
+
     pub fn set_oracle_contract(ctx: Context<SetOracleContract>, oracle_contract_pubkey: Pubkey) -> Result<()> {
         SetOracleContract::set_oracle_contract(ctx, oracle_contract_pubkey)
     }
@@ -1810,6 +1817,22 @@ pub mod solana_pastel_bridge_program {
             aggregated_consensus_data_amount,
             service_request_txid_mapping_data_amount
         )}
+        
+    pub fn process_oracle_data(
+        ctx: Context<AccessOracleData>,
+        txid: String,
+        service_request_id: String,
+    ) -> Result<()> {
+        let bridge_escrow_account = &mut ctx.accounts.bridge_escrow_account.to_account_info().clone();
+        let system_program = &ctx.accounts.system_program.clone();
+        let service_request_txid_mapping_data_account = &ctx.accounts.service_request_txid_mapping_data_account.clone();
 
+        ctx.accounts.process(
+            txid,
+            &service_request_id,
+            bridge_escrow_account,
+            system_program,
+            service_request_txid_mapping_data_account,
+        )
+    }
 }
-    

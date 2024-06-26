@@ -104,12 +104,12 @@ describe("Solana Pastel Bridge Program Tests", () => {
   it("Initializes and expands the bridge contract state", async () => {
     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("reward_pool")],
+      [Buffer.from("bridge_reward_pool_account")],
       program.programId
     );
     const [feeReceivingContractAccountPDA] =
       await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("fee_receiving_contract")],
+        [Buffer.from("bridge_escrow_account")],
         program.programId
       );
 
@@ -235,12 +235,12 @@ describe("Solana Pastel Bridge Program Tests", () => {
   it("Registers new bridge nodes", async () => {
     // Find the PDAs for the RewardPoolAccount and FeeReceivingContractAccount
     const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("reward_pool")],
+      [Buffer.from("bridge_reward_pool_account")],
       program.programId
     );
     const [feeReceivingContractAccountPDA] =
       await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("fee_receiving_contract")],
+        [Buffer.from("bridge_escrow_account")],
         program.programId
       );
 
@@ -310,6 +310,223 @@ describe("Solana Pastel Bridge Program Tests", () => {
     });
   });
 
+  // Define the serviceRequestIds array before it's used
+  const serviceRequestIds: string[] = [];
 
+  // Submit Service Requests
+  it("Submits service requests", async () => {
+    // Find the PDA for the TempServiceRequestsDataAccount
+    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
+    );
 
+    // Find the PDA for the ServiceRequestSubmissionAccount
+    const serviceRequestIds = []; // Array to store service request IDs for later use
+
+    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      const serviceRequestSubmissionAccount = web3.Keypair.generate();
+      const fileHash = crypto.createHash('sha3-256').update(`file${i}`).digest('hex').substring(0, 6);
+      const pastelTicketTypeString = Object.keys(PastelTicketTypeEnum)[i % Object.keys(PastelTicketTypeEnum).length];
+      const ipfsCid = `Qm${crypto.randomBytes(44).toString('hex')}`;
+      const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1; // Random file size between 1 and 1,000,000 bytes
+
+      const serviceRequestId = crypto.createHash('sha256').update(pastelTicketTypeString + fileHash + admin.publicKey.toString()).digest('hex').substring(0, 32);
+      serviceRequestIds.push(serviceRequestId);
+
+      // Submit the service request
+      await program.methods
+        .submitServiceRequest(pastelTicketTypeString, fileHash, ipfsCid, new BN(fileSizeBytes))
+        .accounts({
+          serviceRequestSubmissionAccount: serviceRequestSubmissionAccount.publicKey,
+          bridgeContractState: bridgeContractState.publicKey,
+          tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+          user: admin.publicKey,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([serviceRequestSubmissionAccount])
+        .rpc();
+
+      console.log(`Service request ${i + 1} submitted successfully with ID: ${serviceRequestId}`);
+    }
+
+    // Fetch the TempServiceRequestsDataAccount to verify all service requests are submitted
+    const tempServiceRequestsData = await program.account.tempServiceRequestsDataAccount.fetch(
+      tempServiceRequestsDataAccountPDA
+    );
+    console.log(
+      "Total number of submitted service requests in TempServiceRequestsDataAccount:",
+      tempServiceRequestsData.serviceRequests.length
+    );
+
+    // Verify each service request is submitted in TempServiceRequestsDataAccount
+    serviceRequestIds.forEach((serviceRequestId, index) => {
+      const isSubmitted = tempServiceRequestsData.serviceRequests.some((sr) =>
+        sr.serviceRequestId === serviceRequestId
+      );
+      assert.isTrue(
+        isSubmitted,
+        `Service Request ${
+          index + 1
+        } should be submitted in TempServiceRequestsDataAccount`
+      );
+    });
+  });
+
+  // Submit Price Quotes
+  it("Submits price quotes for service requests", async () => {
+    // Find the PDA for the TempServiceRequestsDataAccount
+    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
+    );
+
+    // Find the PDA for the BestPriceQuoteReceivedForServiceRequest
+    const [bestPriceQuoteAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("best_price_quote_account")],
+      program.programId
+    );
+
+    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      const serviceRequestId = serviceRequestIds[i];
+      const bridgeNode = bridgeNodes[i % bridgeNodes.length];
+      const quotedPriceLamports = new BN(Math.floor(Math.random() * 1000000) + 1); // Random price between 1 and 1,000,000 lamports
+
+      // Submit the price quote
+      await program.methods
+        .submitPriceQuote(bridgeNode.publicKey.toString(), serviceRequestId, quotedPriceLamports)
+        .accounts({
+          priceQuoteSubmissionAccount: web3.Keypair.generate().publicKey,
+          bridgeContractState: bridgeContractState.publicKey,
+          tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+          user: bridgeNode.publicKey,
+          bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
+          bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([bridgeNode])
+        .rpc();
+
+      console.log(`Price quote for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.publicKey.toBase58()}`);
+    }
+
+    // Fetch the BestPriceQuoteReceivedForServiceRequest to verify the best price quotes are selected
+    const bestPriceQuoteData = await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+      bestPriceQuoteAccountPDA
+    );
+    console.log(
+      "Best price quotes received for service requests:",
+      bestPriceQuoteData
+    );
+
+    // Verify the best price quotes are selected for each service request
+    serviceRequestIds.forEach((serviceRequestId, index) => {
+      assert.equal(
+        bestPriceQuoteData.serviceRequestId,
+        serviceRequestId,
+        `Best price quote should be selected for service request ${index + 1}`
+      );
+    });
+  });
+
+  // Submit Pastel TxIDs
+  it("Submits Pastel TxIDs for service requests", async () => {
+    // Find the PDA for the TempServiceRequestsDataAccount
+    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
+    );
+
+    // Find the PDA for the ServiceRequestTxidMappingDataAccount
+    const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("service_request_txid_mapping_data")],
+      program.programId
+    );
+
+    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      const serviceRequestId = serviceRequestIds[i];
+      const bridgeNode = bridgeNodes[i % bridgeNodes.length];
+      const pastelTxid = crypto.randomBytes(32).toString('hex'); // Generate a random Pastel TxID
+
+      // Submit the Pastel TxID
+      await program.methods
+        .submitPastelTxid(serviceRequestId, pastelTxid)
+        .accounts({
+          serviceRequestSubmissionAccount: web3.Keypair.generate().publicKey,
+          bridgeContractState: bridgeContractState.publicKey,
+          bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
+          serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([bridgeNode])
+        .rpc();
+
+      console.log(`Pastel TxID for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.publicKey.toBase58()}`);
+    }
+
+    // Fetch the ServiceRequestTxidMappingDataAccount to verify the TxIDs are submitted
+    const serviceRequestTxidMappingData = await program.account.serviceRequestTxidMappingDataAccount.fetch(
+      serviceRequestTxidMappingDataAccountPDA
+    );
+    console.log(
+      "Total number of submitted Pastel TxIDs in ServiceRequestTxidMappingDataAccount:",
+      serviceRequestTxidMappingData.mappings.length
+    );
+
+    // Verify each Pastel TxID is submitted in ServiceRequestTxidMappingDataAccount
+    serviceRequestIds.forEach((serviceRequestId, index) => {
+      const isSubmitted = serviceRequestTxidMappingData.mappings.some((mapping) =>
+        mapping.serviceRequestId === serviceRequestId
+      );
+      assert.isTrue(
+        isSubmitted,
+        `Pastel TxID for Service Request ${
+          index + 1
+        } should be submitted in ServiceRequestTxidMappingDataAccount`
+      );
+    });
+  });
+
+  const adminKeypair = (provider.wallet as anchor.Wallet).payer;
+
+  // Access Oracle Data
+  it("Accesses Oracle data and handles post-transaction tasks", async () => {
+    // Find the PDA for the AggregatedConsensusDataAccount
+    const [aggregatedConsensusDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("aggregated_consensus_data")],
+      program.programId
+    );
+  
+    // Find the PDA for the ServiceRequestTxidMappingDataAccount
+    const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("service_request_txid_mapping_data")],
+      program.programId
+    );
+  
+    // Fetch aggregated consensus data for each service request
+    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      const serviceRequestId = serviceRequestIds[i];
+      const txid = trackedTxids[i];
+  
+      // Access the Oracle data
+      await program.methods
+        .processOracleData(txid, serviceRequestId)
+        .accounts({
+          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+          serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
+          tempServiceRequestsDataAccount: web3.Keypair.generate().publicKey,
+          bridgeContractState: bridgeContractState.publicKey,
+          bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
+          bridgeRewardPoolAccount: web3.Keypair.generate().publicKey,
+          bridgeEscrowAccount: web3.Keypair.generate().publicKey,
+          userAccount: admin.publicKey,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .signers([adminKeypair]) // Use the payer from the provider's wallet
+        .rpc();
+  
+      console.log(`Oracle data accessed and post-transaction tasks handled for service request ${i + 1} and TxID ${txid}`);
+    }
+  });
+  
 });
