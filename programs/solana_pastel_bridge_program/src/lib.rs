@@ -388,7 +388,7 @@ pub struct Initialize<'info> {
     #[account(init, seeds = [b"aggregated_consensus_data"], bump, payer = user, space = 10_240)]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
-    #[account(init, seeds = [b"service_request_txid_mapping_data"], bump, payer = user, space = 10_240)]
+    #[account(init, seeds = [b"service_request_txid_map"], bump, payer = user, space = 10_240)]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
     // System program is needed for account creation
@@ -1048,7 +1048,7 @@ pub struct SubmitPastelTxid<'info> {
     // Account for the ServiceRequestTxidMappingDataAccount PDA
     #[account(
         mut,
-        seeds = [b"service_request_txid_mapping_data"],
+        seeds = [b"service_request_txid_map"],
         bump
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
@@ -1107,7 +1107,7 @@ pub struct AccessOracleData<'info> {
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
     #[account(
-        seeds = [b"service_request_txid_mapping_data"],
+        seeds = [b"service_request_txid_map"],
         bump
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
