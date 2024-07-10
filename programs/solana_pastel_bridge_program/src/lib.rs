@@ -154,16 +154,13 @@ pub enum BridgeError {
     RegistrationFeeNotPaid,    
 }
 
-
 impl From<BridgeError> for ProgramError {
     fn from(e: BridgeError) -> Self {
         ProgramError::Custom(e as u32)
     }
 }
 
-
 // Enums:
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum TxidStatus {
