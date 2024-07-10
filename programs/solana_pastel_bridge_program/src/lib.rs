@@ -149,6 +149,9 @@ pub enum BridgeError {
     
     #[msg("Timestamp conversion error")]
     TimestampConversionError,
+
+    #[msg("Registration fee not paid")]
+    RegistrationFeeNotPaid,    
 }
 
 
@@ -160,6 +163,7 @@ impl From<BridgeError> for ProgramError {
 
 
 // Enums:
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, AnchorSerialize, AnchorDeserialize)]
 pub enum TxidStatus {
@@ -313,6 +317,10 @@ pub struct ServiceRequestTxidMapping {
     pub pastel_txid: String,
 }
 
+// Account to receive registration fees from bridge nodes before it is transferred to the bridge contract reward pool account 
+#[account]
+pub struct RegFeeReceivingAccount {}
+
 #[account]
 pub struct BridgeContractState {
     pub is_initialized: bool,
@@ -325,6 +333,7 @@ pub struct BridgeContractState {
     pub temp_service_requests_data_account_pubkey: Pubkey,
     pub aggregated_consensus_data_account_pubkey: Pubkey,
     pub service_request_txid_mapping_account_pubkey: Pubkey,
+    pub reg_fee_receiving_account_pubkey: Pubkey,     
 }
 
 // PDA that distributes rewards to bridge nodes for fulfilling service requests successfully
@@ -376,6 +385,9 @@ pub struct Initialize<'info> {
     #[account(init, seeds = [b"bridge_reward_pool_account"], bump, payer = user, space = 1024)]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
 
+    #[account(init, seeds = [b"reg_fee_receiving_account"], bump, payer = user, space = 1024)]
+    pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
+
     #[account(init, seeds = [b"bridge_escrow_account"], bump, payer = user, space = 1024)]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
 
@@ -415,6 +427,7 @@ impl<'info> Initialize<'info> {
         state.bridge_nodes_data_account_pubkey = self.bridge_nodes_data_account.key();
         state.temp_service_requests_data_account_pubkey = self.temp_service_requests_data_account.key();
         state.aggregated_consensus_data_account_pubkey = self.aggregated_consensus_data_account.key();
+        state.reg_fee_receiving_account_pubkey = self.reg_fee_receiving_account.key();
 
         state.oracle_contract_pubkey = Pubkey::default();
         msg!("Oracle Contract Pubkey set to default");
@@ -506,20 +519,29 @@ pub struct BridgeNodeDataAccount {
 
 #[derive(Accounts)]
 pub struct RegisterNewBridgeNode<'info> {
-    /// CHECK: Manual checks are performed in the instruction to ensure the bridge_node_account is valid and safe to use.
+    /// CHECK: Manual checks are performed in the instruction to ensure the contributor_account is valid and safe to use.
     #[account(mut, signer)]
-    pub user: AccountInfo<'info>, // User's Solana account
-
-    #[account(mut, signer)]
+    pub user: AccountInfo<'info>, // Ensure this account is a signer and mutable
+    
+    #[account(mut)]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
     #[account(mut)]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
 
+    #[account(mut)]
+    pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
+
+    pub system_program: Program<'info, System>,
 }
 
-pub fn register_new_bridge_node_helper(ctx: Context<RegisterNewBridgeNode>, pastel_id: String, bridge_node_psl_address: String) -> Result<()> {
+pub fn register_new_bridge_node_helper(
+    ctx: Context<RegisterNewBridgeNode>,
+    pastel_id: String,
+    bridge_node_psl_address: String,
+) -> Result<()> {
     let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
+    msg!("Initiating new bridge node registration: {}", ctx.accounts.user.key());
 
     // Check if the bridge node is already registered
     if bridge_nodes_data_account.bridge_nodes.iter().any(|node| node.pastel_id == pastel_id) {
@@ -527,60 +549,54 @@ pub fn register_new_bridge_node_helper(ctx: Context<RegisterNewBridgeNode>, past
         return Err(BridgeError::BridgeNodeAlreadyRegistered.into());
     }
 
-    // User's account as the signer
-    let user_account_info = ctx.accounts.user.to_account_info();
+    // Retrieve mutable references to the lamport balance
+    let fee_receiving_account_info = ctx.accounts.reg_fee_receiving_account.to_account_info();
+    let mut fee_receiving_account_lamports = fee_receiving_account_info.lamports.borrow_mut();
 
-    // Check if the user has enough lamports for the registration fee
-    if **user_account_info.lamports.borrow() < BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS {
-        msg!("Registration failed: Insufficient registration fee for Pastel ID: {}", pastel_id);
-        return Err(BridgeError::InsufficientRegistrationFee.into());
+    let reward_pool_account_info = ctx.accounts.bridge_reward_pool_account.to_account_info();
+    let mut reward_pool_account_lamports = reward_pool_account_info.lamports.borrow_mut();
+
+    // Check if the reg_fee_receiving_account received the registration fee
+    if **fee_receiving_account_lamports < BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS {
+        return Err(BridgeError::RegistrationFeeNotPaid.into());
     }
 
-    // Transfer the registration fee from the user's account to the reward pool account
-    **ctx.accounts.bridge_reward_pool_account.to_account_info().lamports.borrow_mut() += BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
-    **user_account_info.lamports.borrow_mut() -= BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
-    msg!("Registration fee transferred to reward pool.");
+    msg!("Registration fee verified. Attempting to register new bridge node {}", ctx.accounts.user.key());
 
-    // Time of registration
+    // Deduct the registration fee from the reg_fee_receiving_account and add it to the reward pool account
+    **fee_receiving_account_lamports -= BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
+    **reward_pool_account_lamports += BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
+
     let last_active_timestamp = Clock::get()?.unix_timestamp as u64;
-
-    // Create the new bridge node
+    
+    // Create and add the new bridge node
     let new_bridge_node = BridgeNode {
-        pastel_id: pastel_id.clone(), // Clone the pastel_id here
-        reward_address: *user_account_info.key, // User who is registering as a bridge node
+        pastel_id: pastel_id.clone(),
+        reward_address: *ctx.accounts.user.key,
         bridge_node_psl_address,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
         compliance_score: 1.0, // Initial compliance score
         reliability_score: 1.0, // Initial reliability score
-        last_active_timestamp, // Set to current timestamp
-        total_price_quotes_submitted: 0,
-        total_service_requests_attempted: 0,
-        successful_service_requests_count: 0,
-        current_streak: 0,
-        failed_service_requests_count: 0,
-        ban_expiry: 0,
-        is_eligible_for_rewards: false,
-        is_recently_active: false,
-        is_reliable: false,
-        is_banned: false,
+        last_active_timestamp, // Set the last active timestamp to the current time
+        total_price_quotes_submitted: 0, // Initially, no price quotes have been submitted
+        total_service_requests_attempted: 0, // Initially, no service requests attempted
+        successful_service_requests_count: 0, // Initially, no successful service requests
+        current_streak: 0, // No streak at the beginning
+        failed_service_requests_count: 0, // No failed service requests at the start
+        ban_expiry: 0, // No ban initially set
+        is_eligible_for_rewards: false, // Initially not eligible for rewards
+        is_recently_active: false, // Initially not considered active
+        is_reliable: false, // Initially not considered reliable
+        is_banned: false, // Initially not banned
     };
-
-    // Mutable borrow of bridge_nodes_data_account starts here
-    let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
-
-    // Check if the bridge node is already registered
-    if bridge_nodes_data_account.bridge_nodes.iter().any(|node| node.pastel_id == pastel_id) {
-        msg!("Registration failed: Bridge Node already registered with Pastel ID: {}", pastel_id);
-        return Err(BridgeError::BridgeNodeAlreadyRegistered.into());
-    }
 
     // Append the new bridge node to the BridgeNodesDataAccount
     bridge_nodes_data_account.bridge_nodes.push(new_bridge_node);
 
-    msg!("New Bridge Node successfully Registered: {}", pastel_id);
+    // Logging for debug purposes
+    msg!("New Bridge Node successfully Registered: Pastel ID: {}, Timestamp: {}", pastel_id, last_active_timestamp);
     Ok(())
 }
-
 
 // Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
 pub fn generate_service_request_id(
