@@ -1737,6 +1737,39 @@ impl<'info> WithdrawFunds<'info> {
     }
 }
 
+
+#[derive(Accounts)]
+#[instruction(service_request_id: String)]
+pub struct InitializeBestPriceQuote<'info> {
+    #[account(
+        init,
+        payer = user,
+        seeds = [b"bst_px_qt", service_request_id.as_bytes()],
+        bump,
+        space = 8 + std::mem::size_of::<BestPriceQuoteReceivedForServiceRequest>()
+    )]
+    pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> InitializeBestPriceQuote<'info> {
+    pub fn initialize(ctx: Context<InitializeBestPriceQuote>, service_request_id: String) -> Result<()> {
+        let best_price_quote_account = &mut ctx.accounts.best_price_quote_account;
+
+        best_price_quote_account.service_request_id = service_request_id;
+        best_price_quote_account.best_bridge_node_pastel_id = "".to_string();
+        best_price_quote_account.best_quoted_price_in_lamports = 0;
+        best_price_quote_account.best_quote_timestamp = 0;
+        best_price_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::NoQuotesReceivedYet;
+
+        Ok(())
+    }
+}
+
 declare_id!("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
 #[program]
 pub mod solana_pastel_bridge_program {
@@ -1782,6 +1815,13 @@ pub mod solana_pastel_bridge_program {
         file_size_bytes: u64,
     ) -> ProgramResult {
         submit_service_request_helper(ctx, pastel_ticket_type_string, first_6_chars_of_hash, ipfs_cid, file_size_bytes)
+    }
+
+    pub fn initialize_best_price_quote(
+        ctx: Context<InitializeBestPriceQuote>,
+        service_request_id: String,
+    ) -> Result<()> {
+        InitializeBestPriceQuote::initialize(ctx, service_request_id)
     }
 
     pub fn submit_price_quote(
