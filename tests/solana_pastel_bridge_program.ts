@@ -26,26 +26,24 @@ const program = new Program<SolanaPastelBridgeProgram>(
   provider
 );
 
-// Extract keypair from provider's wallet
 const admin = Keypair.fromSecretKey(
   Uint8Array.from(provider.wallet.payer.secretKey)
 );
-// const admin = provider.wallet; // Use the provider's wallet
 
 const bridgeContractState = web3.Keypair.generate();
 
-let bridgeNodes = []; // Array to store bridge node keypairs
+let bridgeNodes = []; 
 
-const maxSize = 100 * 1024; // 100KB (max size of the bridge contract state account)
+const maxSize = 100 * 1024;
 
-const NUM_BRIDGE_NODES = 3; //12
-const NUMBER_OF_SIMULATED_SERVICE_REQUESTS = 5; //20
+const NUM_BRIDGE_NODES = 3;
+const NUMBER_OF_SIMULATED_SERVICE_REQUESTS = 5;
 
 const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_NUMBER_OF_ORACLES = 8;
 const MIN_REPORTS_FOR_REWARD = 10;
-const BAD_BRIDGE_NODE_INDEX = 5; // Define a constant to represent the index at which bridge nodes start submitting incorrect reports with increasing probability
+const BAD_BRIDGE_NODE_INDEX = 5;
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
 const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
@@ -234,7 +232,7 @@ describe("Solana Pastel Bridge Program Tests", () => {
       );
       console.log("Initial assertions passed.");
 
-      let currentSize = 10_240; // Initial size after first init
+      let currentSize = 10_240; 
 
       while (currentSize < maxSize) {
         console.log(
@@ -347,7 +345,7 @@ describe("Solana Pastel Bridge Program Tests", () => {
             bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
             user: bridgeNode.publicKey,
             bridgeRewardPoolAccount: bridgeRewardPoolAccountPDA,
-            regFeeReceivingAccount: regFeeReceivingAccountPDA, // Corrected account name
+            regFeeReceivingAccount: regFeeReceivingAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .signers([bridgeNode])
@@ -403,63 +401,44 @@ describe("Solana Pastel Bridge Program Tests", () => {
   const serviceRequestIds: string[] = [];
 
   it("Submits service requests", async () => {
-    const [tempServiceRequestsDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("temp_service_requests_data")],
-        program.programId
-      );
-    console.log(
-      "Found PDA for TempServiceRequestsDataAccount:",
-      tempServiceRequestsDataAccountPDA.toString()
+    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
     );
+    console.log("Found PDA for TempServiceRequestsDataAccount:", tempServiceRequestsDataAccountPDA.toString());
 
-    const [aggregatedConsensusDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("aggregated_consensus_data")],
-        program.programId
-      );
-    console.log(
-      "Found PDA for AggregatedConsensusDataAccount:",
-      aggregatedConsensusDataAccountPDA.toString()
+    const [aggregatedConsensusDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("aggregated_consensus_data")],
+      program.programId
     );
+    console.log("Found PDA for AggregatedConsensusDataAccount:", aggregatedConsensusDataAccountPDA.toString());
+
+    const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
+    const lamports = web3.LAMPORTS_PER_SOL * COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
+
+    const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
+    const totalFundingLamports = lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
 
     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      console.log(
-        `Generating service request ${
-          i + 1
-        } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
-      );
+      console.log(`Generating service request ${i + 1} of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`);
 
       const endUserKeypair = web3.Keypair.generate();
-      console.log(
-        `Generated new Keypair for end user: ${endUserKeypair.publicKey.toString()}`
-      );
+      console.log(`Generated new Keypair for end user: ${endUserKeypair.publicKey.toString()}`);
 
       const transferTransaction = new web3.Transaction().add(
         web3.SystemProgram.transfer({
           fromPubkey: admin.publicKey,
           toPubkey: endUserKeypair.publicKey,
-          lamports: web3.LAMPORTS_PER_SOL, // Fund the user with 1 SOL for transaction fees and future payments
+          lamports: totalFundingLamports,
         })
       );
-      await web3.sendAndConfirmTransaction(
-        provider.connection,
-        transferTransaction,
-        [admin]
-      );
-      console.log(`Funded end user account with 1 SOL`);
+      await web3.sendAndConfirmTransaction(provider.connection, transferTransaction, [admin]);
+      console.log(`Funded end user account with ${totalFundingLamports} lamports`);
 
-      const fileHash = crypto
-        .createHash("sha3-256")
-        .update(`file${i}`)
-        .digest("hex")
-        .substring(0, 6);
+      const fileHash = crypto.createHash("sha3-256").update(`file${i}`).digest("hex").substring(0, 6);
       console.log(`Generated file hash for file${i}: ${fileHash}`);
 
-      const pastelTicketTypeString =
-        Object.keys(PastelTicketTypeEnum)[
-          i % Object.keys(PastelTicketTypeEnum).length
-        ];
+      const pastelTicketTypeString = Object.keys(PastelTicketTypeEnum)[i % Object.keys(PastelTicketTypeEnum).length];
       console.log(`Selected PastelTicketType: ${pastelTicketTypeString}`);
 
       const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
@@ -467,6 +446,21 @@ describe("Solana Pastel Bridge Program Tests", () => {
 
       const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
       console.log(`Generated random file size: ${fileSizeBytes} bytes`);
+
+      const concatenatedStr = pastelTicketTypeString + fileHash + endUserKeypair.publicKey.toString();
+      const expectedServiceRequestIdHash = crypto.createHash("sha256").update(concatenatedStr).digest("hex");
+      const expectedServiceRequestId = expectedServiceRequestIdHash.substring(0, 32);
+      console.log(`Expected service request ID: ${expectedServiceRequestId}`);
+
+      // Derive the service_request_submission_account PDA
+      const [serviceRequestSubmissionAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("svc_request"),
+          Buffer.from(expectedServiceRequestId)
+        ],
+        program.programId
+      );
+      console.log(`Derived service request submission account PDA: ${serviceRequestSubmissionAccountPDA.toString()}`);
 
       await program.methods
         .submitServiceRequest(
@@ -476,38 +470,53 @@ describe("Solana Pastel Bridge Program Tests", () => {
           new BN(fileSizeBytes)
         )
         .accounts({
-          serviceRequestSubmissionAccount: web3.Keypair.generate().publicKey,
+          serviceRequestSubmissionAccount: serviceRequestSubmissionAccountPDA,
           bridgeContractState: bridgeContractState.publicKey,
           tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-          user: endUserKeypair.publicKey,
           aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+          user: endUserKeypair.publicKey, // End user keypair as user
           systemProgram: web3.SystemProgram.programId,
         })
-        .signers([endUserKeypair])
+        .signers([endUserKeypair]) // Only endUserKeypair is needed as a signer
         .rpc();
       console.log(`Service request ${i + 1} submitted successfully`);
+
+      const serviceRequestSubmissionData = await program.account.serviceRequestSubmissionAccount.fetch(serviceRequestSubmissionAccountPDA);
+      const actualServiceRequestId = serviceRequestSubmissionData.serviceRequest.serviceRequestId;
+      console.log(`Actual service request ID: ${actualServiceRequestId}`);
+
+      assert.equal(
+        actualServiceRequestId,
+        expectedServiceRequestId,
+        `Service Request ID should match the expected value for request ${i + 1}`
+      );
+
+      serviceRequestIds.push(expectedServiceRequestId); // Add this line to push the IDs into the array
     }
 
-    const tempServiceRequestsData =
-      await program.account.tempServiceRequestsDataAccount.fetch(
-        tempServiceRequestsDataAccountPDA
-      );
-    console.log(
-      "Fetched TempServiceRequestsDataAccount:",
-      tempServiceRequestsDataAccountPDA.toString()
+    const tempServiceRequestsData = await program.account.tempServiceRequestsDataAccount.fetch(
+      tempServiceRequestsDataAccountPDA
     );
+    console.log("Fetched TempServiceRequestsDataAccount:", tempServiceRequestsDataAccountPDA.toString());
     console.log(
       "Total number of submitted service requests in TempServiceRequestsDataAccount:",
       tempServiceRequestsData.serviceRequests.length
     );
 
-    assert.isTrue(
-      tempServiceRequestsData.serviceRequests.length ===
-        NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
-      `All ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS} service requests should be submitted in TempServiceRequestsDataAccount`
-    );
+    serviceRequestIds.forEach((serviceRequestId, index) => {
+      const isSubmitted = tempServiceRequestsData.serviceRequests.some(
+        (sr) => sr.serviceRequestId === serviceRequestId
+      );
+      console.log(`Verifying service request ${index + 1} with ID: ${serviceRequestId} - ${isSubmitted ? "Found" : "Not Found"}`);
+      assert.isTrue(
+        isSubmitted,
+        `Service Request ${index + 1} should be submitted in TempServiceRequestsDataAccount`
+      );
+    });
   });
+
 });
+
 
 // // Submit Price Quotes
 // it("Submits price quotes for service requests", async () => {

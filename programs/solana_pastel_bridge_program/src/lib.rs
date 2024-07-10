@@ -614,8 +614,8 @@ pub fn generate_service_request_id(
     // Compute hash
     let service_request_id_hash = hash(preimage_bytes);
     
-    // Convert the first 20 bytes of Hash to a hex string
-    let service_request_id_truncated = &service_request_id_hash.to_bytes()[..20];
+    // Convert the first 16 bytes of Hash to a hex string (within 32 bytes limit for seed)
+    let service_request_id_truncated = &service_request_id_hash.to_bytes()[..16];
     let hex_string: String = service_request_id_truncated.iter().map(|byte| format!("{:02x}", byte)).collect();
 
     // Optional logging
