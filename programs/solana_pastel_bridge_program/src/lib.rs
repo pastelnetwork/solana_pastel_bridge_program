@@ -614,8 +614,8 @@ pub fn generate_service_request_id(
     // Compute hash
     let service_request_id_hash = hash(preimage_bytes);
     
-    // Convert the first 16 bytes of Hash to a hex string (within 32 bytes limit for seed)
-    let service_request_id_truncated = &service_request_id_hash.to_bytes()[..16];
+    // Convert the first 12 bytes of Hash to a hex string (within 32 bytes limit for seed)
+    let service_request_id_truncated = &service_request_id_hash.to_bytes()[..12];
     let hex_string: String = service_request_id_truncated.iter().map(|byte| format!("{:02x}", byte)).collect();
 
     // Optional logging
@@ -638,7 +638,7 @@ pub struct SubmitServiceRequest<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [b"svc_request", generate_service_request_id(
+        seeds = [b"srq", generate_service_request_id(
             &pastel_ticket_type_string,
             &first_6_chars_of_hash,
             &user.key()
@@ -800,12 +800,12 @@ pub struct ServicePriceQuoteSubmissionAccount {
 
 // PDA to receive price quotes from bridge nodes
 #[derive(Accounts)]
-#[instruction(service_request_id: String)] // Add this instruction argument
+#[instruction(service_request_id: String)] 
 pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"px_quote", service_request_id.as_bytes()], // Use as_bytes() to convert to &[u8]
+        seeds = [b"px_quote", service_request_id.as_bytes()],
         bump,
         space = 8 + std::mem::size_of::<ServicePriceQuote>()
     )]
@@ -820,22 +820,18 @@ pub struct SubmitPriceQuote<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    // System program for account creation
     pub system_program: Program<'info, System>,
 
-    // Bridge Nodes Data Account
     #[account(mut)]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
-    // Account to store the best price quote for a service request
     #[account(
         mut,
-        seeds = [b"bst_px_qt", service_request_id.as_bytes()], // Use as_bytes() here as well
+        seeds = [b"bpx", service_request_id.as_bytes()],
         bump
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
 }
-
 
 pub fn submit_price_quote_helper(
     ctx: Context<SubmitPriceQuote>,
@@ -1744,7 +1740,7 @@ pub struct InitializeBestPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"bst_px_qt", service_request_id.as_bytes()],
+        seeds = [b"bpx", service_request_id.as_bytes()],
         bump,
         space = 8 + std::mem::size_of::<BestPriceQuoteReceivedForServiceRequest>()
     )]

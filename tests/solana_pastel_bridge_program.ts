@@ -60,19 +60,6 @@ function generateRandomPriceQuote(baselinePriceLamports: number): BN {
   return new BN(baselinePriceLamports + randomIncrement);
 }
 
-// Fetch the registered bridge nodes from the BridgeNodesDataAccount
-async function fetchBridgeNodes(program: Program) {
-  const [bridgeNodesDataAccountPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("bridge_nodes_data")],
-    program.programId
-  );
-  const bridgeNodesDataAccount =
-    await program.account.bridgeNodesDataAccount.fetch(
-      bridgeNodesDataAccountPDA
-    );
-  return bridgeNodesDataAccount.bridgeNodes;
-}
-
 const ErrorCodeMap = {
   0x0: "BridgeNodeAlreadyRegistered",
   0x1: "UnregisteredBridgeNode",
@@ -505,14 +492,14 @@ describe("Solana Pastel Bridge Program Tests", () => {
         .digest("hex");
       const expectedServiceRequestId = expectedServiceRequestIdHash.substring(
         0,
-        32
-      );
+        24
+      ); // Adjusted length to 12 bytes hex (24 chars)
       console.log(`Expected service request ID: ${expectedServiceRequestId}`);
 
       // Derive the service_request_submission_account PDA
       const [serviceRequestSubmissionAccountPDA] =
         await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("svc_request"), Buffer.from(expectedServiceRequestId)],
+          [Buffer.from("srq"), Buffer.from(expectedServiceRequestId)],
           program.programId
         );
       console.log(
@@ -602,11 +589,12 @@ describe("Solana Pastel Bridge Program Tests", () => {
 
     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
       const serviceRequestId = serviceRequestIds[i];
-      console.log(`Processing service request ${i + 1}: ${serviceRequestId}`);
+      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24); // Adjust the length appropriately
+      console.log(`Processing service request ${i + 1}: ${truncatedServiceRequestId}`);
 
       const [serviceRequestSubmissionAccountPDA] =
         await PublicKey.findProgramAddressSync(
-          [Buffer.from("svc_request"), Buffer.from(serviceRequestId)],
+          [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
           program.programId
         );
 
@@ -631,8 +619,9 @@ describe("Solana Pastel Bridge Program Tests", () => {
         }: ${baselinePriceLamports} lamports`
       );
 
+
       const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bst_px_qt"), Buffer.from(serviceRequestId)],
+        [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
         program.programId
       );
 
@@ -699,11 +688,13 @@ describe("Solana Pastel Bridge Program Tests", () => {
     }
 
     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24); // Adjust the length appropriately
+
       const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bst_px_qt"), Buffer.from(serviceRequestIds[i])],
+        [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
         program.programId
       );
-
+      
       const bestPriceQuoteData =
         await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
           bestPriceQuoteAccountPDA
