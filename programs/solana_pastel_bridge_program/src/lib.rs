@@ -5,6 +5,7 @@ use anchor_lang::solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::hash::hash;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
+use std::convert::TryInto;
 
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
 const QUOTE_VALIDITY_DURATION: u64 = 21_600; // The time for which a submitted price quote remains valid. e.g., 6 hours in seconds
@@ -644,7 +645,7 @@ pub struct SubmitServiceRequest<'info> {
             &user.key()
         ).as_bytes()],
         bump,
-        space = 8 + std::mem::size_of::<ServiceRequest>()
+        space = 12 + std::mem::size_of::<ServiceRequest>()
     )]
     pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
 
@@ -781,6 +782,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
     Ok(())
 }
 
+
 #[account]
 pub struct BestPriceQuoteReceivedForServiceRequest {
     pub service_request_id: String,
@@ -790,24 +792,21 @@ pub struct BestPriceQuoteReceivedForServiceRequest {
     pub best_quote_selection_status: BestQuoteSelectionStatus,
 }
 
-
-// Struct to hold a service price quote submission
 #[account]
 pub struct ServicePriceQuoteSubmissionAccount {
     pub price_quote: ServicePriceQuote,
     pub price_quote_status: ServicePriceQuoteStatus,
 }
 
-// PDA to receive price quotes from bridge nodes
 #[derive(Accounts)]
-#[instruction(service_request_id: String)] 
+#[instruction(truncated_service_request_id: [u8; 12])]
 pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"px_quote", service_request_id.as_bytes()],
+        seeds = [b"px_quote", truncated_service_request_id.as_ref()],
         bump,
-        space = 8 + std::mem::size_of::<ServicePriceQuote>()
+        space = 12 + std::mem::size_of::<ServicePriceQuoteSubmissionAccount>()
     )]
     pub price_quote_submission_account: Account<'info, ServicePriceQuoteSubmissionAccount>,
 
@@ -827,7 +826,7 @@ pub struct SubmitPriceQuote<'info> {
 
     #[account(
         mut,
-        seeds = [b"bpx", service_request_id.as_bytes()],
+        seeds = [b"bpx", truncated_service_request_id.as_ref()],
         bump
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
@@ -839,51 +838,44 @@ pub fn submit_price_quote_helper(
     service_request_id: String,
     quoted_price_lamports: u64,
 ) -> ProgramResult {
+    let truncated_service_request_id: [u8; 12] = service_request_id.as_bytes()[..12].try_into().expect("ID must be 12 bytes");
 
-    // Obtain the current timestamp
     let quote_timestamp = Clock::get()?.unix_timestamp as u64;
 
-    // Find the service request using the service_request_id_string
     let service_request = ctx.accounts.temp_service_requests_data_account.service_requests.iter()
-        .find(|request| request.service_request_id == service_request_id)
+        .find(|request| request.service_request_id.as_bytes()[..12] == truncated_service_request_id)
         .ok_or(ProgramError::Custom(BridgeError::ServiceRequestNotFound as u32))?;
 
-    // Check if the current timestamp is within the allowed window for quote submission
     if quote_timestamp < service_request.service_request_creation_timestamp + DURATION_IN_SECONDS_TO_WAIT_AFTER_ANNOUNCING_NEW_PENDING_SERVICE_REQUEST_BEFORE_SELECTING_BEST_QUOTE {
         msg!("Quote submission is too early. Please wait until the waiting period is over.");
         return Err(ProgramError::Custom(BridgeError::QuoteResponseTimeExceeded as u32));
     }
 
-    // Validate the price quote
     validate_price_quote_submission(
         &ctx.accounts.bridge_nodes_data_account,
         &ctx.accounts.temp_service_requests_data_account,
         &ctx.accounts.price_quote_submission_account,
-        service_request_id.clone(),
-        bridge_node_pastel_id,
+        String::from_utf8(truncated_service_request_id.to_vec()).unwrap(),
+        bridge_node_pastel_id.clone(),
         quoted_price_lamports,
         quote_timestamp,
     )?;
 
-    // Find the bridge node that is submitting the quote and get a mutable reference
     let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter_mut().find(|node| {
         node.reward_address == ctx.accounts.user.key()
     }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
 
-    // Update the total number of price quotes submitted by the bridge node
     submitting_bridge_node.total_price_quotes_submitted += 1;
 
-    // Add the price quote to the price_quote_submission_account
     let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
     price_quote_account.price_quote = ServicePriceQuote {
-        service_request_id: service_request_id.clone(),
+        service_request_id: String::from_utf8(truncated_service_request_id.to_vec()).unwrap(),
         bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
         quoted_price_lamports,
-        quote_timestamp, // Use internally generated timestamp
+        quote_timestamp,
         price_quote_status: ServicePriceQuoteStatus::Submitted,
     };
 
-    // Update best price quote if the new quote is better
     let best_quote_account = &mut ctx.accounts.best_price_quote_account;
     if best_quote_account.best_quote_selection_status == BestQuoteSelectionStatus::NoQuotesReceivedYet ||
     quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
@@ -896,7 +888,6 @@ pub fn submit_price_quote_helper(
     Ok(())
 }
 
-
 pub fn validate_price_quote_submission(
     bridge_nodes_data_account: &BridgeNodesDataAccount,
     temp_service_requests_data_account: &TempServiceRequestsDataAccount,
@@ -906,41 +897,34 @@ pub fn validate_price_quote_submission(
     quoted_price_lamports: u64,
     quote_timestamp: u64,
 ) -> Result<()> {
-
-    // Check if the service_request_id corresponds to an existing and pending service request
     let service_request = temp_service_requests_data_account
         .service_requests
         .iter()
-        .find(|request| request.service_request_id == *service_request_id)
+        .find(|request| request.service_request_id == service_request_id)
         .ok_or(BridgeError::ServiceRequestNotFound)?;
 
-    // Validate service request status
     if service_request.status != RequestStatus::Pending {
         msg!("Error: Service request is not in a pending state");
         return Err(BridgeError::ServiceRequestNotPending.into());
     }
 
-    // Ensure the price quote is submitted within MAX_QUOTE_RESPONSE_TIME seconds of service request creation
     if quote_timestamp > service_request.service_request_creation_timestamp + MAX_QUOTE_RESPONSE_TIME {
         msg!("Error: Price quote submitted beyond the maximum response time");
         return Err(BridgeError::QuoteResponseTimeExceeded.into());
     }
 
-    // Check Maximum Quote Response Time
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
     if quote_timestamp > service_request.service_request_creation_timestamp + MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE {
         msg!("Error: Price quote submitted too late");
         return Err(BridgeError::QuoteResponseTimeExceeded.into());
     }
 
-    // Check if the bridge node is registered
     let registered_bridge_node = bridge_nodes_data_account
         .bridge_nodes
         .iter()
         .find(|node| &node.pastel_id == &bridge_node_pastel_id);
 
     if let Some(bridge_node) = registered_bridge_node {
-        // Check if the bridge node is banned
         if bridge_node.calculate_is_banned(current_timestamp) {
             msg!("Error: Bridge node is currently banned");
             return Err(BridgeError::BridgeNodeBanned.into());
@@ -950,32 +934,26 @@ pub fn validate_price_quote_submission(
         return Err(BridgeError::UnregisteredBridgeNode.into());
     }
 
-    // Check if the quoted price in lamports is not zero
     if quoted_price_lamports == 0 {
         msg!("Error: Quoted price cannot be zero");
         return Err(BridgeError::InvalidQuotedPrice.into());
     }
 
-    // Check if the price quote status is set to 'Submitted'
     if price_quote_submission_account.price_quote_status != ServicePriceQuoteStatus::Submitted {
         msg!("Error: Price quote status is not set to 'Submitted'");
         return Err(BridgeError::InvalidQuoteStatus.into());
     }
 
-    // Time Validity of the Quote
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
     if current_timestamp > price_quote_submission_account.price_quote.quote_timestamp + QUOTE_VALIDITY_DURATION {
         msg!("Error: Price quote has expired");
         return Err(BridgeError::QuoteExpired.into());
     }
 
-    // Bridge Node Compliance and Reliability Scores for Reward
     if let Some(bridge_node) = registered_bridge_node {
         if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD || bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
             msg!("Error: Bridge node does not meet the minimum score requirements for rewards");
             return Err(BridgeError::BridgeNodeScoreTooLow.into());
         }
-        // Bridge Node Activity Status
         if current_timestamp > bridge_node.last_active_timestamp + BRIDGE_NODE_INACTIVITY_THRESHOLD {
             msg!("Error: Bridge node is inactive");
             return Err(BridgeError::BridgeNodeInactive.into());
@@ -984,34 +962,27 @@ pub fn validate_price_quote_submission(
     Ok(())
 }
 
-
 pub fn choose_best_price_quote(
     best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
     temp_service_requests_data_account: &mut TempServiceRequestsDataAccount,
     current_timestamp: u64
 ) -> Result<()> {
-    // Find the service request corresponding to the best price quote
     let service_request = temp_service_requests_data_account.service_requests
         .iter_mut()
         .find(|request| request.service_request_id == best_quote_account.service_request_id)
         .ok_or(BridgeError::ServiceRequestNotFound)?;
 
-    // Check if the quote is still valid
     if current_timestamp > best_quote_account.best_quote_timestamp + QUOTE_VALIDITY_DURATION {
         return Err(BridgeError::QuoteExpired.into());
     }
 
-    // Update the service request with the selected bridge node details
     service_request.selected_bridge_node_pastelid = Some(best_quote_account.best_bridge_node_pastel_id.clone());
     service_request.best_quoted_price_in_lamports = Some(best_quote_account.best_quoted_price_in_lamports);
     service_request.bridge_node_selection_timestamp = Some(current_timestamp);
-
-    // Change the status of the service request to indicate that a bridge node has been selected
     service_request.status = RequestStatus::BridgeNodeSelected;
 
     Ok(())
 }
-
 
 fn update_txid_mapping(
     txid_mapping_data_account: &mut Account<ServiceRequestTxidMappingDataAccount>, 
@@ -1733,16 +1704,15 @@ impl<'info> WithdrawFunds<'info> {
     }
 }
 
-
 #[derive(Accounts)]
 #[instruction(service_request_id: String)]
 pub struct InitializeBestPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"bpx", service_request_id.as_bytes()],
+        seeds = [b"bpx", &service_request_id.as_bytes()[..12]],
         bump,
-        space = 8 + std::mem::size_of::<BestPriceQuoteReceivedForServiceRequest>()
+        space = 12 + std::mem::size_of::<BestPriceQuoteReceivedForServiceRequest>()
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
 
@@ -1756,6 +1726,7 @@ impl<'info> InitializeBestPriceQuote<'info> {
     pub fn initialize(ctx: Context<InitializeBestPriceQuote>, service_request_id: String) -> Result<()> {
         let best_price_quote_account = &mut ctx.accounts.best_price_quote_account;
 
+        // Store the full service_request_id
         best_price_quote_account.service_request_id = service_request_id;
         best_price_quote_account.best_bridge_node_pastel_id = "".to_string();
         best_price_quote_account.best_quoted_price_in_lamports = 0;
