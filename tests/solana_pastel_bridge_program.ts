@@ -576,142 +576,139 @@ describe("Solana Pastel Bridge Program Tests", () => {
   });
 
   it("Submits price quotes for service requests", async () => {
-    const [tempServiceRequestsDataAccountPDA] =
-      await PublicKey.findProgramAddressSync(
-        [Buffer.from("temp_service_requests_data")],
-        program.programId
-      );
-
+    const [tempServiceRequestsDataAccountPDA] = await PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
+    );
+  
     const [bridgeNodesDataAccountPDA] = await PublicKey.findProgramAddressSync(
       [Buffer.from("bridge_nodes_data")],
       program.programId
     );
-
+  
     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
       const serviceRequestId = serviceRequestIds[i];
-      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24); // Adjust the length appropriately
-      console.log(`Processing service request ${i + 1}: ${truncatedServiceRequestId}`);
-
-      const [serviceRequestSubmissionAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
-          program.programId
-        );
-
-      const serviceRequestSubmissionData =
-        await program.account.serviceRequestSubmissionAccount.fetch(
-          serviceRequestSubmissionAccountPDA
-        );
-
+      const truncatedServiceRequestId = serviceRequestId.substring(0, 24);
+      console.log(`Processing service request ${i + 1}: ${serviceRequestId}`);
+  
+      const [serviceRequestSubmissionAccountPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
+        program.programId
+      );
+  
+      const serviceRequestSubmissionData = await program.account.serviceRequestSubmissionAccount.fetch(
+        serviceRequestSubmissionAccountPDA
+      );
+  
       const fileSizeBytes = new BN(
         serviceRequestSubmissionData.serviceRequest.fileSizeBytes
       ).toNumber();
-      console.log(
-        `File size for service request ${i + 1}: ${fileSizeBytes} bytes`
-      );
-
+      console.log(`File size for service request ${i + 1}: ${fileSizeBytes} bytes`);
+  
       const baselinePriceLamports = Math.floor(
         (fileSizeBytes / 1000000) * baselinePriceSol * 1e9
       );
-      console.log(
-        `Baseline price for service request ${
-          i + 1
-        }: ${baselinePriceLamports} lamports`
-      );
-
-
+      console.log(`Baseline price for service request ${i + 1}: ${baselinePriceLamports} lamports`);
+  
       const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
         [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
         program.programId
       );
-
-      // Initialize the best price quote account
+  
       await program.methods
-        .initializeBestPriceQuote(serviceRequestId)
+        .initializeBestPriceQuote(truncatedServiceRequestId)
         .accounts({
           bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
           user: provider.wallet.publicKey,
           systemProgram: SystemProgram.programId,
         })
         .rpc();
-      console.log(
-        `Best price quote account initialized for service request ${i + 1}`
-      );
-
+      console.log(`Best price quote account initialized for service request ${i + 1}`);
+  
       for (let j = 0; j < bridgeNodes.length; j++) {
         const bridgeNode = bridgeNodes[j];
-        if (
-          !bridgeNode ||
-          !bridgeNode.keypair ||
-          !bridgeNode.keypair.publicKey
-        ) {
-          console.error(
-            `Bridge node ${j + 1} is not defined or does not have a publicKey`
-          );
+        if (!bridgeNode || !bridgeNode.keypair || !bridgeNode.keypair.publicKey) {
+          console.error(`Bridge node ${j + 1} is not defined or does not have a publicKey`);
           continue;
         }
-
-        const quotedPriceLamports = generateRandomPriceQuote(
-          baselinePriceLamports
-        );
-        console.log(
-          `Submitting price quote from bridge node ${
-            j + 1
-          }: ${bridgeNode.keypair.publicKey.toBase58()}`
-        );
+  
+        const quotedPriceLamports = generateRandomPriceQuote(baselinePriceLamports);
+        console.log(`Submitting price quote from bridge node ${j + 1}: ${bridgeNode.keypair.publicKey.toBase58()}`);
         console.log(`Quoted price: ${quotedPriceLamports.toString()} lamports`);
-
-        await program.methods
-          .submitPriceQuote(
-            bridgeNode.keypair.publicKey.toString(),
-            serviceRequestId,
-            quotedPriceLamports
-          )
-          .accounts({
-            priceQuoteSubmissionAccount: provider.wallet.publicKey,
-            bridgeContractState: bridgeContractState.publicKey,
-            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-            user: bridgeNode.keypair.publicKey,
-            bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
-            bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-            systemProgram: SystemProgram.programId,
-          })
-          .signers([bridgeNode.keypair])
-          .rpc();
-
-        console.log(
-          `Price quote for service request ${
-            i + 1
-          } submitted successfully by bridge node ${bridgeNode.keypair.publicKey.toBase58()}`
+  
+        const [priceQuoteSubmissionAccountPDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("px_quote"), Buffer.from(truncatedServiceRequestId)],
+          program.programId
         );
+  
+        console.log(`Derived priceQuoteSubmissionAccountPDA: ${priceQuoteSubmissionAccountPDA.toBase58()}`);
+  
+        console.log("Account parameters for submitPriceQuote:");
+        console.log(`priceQuoteSubmissionAccount: ${priceQuoteSubmissionAccountPDA.toBase58()}`);
+        console.log(`bridgeContractState: ${bridgeContractState.publicKey.toBase58()}`);
+        console.log(`tempServiceRequestsDataAccount: ${tempServiceRequestsDataAccountPDA.toBase58()}`);
+        console.log(`user: ${bridgeNode.keypair.publicKey.toBase58()}`);
+        console.log(`bridgeNodesDataAccount: ${bridgeNodesDataAccountPDA.toBase58()}`);
+        console.log(`bestPriceQuoteAccount: ${bestPriceQuoteAccountPDA.toBase58()}`);
+  
+        console.log("Method parameters for submitPriceQuote:");
+        console.log(`bridgeNode.pastelId: ${bridgeNode.pastelId}`);
+        console.log(`truncatedServiceRequestId: ${truncatedServiceRequestId}`);
+        console.log(`serviceRequestId: ${serviceRequestId}`);
+        console.log(`quotedPriceLamports: ${quotedPriceLamports.toString()}`);
+  
+        try {
+          await program.methods
+            .submitPriceQuote(
+              bridgeNode.pastelId,
+              serviceRequestId,
+              quotedPriceLamports
+            )
+            .accounts({
+              priceQuoteSubmissionAccount: priceQuoteSubmissionAccountPDA,
+              bridgeContractState: bridgeContractState.publicKey,
+              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+              user: bridgeNode.keypair.publicKey,
+              bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
+              bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([bridgeNode.keypair])
+            .rpc();
+  
+          console.log(`Price quote for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.keypair.publicKey.toBase58()}`);
+        } catch (error) {
+          console.error(`Error submitting price quote for service request ${i + 1}:`, error);
+          if (error instanceof anchor.AnchorError) {
+            console.error(`Error code: ${error.error.errorCode.number}`);
+            console.error(`Error message: ${error.error.errorMessage}`);
+          }
+          throw error;
+        }
       }
     }
-
+  
     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24); // Adjust the length appropriately
-
+      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24);
+  
       const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
         [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
         program.programId
       );
-      
-      const bestPriceQuoteData =
-        await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
-          bestPriceQuoteAccountPDA
-        );
-      console.log(
-        `Best price quotes received for service request ${i + 1}:`,
-        bestPriceQuoteData
+  
+      const bestPriceQuoteData = await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+        bestPriceQuoteAccountPDA
       );
-
-      const bestQuote =
-        bestPriceQuoteData.serviceRequestId === serviceRequestIds[i];
+      console.log(`Best price quotes received for service request ${i + 1}:`, bestPriceQuoteData);
+  
+      const bestQuote = bestPriceQuoteData.serviceRequestId === serviceRequestIds[i];
       assert.isTrue(
         bestQuote,
         `Best price quote should be selected for service request ${i + 1}`
       );
     }
   });
+  
 });
 
 //   // Submit Pastel TxIDs
