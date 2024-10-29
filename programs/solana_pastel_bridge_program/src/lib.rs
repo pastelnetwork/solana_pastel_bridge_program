@@ -129,6 +129,14 @@ pub enum BridgeError {
     RegistrationFeeNotPaid,
     #[msg("Maximum account size exceeded")]
     MaxSizeExceeded,
+    #[msg("Account initialization failed")]
+    AccountInitializationFailed,
+    #[msg("Invalid account size")]
+    InvalidAccountSize,
+    #[msg("Account is not rent exempt")]
+    NotRentExempt,
+    #[msg("PDA derivation failed")]
+    PdaDerivationFailed,
 }
 
 // Enums:
@@ -534,7 +542,7 @@ pub struct InitializeDataPDAs<'info> {
         payer = user,
         space = 8 +  // Discriminator
                 4 +  // Vec length
-                10 * (
+                (10 * (
                     64 +    // pastel_id (String ~32 chars)
                     32 +    // reward_address
                     64 +    // bridge_node_psl_address (String ~32 chars)
@@ -552,7 +560,7 @@ pub struct InitializeDataPDAs<'info> {
                     1 +     // is_recently_active
                     1 +     // is_reliable
                     1       // is_banned
-                )
+                ))
     )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
@@ -563,7 +571,7 @@ pub struct InitializeDataPDAs<'info> {
         payer = user,
         space = 8 +  // Discriminator
                 4 +  // Vec length
-                10 * (
+                (10 * (
                     32 +    // service_request_id
                     1 +     // service_type
                     8 +     // first_6_characters_of_hash (String)
@@ -573,12 +581,20 @@ pub struct InitializeDataPDAs<'info> {
                     1 +     // status
                     1 +     // payment_in_escrow
                     8 +     // request_expiry
-                    8 +     // sol_received_timestamp
-                    64 +    // selected_bridge_node_pastelid
-                    8 +     // best_quoted_price
-                    8 * 6 + // various timestamps (6 of them)
-                    64      // pastel_txid
-                )
+                    9 +     // Option<u64> sol_received_timestamp
+                    65 +    // Option<String> selected_bridge_node_pastelid
+                    9 +     // Option<u64> best_quoted_price
+                    9 +     // service_request_creation_timestamp
+                    9 +     // Option<u64> bridge_node_selection_timestamp
+                    9 +     // Option<u64> bridge_node_submission_of_txid_timestamp
+                    9 +     // Option<u64> submission_of_txid_to_oracle_timestamp
+                    9 +     // Option<u64> service_request_completion_timestamp
+                    9 +     // Option<u64> payment_received_timestamp
+                    9 +     // Option<u64> payment_release_timestamp
+                    9 +     // Option<u64> escrow_amount_lamports
+                    9 +     // Option<u64> service_fee_retained_by_bridge_contract_lamports
+                    65      // Option<String> pastel_txid
+                ))
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
@@ -589,13 +605,17 @@ pub struct InitializeDataPDAs<'info> {
         payer = user,
         space = 8 +  // Discriminator
                 4 +  // Vec length
-                10 * (
+                (10 * (
                     64 +    // txid
-                    16 +    // status_weights
-                    256 +   // hash_weights vec
+                    16 +    // status_weights [4 * i32]
+                    4 +     // Vec length for hash_weights
+                    (10 * (
+                        64 + // hash
+                        4    // weight
+                    )) +    // hash_weights vec assumed max 10 entries
                     8 +     // first_6_characters_hash
                     8       // last_updated
-                )
+                ))
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -606,15 +626,49 @@ pub struct InitializeDataPDAs<'info> {
         payer = user,
         space = 8 +  // Discriminator
                 4 +  // Vec length
-                10 * (
+                (10 * (
                     32 +    // service_request_id
                     64      // pastel_txid
-                )
+                ))
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
     pub system_program: Program<'info, System>,
 }
+
+
+impl<'info> InitializeDataPDAs<'info> {
+    fn validate_rent_exemption(&self, rent: &Rent) -> Result<()> {
+        let accounts = [
+            (
+                &self.bridge_nodes_data_account.to_account_info(),
+                "Bridge Nodes Data Account",
+            ),
+            (
+                &self.temp_service_requests_data_account.to_account_info(),
+                "Temp Service Requests Data Account",
+            ),
+            (
+                &self.aggregated_consensus_data_account.to_account_info(),
+                "Aggregated Consensus Data Account",
+            ),
+            (
+                &self.service_request_txid_mapping_data_account.to_account_info(),
+                "Service Request TXID Mapping Account",
+            ),
+        ];
+
+        for (account, name) in accounts.iter() {
+            if !rent.is_exempt(account.lamports(), account.data_len()) {
+                msg!("{} is not rent exempt", name);
+                return err!(BridgeError::NotRentExempt);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 
 #[derive(Accounts)]
 pub struct ReallocateBridgeState<'info> {
@@ -2122,33 +2176,48 @@ pub mod solana_pastel_bridge_program {
     }
 
     pub fn initialize_data_pdas(ctx: Context<InitializeDataPDAs>) -> Result<()> {
-        msg!("Initializing Data PDAs");
+        msg!("Starting data PDA initialization with rent validation");
     
-        // Initialize BridgeNodesDataAccount with an empty Vec
-        let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
-        bridge_nodes_data_account.bridge_nodes = Vec::new();
+        // Validate rent exemption for all accounts
+        let rent = Rent::get()?;
+        ctx.accounts.validate_rent_exemption(&rent)?;
     
-        // Initialize TempServiceRequestsDataAccount with an empty Vec
-        let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
-        temp_service_requests_data_account.service_requests = Vec::new();
+        // Initialize accounts with explicit error handling
+        msg!("Initializing bridge nodes data account");
+        ctx.accounts.bridge_nodes_data_account.bridge_nodes = Vec::with_capacity(10);
     
-        // Initialize AggregatedConsensusDataAccount with an empty Vec
-        let aggregated_consensus_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
-        aggregated_consensus_data_account.consensus_data = Vec::new();
+        msg!("Initializing temp service requests data account");
+        ctx.accounts.temp_service_requests_data_account.service_requests = Vec::with_capacity(10);
     
-        // Initialize ServiceRequestTxidMappingDataAccount with an empty Vec
-        let service_request_txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-        service_request_txid_mapping_data_account.mappings = Vec::new();
+        msg!("Initializing consensus data account");
+        ctx.accounts.aggregated_consensus_data_account.consensus_data = Vec::with_capacity(10);
     
-        // Update bridge contract state with the PDA pubkeys
+        msg!("Initializing txid mapping account");
+        ctx.accounts.service_request_txid_mapping_data_account.mappings = Vec::with_capacity(10);
+    
+        // Update bridge contract state with validation
         let state = &mut ctx.accounts.bridge_contract_state;
+        
+        msg!("Updating bridge contract state with PDA pubkeys");
         state.bridge_nodes_data_account_pubkey = ctx.accounts.bridge_nodes_data_account.key();
         state.temp_service_requests_data_account_pubkey = ctx.accounts.temp_service_requests_data_account.key();
         state.aggregated_consensus_data_account_pubkey = ctx.accounts.aggregated_consensus_data_account.key();
         state.service_request_txid_mapping_account_pubkey = ctx.accounts.service_request_txid_mapping_data_account.key();
     
-        // Verify initialization
-        msg!("Data PDAs initialized successfully");
+        // Verify account sizes
+        for (account, name) in [
+            (&ctx.accounts.bridge_nodes_data_account.to_account_info(), "Bridge Nodes"),
+            (&ctx.accounts.temp_service_requests_data_account.to_account_info(), "Service Requests"),
+            (&ctx.accounts.aggregated_consensus_data_account.to_account_info(), "Consensus Data"),
+            (&ctx.accounts.service_request_txid_mapping_data_account.to_account_info(), "TXID Mapping"),
+        ] {
+            if account.data_len() < 8 {  // Minimum size for discriminator
+                msg!("Invalid account size for {}", name);
+                return err!(BridgeError::InvalidAccountSize);
+            }
+        }
+    
+        msg!("Data PDAs initialization completed successfully");
         msg!("Bridge nodes account: {}", ctx.accounts.bridge_nodes_data_account.key());
         msg!("Temp service requests account: {}", ctx.accounts.temp_service_requests_data_account.key());
         msg!("Consensus data account: {}", ctx.accounts.aggregated_consensus_data_account.key());
@@ -2156,7 +2225,7 @@ pub mod solana_pastel_bridge_program {
     
         Ok(())
     }
-
+    
     pub fn reallocate_bridge_state(ctx: Context<ReallocateBridgeState>) -> Result<()> {
         ReallocateBridgeState::execute(ctx)
     }

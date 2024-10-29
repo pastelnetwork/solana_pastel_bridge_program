@@ -9,6 +9,19 @@ import IDL from "../target/idl/solana_pastel_bridge_program.json";
 
 const { PublicKey, Keypair, Transaction } = anchor.web3;
 
+// Provider setup
+process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
+process.env.RUST_LOG =
+  "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
+
+const provider = AnchorProvider.env();
+anchor.setProvider(provider);
+
+// Let Anchor handle the program ID
+const program = new Program<SolanaPastelBridgeProgram>(IDL as any, provider);
+const admin = provider.wallet;
+const adminPublicKey = admin.publicKey;
+
 // Global state tracking
 let bridgeContractState: web3.Keypair;
 let bridgeNodes: any[] = [];
@@ -47,21 +60,6 @@ const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 const baselinePriceUSD = 3;
 const solToUsdRate = 130;
 const baselinePriceSol = baselinePriceUSD / solToUsdRate;
-
-// Provider setup
-process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
-process.env.RUST_LOG =
-  "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
-
-const programID = new PublicKey("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
-
-const provider = AnchorProvider.env();
-anchor.setProvider(provider);
-
-const program = new Program<SolanaPastelBridgeProgram>(IDL as any, provider);
-
-const admin = provider.wallet;
-const adminPublicKey = admin.publicKey;
 
 // Enums
 const TxidStatusEnum = {
@@ -198,15 +196,13 @@ describe("Solana Pastel Bridge Tests", () => {
     it("Initializes and expands the bridge contract state", async () => {
       try {
         // Set up compute budget for all transactions
-        const modifyComputeBudgetIx =
-          web3.ComputeBudgetProgram.setComputeUnitLimit({
-            units: 1_400_000,
-          });
+        const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+          units: 1_400_000,
+        });
 
-        const modifyComputePriceIx =
-          web3.ComputeBudgetProgram.setComputeUnitPrice({
-            microLamports: 50,
-          });
+        const modifyComputePriceIx = ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: 50,
+        });
 
         console.log("Starting PDA generation...");
 
@@ -267,16 +263,30 @@ describe("Solana Pastel Bridge Tests", () => {
 
         // Calculate initial rent exemption for all accounts
         const connection = provider.connection;
+        const baseStateSpace =
+          8 + // Discriminator
+          1 + // is_initialized
+          1 + // is_paused
+          32 + // admin_pubkey
+          32 + // oracle_contract_pubkey
+          32 + // bridge_reward_pool_account_pubkey
+          32 + // bridge_escrow_account_pubkey
+          32 + // bridge_nodes_data_account_pubkey
+          32 + // temp_service_requests_data_account_pubkey
+          32 + // aggregated_consensus_data_account_pubkey
+          32 + // service_request_txid_mapping_account_pubkey
+          32; // reg_fee_receiving_account_pubkey
+
         const rent = await connection.getMinimumBalanceForRentExemption(
-          ACCOUNT_SIZES.BASE_STATE + 1024 // Adding buffer for safety
+          baseStateSpace
         );
 
-        // Fund the bridge contract state account
+        // Fund the bridge contract state account with double the minimum rent
         const fundTx = new web3.Transaction().add(
           web3.SystemProgram.transfer({
             fromPubkey: provider.wallet.publicKey,
             toPubkey: bridgeContractState.publicKey,
-            lamports: rent * 2, // Double the minimum for safety
+            lamports: rent * 2,
           })
         );
 
@@ -344,39 +354,33 @@ describe("Solana Pastel Bridge Tests", () => {
             commitment: "confirmed",
           });
 
-        await confirmTransaction(initDataPDAsTx, "confirmed", 60000);
+        await confirmTransaction(initDataPDAsTx);
         console.log("Data PDAs initialization complete");
 
         // Verify all PDAs were initialized correctly
-        const verifyAccounts = async () => {
-          const accounts = [
-            { name: "Bridge Node Data", pubkey: bridgeNodeDataAccountPDA },
-            {
-              name: "Temp Service Requests",
-              pubkey: tempServiceRequestsDataAccountPDA,
-            },
-            {
-              name: "Service Request Txid Mapping",
-              pubkey: serviceRequestTxidMappingDataAccountPDA,
-            },
-            {
-              name: "Aggregated Consensus Data",
-              pubkey: aggregatedConsensusDataAccountPDA,
-            },
+        const accountInfos = await Promise.all([
+          connection.getAccountInfo(bridgeNodeDataAccountPDA),
+          connection.getAccountInfo(tempServiceRequestsDataAccountPDA),
+          connection.getAccountInfo(serviceRequestTxidMappingDataAccountPDA),
+          connection.getAccountInfo(aggregatedConsensusDataAccountPDA),
+        ]);
+
+        // Verify each account exists and has the correct data size
+        accountInfos.forEach((accountInfo, index) => {
+          const accountNames = [
+            "Bridge Node Data",
+            "Temp Service Requests",
+            "Service Request Txid Mapping",
+            "Aggregated Consensus Data",
           ];
 
-          for (const account of accounts) {
-            const accountInfo = await connection.getAccountInfo(account.pubkey);
-            if (!accountInfo) {
-              throw new Error(`${account.name} account not initialized`);
-            }
-            console.log(
-              `${account.name} account initialized with ${accountInfo.data.length} bytes`
-            );
+          if (!accountInfo) {
+            throw new Error(`${accountNames[index]} account not initialized`);
           }
-        };
-
-        await verifyAccounts();
+          console.log(
+            `${accountNames[index]} account initialized with ${accountInfo.data.length} bytes`
+          );
+        });
 
         // Verify the bridge contract state
         const state = await program.account.bridgeContractState.fetch(
@@ -407,6 +411,130 @@ describe("Solana Pastel Bridge Tests", () => {
           tempServiceRequestsDataAccountPDA.toString(),
           "Temp service requests data account pubkey should be set correctly"
         );
+        assert.equal(
+          state.aggregatedConsensusDataAccountPubkey.toString(),
+          aggregatedConsensusDataAccountPDA.toString(),
+          "Aggregated consensus data account pubkey should be set correctly"
+        );
+        assert.equal(
+          state.serviceRequestTxidMappingAccountPubkey.toString(),
+          serviceRequestTxidMappingDataAccountPDA.toString(),
+          "Service request txid mapping account pubkey should be set correctly"
+        );
+        assert.equal(
+          state.bridgeRewardPoolAccountPubkey.toString(),
+          rewardPoolAccountPDA.toString(),
+          "Bridge reward pool account pubkey should be set correctly"
+        );
+        assert.equal(
+          state.bridgeEscrowAccountPubkey.toString(),
+          bridgeEscrowAccountPDA.toString(),
+          "Bridge escrow account pubkey should be set correctly"
+        );
+        assert.equal(
+          state.regFeeReceivingAccountPubkey.toString(),
+          regFeeReceivingAccountPDA.toString(),
+          "Registration fee receiving account pubkey should be set correctly"
+        );
+
+        // Verify account rent-exemption status
+        const accounts = [
+          {
+            name: "Bridge Contract State",
+            pubkey: bridgeContractState.publicKey,
+          },
+          { name: "Bridge Nodes Data", pubkey: bridgeNodeDataAccountPDA },
+          {
+            name: "Temp Service Requests",
+            pubkey: tempServiceRequestsDataAccountPDA,
+          },
+          {
+            name: "Service Request Txid Mapping",
+            pubkey: serviceRequestTxidMappingDataAccountPDA,
+          },
+          {
+            name: "Aggregated Consensus Data",
+            pubkey: aggregatedConsensusDataAccountPDA,
+          },
+          { name: "Bridge Reward Pool", pubkey: rewardPoolAccountPDA },
+          { name: "Bridge Escrow", pubkey: bridgeEscrowAccountPDA },
+          {
+            name: "Registration Fee Receiving",
+            pubkey: regFeeReceivingAccountPDA,
+          },
+        ];
+
+        for (const account of accounts) {
+          const accountInfo = await connection.getAccountInfo(account.pubkey);
+          if (!accountInfo) {
+            throw new Error(`${account.name} account not found`);
+          }
+
+          const rent = await connection.getMinimumBalanceForRentExemption(
+            accountInfo.data.length
+          );
+          assert.isTrue(
+            accountInfo.lamports >= rent,
+            `${account.name} account should be rent-exempt. Required: ${rent}, Current: ${accountInfo.lamports}`
+          );
+        }
+
+        // Verify data structures initialization
+        const bridgeNodesData =
+          await program.account.bridgeNodesDataAccount.fetch(
+            bridgeNodeDataAccountPDA
+          );
+        assert.isArray(
+          bridgeNodesData.bridgeNodes,
+          "Bridge nodes should be initialized as empty array"
+        );
+        assert.equal(
+          bridgeNodesData.bridgeNodes.length,
+          0,
+          "Bridge nodes array should be empty"
+        );
+
+        const tempServiceRequestsData =
+          await program.account.tempServiceRequestsDataAccount.fetch(
+            tempServiceRequestsDataAccountPDA
+          );
+        assert.isArray(
+          tempServiceRequestsData.serviceRequests,
+          "Service requests should be initialized as empty array"
+        );
+        assert.equal(
+          tempServiceRequestsData.serviceRequests.length,
+          0,
+          "Service requests array should be empty"
+        );
+
+        const txidMappingData =
+          await program.account.serviceRequestTxidMappingDataAccount.fetch(
+            serviceRequestTxidMappingDataAccountPDA
+          );
+        assert.isArray(
+          txidMappingData.mappings,
+          "TXID mappings should be initialized as empty array"
+        );
+        assert.equal(
+          txidMappingData.mappings.length,
+          0,
+          "TXID mappings array should be empty"
+        );
+
+        const consensusData =
+          await program.account.aggregatedConsensusDataAccount.fetch(
+            aggregatedConsensusDataAccountPDA
+          );
+        assert.isArray(
+          consensusData.consensusData,
+          "Consensus data should be initialized as empty array"
+        );
+        assert.equal(
+          consensusData.consensusData.length,
+          0,
+          "Consensus data array should be empty"
+        );
 
         console.log("All initialization verifications completed successfully");
       } catch (error) {
@@ -417,25 +545,6 @@ describe("Solana Pastel Bridge Tests", () => {
         throw error;
       }
     });
-
-    // Helper function to verify account data
-    const verifyAccountData = async (
-      connection: web3.Connection,
-      accountPubkey: web3.PublicKey,
-      expectedMinSize: number,
-      accountName: string
-    ) => {
-      const accountInfo = await connection.getAccountInfo(accountPubkey);
-      if (!accountInfo) {
-        throw new Error(`${accountName} account not found`);
-      }
-      if (accountInfo.data.length < expectedMinSize) {
-        throw new Error(
-          `${accountName} account size (${accountInfo.data.length}) is less than minimum required (${expectedMinSize})`
-        );
-      }
-      return accountInfo;
-    };
   });
 
   describe("Reinitialization Prevention", () => {
