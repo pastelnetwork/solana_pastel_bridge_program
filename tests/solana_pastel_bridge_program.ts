@@ -9,7 +9,7 @@ import IDL from "../target/idl/solana_pastel_bridge_program.json";
 
 const { PublicKey, Keypair, Transaction } = anchor.web3;
 
-// Provider setup
+// Provider setup with explicit error handling
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG =
   "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
@@ -17,14 +17,18 @@ process.env.RUST_LOG =
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
 
-// Let Anchor handle the program ID
 const program = new Program<SolanaPastelBridgeProgram>(IDL as any, provider);
 const admin = provider.wallet;
 const adminPublicKey = admin.publicKey;
 
-// Global state tracking
+// Global state tracking with proper typing
 let bridgeContractState: web3.Keypair;
-let bridgeNodes: any[] = [];
+interface BridgeNode {
+  keypair: web3.Keypair;
+  pastelId: string;
+  pslAddress: string;
+}
+let bridgeNodes: BridgeNode[] = [];
 let serviceRequestIds: string[] = [];
 let totalComputeUnitsUsed = 0;
 let maxAccountStorageUsed = 0;
@@ -37,13 +41,65 @@ const COMPUTE_UNITS_PER_TX = 1_400_000;
 const TX_CONFIRMATION_TIMEOUT = 60000; // 60 seconds
 const OPERATION_DELAY = 1000; // 1 second delay between operations
 
-// Account size calculations
+// Account size calculations with updated space requirements
 const ACCOUNT_SIZES = {
-  BRIDGE_NODES: 2048,
-  SERVICE_REQUESTS: 2048,
-  CONSENSUS_DATA: 2048,
-  TXID_MAPPINGS: 2048,
-  BASE_STATE: 1024,
+  BRIDGE_NODES:
+    8 +
+    4 +
+    10 *
+      (64 + // pastel_id
+        32 + // reward_address
+        64 + // bridge_node_psl_address
+        64 + // registration_entrance_fee_transaction_signature
+        8 + // compliance_score
+        8 + // reliability_score
+        8 + // last_active_timestamp
+        4 + // total_price_quotes_submitted
+        4 + // total_service_requests_attempted
+        4 + // successful_service_requests_count
+        4 + // current_streak
+        4 + // failed_service_requests_count
+        8 + // ban_expiry
+        1 + // is_eligible_for_rewards
+        1 + // is_recently_active
+        1 + // is_reliable
+        1), // is_banned
+  SERVICE_REQUESTS:
+    8 +
+    4 +
+    10 *
+      (32 + // service_request_id
+        1 + // service_type
+        8 + // first_6_characters_of_hash
+        64 + // ipfs_cid
+        8 + // file_size_bytes
+        32 + // user_sol_address
+        1 + // status
+        1 + // payment_in_escrow
+        8 + // request_expiry
+        9 + // Option<u64> timestamps (x7)
+        65 + // Option<String> selected_bridge_node_pastelid
+        9 + // Option<u64> best_quoted_price
+        9 + // Option<u64> escrow_amount
+        9 + // Option<u64> service_fee
+        65), // Option<String> pastel_txid
+  CONSENSUS_DATA:
+    8 +
+    4 +
+    10 *
+      (64 + // txid
+        16 + // status_weights
+        4 + // Vec length for hash_weights
+        640 + // hash_weights (10 * (64 + 4))
+        8 + // first_6_characters_hash
+        8), // last_updated
+  TXID_MAPPINGS:
+    8 +
+    4 +
+    10 *
+      (32 + // service_request_id
+        64), // pastel_txid
+  BASE_STATE: 8 + 1 + 1 + 32 * 11, // Discriminator + initialized + paused + 11 pubkeys
 };
 
 // Business logic constants
@@ -54,29 +110,29 @@ const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_NUMBER_OF_ORACLES = 8;
 const MIN_REPORTS_FOR_REWARD = 10;
 const BAD_BRIDGE_NODE_INDEX = 5;
-const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
-const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
+const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65_000_000_000; // Updated to fixed-point
+const MIN_RELIABILITY_SCORE_FOR_REWARD = 80_000_000_000; // Updated to fixed-point
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
 const baselinePriceUSD = 3;
 const solToUsdRate = 130;
 const baselinePriceSol = baselinePriceUSD / solToUsdRate;
 
-// Enums
+// Enums matching Rust implementation
 const TxidStatusEnum = {
-  Invalid: "Invalid",
-  PendingMining: "PendingMining",
-  MinedPendingActivation: "MinedPendingActivation",
-  MinedActivated: "MinedActivated",
-};
+  Invalid: 0,
+  PendingMining: 1,
+  MinedPendingActivation: 2,
+  MinedActivated: 3,
+} as const;
 
 const PastelTicketTypeEnum = {
-  Sense: "Sense",
-  Cascade: "Cascade",
-  Nft: "Nft",
-  InferenceApi: "InferenceApi",
-};
+  Sense: 0,
+  Cascade: 1,
+  Nft: 2,
+  InferenceApi: 3,
+} as const;
 
-// Helper functions
+// Helper functions with improved error handling
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const handleProgramError = (error: any, context: string) => {
@@ -88,6 +144,9 @@ const handleProgramError = (error: any, context: string) => {
     if (error.error.origin) {
       console.error(`Error Origin: ${error.error.origin}`);
     }
+    if (error.program) {
+      console.error(`Program ID:`, error.program.toString());
+    }
   }
 
   if (error.logs) {
@@ -95,6 +154,20 @@ const handleProgramError = (error: any, context: string) => {
   }
 
   throw error;
+};
+
+const logAccountState = async (
+  connection: web3.Connection,
+  pubkey: web3.PublicKey,
+  name: string
+) => {
+  const info = await connection.getAccountInfo(pubkey);
+  console.log(`${name} Account:`, {
+    exists: info !== null,
+    size: info?.data.length ?? 0,
+    lamports: info?.lamports ?? 0,
+    owner: info?.owner?.toBase58() ?? "none",
+  });
 };
 
 const confirmTransaction = async (
@@ -105,8 +178,13 @@ const confirmTransaction = async (
   const startTime = Date.now();
 
   try {
+    const latestBlockhash = await provider.connection.getLatestBlockhash();
     await provider.connection.confirmTransaction(
-      { signature, ...(await provider.connection.getLatestBlockhash()) },
+      {
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      },
       commitment
     );
 
@@ -171,8 +249,34 @@ const calculateSpace = (
   baseSize: number,
   itemSize: number,
   maxItems: number
-) => {
+): number => {
   return ACCOUNT_DISCRIMINATOR_SIZE + 4 + (baseSize + itemSize * maxItems);
+};
+
+// Account initialization helper
+const initializeAccount = async (
+  accountSize: number,
+  connection: web3.Connection,
+  payer: web3.PublicKey,
+  owner: web3.PublicKey
+): Promise<web3.Keypair> => {
+  const account = web3.Keypair.generate();
+  const lamports = await connection.getMinimumBalanceForRentExemption(
+    accountSize
+  );
+
+  const transaction = new Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: payer,
+      newAccountPubkey: account.publicKey,
+      lamports,
+      space: accountSize,
+      programId: owner,
+    })
+  );
+
+  await provider.sendAndConfirm(transaction, [account]);
+  return account;
 };
 
 describe("Solana Pastel Bridge Tests", () => {
@@ -197,7 +301,7 @@ describe("Solana Pastel Bridge Tests", () => {
       try {
         // Set up compute budget for all transactions
         const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-          units: 1_400_000,
+          units: COMPUTE_UNITS_PER_TX,
         });
 
         const modifyComputePriceIx = ComputeBudgetProgram.setComputeUnitPrice({
@@ -206,48 +310,50 @@ describe("Solana Pastel Bridge Tests", () => {
 
         console.log("Starting PDA generation...");
 
-        // Generate PDAs with proper seeds
-        const [rewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_reward_pool_account")],
-          program.programId
-        );
+        // Generate PDAs with proper seeds and store bumps
+        const [rewardPoolAccountPDA, rewardPoolBump] =
+          await PublicKey.findProgramAddress(
+            [Buffer.from("bridge_reward_pool_account")],
+            program.programId
+          );
 
-        const [bridgeEscrowAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_escrow_account")],
-          program.programId
-        );
+        const [bridgeEscrowAccountPDA, escrowBump] =
+          await PublicKey.findProgramAddress(
+            [Buffer.from("bridge_escrow_account")],
+            program.programId
+          );
 
-        const [bridgeNodeDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
+        const [bridgeNodeDataAccountPDA, nodeDataBump] =
+          await PublicKey.findProgramAddress(
             [Buffer.from("bridge_nodes_data")],
             program.programId
           );
 
-        const [serviceRequestTxidMappingDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
+        const [serviceRequestTxidMappingDataAccountPDA, mappingBump] =
+          await PublicKey.findProgramAddress(
             [Buffer.from("service_request_txid_map")],
             program.programId
           );
 
-        const [aggregatedConsensusDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
+        const [aggregatedConsensusDataAccountPDA, consensusBump] =
+          await PublicKey.findProgramAddress(
             [Buffer.from("aggregated_consensus_data")],
             program.programId
           );
 
-        const [tempServiceRequestsDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
+        const [tempServiceRequestsDataAccountPDA, tempRequestsBump] =
+          await PublicKey.findProgramAddress(
             [Buffer.from("temp_service_requests_data")],
             program.programId
           );
 
-        const [regFeeReceivingAccountPDA] =
-          await PublicKey.findProgramAddressSync(
+        const [regFeeReceivingAccountPDA, regFeeBump] =
+          await PublicKey.findProgramAddress(
             [Buffer.from("reg_fee_receiving_account")],
             program.programId
           );
 
-        // Log PDA addresses
+        // Log PDA addresses and bumps
         console.log({
           rewardPoolAccountPDA: rewardPoolAccountPDA.toBase58(),
           bridgeEscrowAccountPDA: bridgeEscrowAccountPDA.toBase58(),
@@ -259,40 +365,52 @@ describe("Solana Pastel Bridge Tests", () => {
           tempServiceRequestsDataAccountPDA:
             tempServiceRequestsDataAccountPDA.toBase58(),
           regFeeReceivingAccountPDA: regFeeReceivingAccountPDA.toBase58(),
+          bumps: {
+            rewardPool: rewardPoolBump,
+            escrow: escrowBump,
+            nodeData: nodeDataBump,
+            mapping: mappingBump,
+            consensus: consensusBump,
+            tempRequests: tempRequestsBump,
+            regFee: regFeeBump,
+          },
         });
 
-        // Calculate initial rent exemption for all accounts
+        // Calculate precise space requirements for bridge contract state
         const connection = provider.connection;
-        const baseStateSpace =
-          8 + // Discriminator
-          1 + // is_initialized
-          1 + // is_paused
-          32 + // admin_pubkey
-          32 + // oracle_contract_pubkey
-          32 + // bridge_reward_pool_account_pubkey
-          32 + // bridge_escrow_account_pubkey
-          32 + // bridge_nodes_data_account_pubkey
-          32 + // temp_service_requests_data_account_pubkey
-          32 + // aggregated_consensus_data_account_pubkey
-          32 + // service_request_txid_mapping_account_pubkey
-          32; // reg_fee_receiving_account_pubkey
+        const baseStateSpace = ACCOUNT_SIZES.BASE_STATE;
 
+        // Get exact rent exemption amount
         const rent = await connection.getMinimumBalanceForRentExemption(
           baseStateSpace
         );
 
-        // Fund the bridge contract state account with double the minimum rent
-        const fundTx = new web3.Transaction().add(
-          web3.SystemProgram.transfer({
+        // Fund the bridge contract state account with exact rent requirement
+        const fundTx = new Transaction().add(
+          SystemProgram.transfer({
             fromPubkey: provider.wallet.publicKey,
             toPubkey: bridgeContractState.publicKey,
-            lamports: rent * 2,
+            lamports: rent,
           })
         );
 
         const fundTxSignature = await provider.sendAndConfirm(fundTx);
         await confirmTransaction(fundTxSignature);
-        console.log("Bridge contract state funded");
+        console.log("Bridge contract state funded with exact rent:", rent);
+
+        // Verify the account was funded
+        const accountInfo = await connection.getAccountInfo(
+          bridgeContractState.publicKey
+        );
+        assert(
+          accountInfo !== null,
+          "Bridge contract state account should exist"
+        );
+        assert.equal(
+          accountInfo.lamports,
+          rent,
+          "Account should have exact rent amount"
+        );
 
         // Initialize base state
         console.log("Starting base initialization...");
@@ -301,11 +419,14 @@ describe("Solana Pastel Bridge Tests", () => {
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
             user: provider.wallet.publicKey,
-            systemProgram: web3.SystemProgram.programId,
+            systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
           .signers([bridgeContractState])
-          .rpc({ skipPreflight: true });
+          .rpc({
+            skipPreflight: true,
+            commitment: "confirmed",
+          });
 
         await confirmTransaction(initBaseTx);
         console.log("Base initialization complete");
@@ -315,226 +436,507 @@ describe("Solana Pastel Bridge Tests", () => {
 
         // Initialize core PDAs
         console.log("Starting core PDA initialization...");
-        const initCorePDAsTx = await program.methods
-          .initializeCorePdas()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            bridgeRewardPoolAccount: rewardPoolAccountPDA,
-            bridgeEscrowAccount: bridgeEscrowAccountPDA,
-            regFeeReceivingAccount: regFeeReceivingAccountPDA,
-            systemProgram: web3.SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
-          .rpc({ skipPreflight: true });
 
-        await confirmTransaction(initCorePDAsTx);
-        console.log("Core PDAs initialization complete");
-
-        // Add delay between transactions
-        await sleep(2000);
-
-        // Initialize data PDAs
-        console.log("Starting data PDA initialization...");
-        const initDataPDAsTx = await program.methods
-          .initializeDataPdas()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-            serviceRequestTxidMappingDataAccount:
-              serviceRequestTxidMappingDataAccountPDA,
-            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-            systemProgram: web3.SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
-          .rpc({
-            skipPreflight: true,
-            commitment: "confirmed",
-          });
-
-        await confirmTransaction(initDataPDAsTx);
-        console.log("Data PDAs initialization complete");
-
-        // Verify all PDAs were initialized correctly
-        const accountInfos = await Promise.all([
-          connection.getAccountInfo(bridgeNodeDataAccountPDA),
-          connection.getAccountInfo(tempServiceRequestsDataAccountPDA),
-          connection.getAccountInfo(serviceRequestTxidMappingDataAccountPDA),
-          connection.getAccountInfo(aggregatedConsensusDataAccountPDA),
-        ]);
-
-        // Verify each account exists and has the correct data size
-        accountInfos.forEach((accountInfo, index) => {
-          const accountNames = [
-            "Bridge Node Data",
-            "Temp Service Requests",
-            "Service Request Txid Mapping",
-            "Aggregated Consensus Data",
-          ];
-
-          if (!accountInfo) {
-            throw new Error(`${accountNames[index]} account not initialized`);
-          }
-          console.log(
-            `${accountNames[index]} account initialized with ${accountInfo.data.length} bytes`
-          );
-        });
-
-        // Verify the bridge contract state
-        const state = await program.account.bridgeContractState.fetch(
+        // First verify the contract state
+        const stateAccount = await program.account.bridgeContractState.fetch(
           bridgeContractState.publicKey
         );
+        console.log("Contract state before core init:", stateAccount);
 
-        // Perform assertions
-        assert.isTrue(
-          state.isInitialized,
-          "Bridge contract state should be initialized"
-        );
-        assert.isFalse(
-          state.isPaused,
-          "Bridge contract should not be paused initially"
-        );
-        assert.equal(
-          state.adminPubkey.toString(),
-          provider.wallet.publicKey.toString(),
-          "Admin public key should be set correctly"
-        );
-        assert.equal(
-          state.bridgeNodesDataAccountPubkey.toString(),
-          bridgeNodeDataAccountPDA.toString(),
-          "Bridge nodes data account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.tempServiceRequestsDataAccountPubkey.toString(),
-          tempServiceRequestsDataAccountPDA.toString(),
-          "Temp service requests data account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.aggregatedConsensusDataAccountPubkey.toString(),
-          aggregatedConsensusDataAccountPDA.toString(),
-          "Aggregated consensus data account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.serviceRequestTxidMappingAccountPubkey.toString(),
-          serviceRequestTxidMappingDataAccountPDA.toString(),
-          "Service request txid mapping account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.bridgeRewardPoolAccountPubkey.toString(),
-          rewardPoolAccountPDA.toString(),
-          "Bridge reward pool account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.bridgeEscrowAccountPubkey.toString(),
-          bridgeEscrowAccountPDA.toString(),
-          "Bridge escrow account pubkey should be set correctly"
-        );
-        assert.equal(
-          state.regFeeReceivingAccountPubkey.toString(),
-          regFeeReceivingAccountPDA.toString(),
-          "Registration fee receiving account pubkey should be set correctly"
+        // Build transaction with required space
+        const corePDAInstructionAccounts = {
+          bridgeContractState: bridgeContractState.publicKey,
+          user: provider.wallet.publicKey,
+          bridgeRewardPoolAccount: rewardPoolAccountPDA,
+          bridgeEscrowAccount: bridgeEscrowAccountPDA,
+          regFeeReceivingAccount: regFeeReceivingAccountPDA,
+          systemProgram: SystemProgram.programId,
+        };
+
+        // Log all account states before transaction
+        await Promise.all([
+          logAccountState(
+            connection,
+            bridgeContractState.publicKey,
+            "Bridge Contract State"
+          ),
+          logAccountState(connection, rewardPoolAccountPDA, "Reward Pool"),
+          logAccountState(connection, bridgeEscrowAccountPDA, "Escrow"),
+          logAccountState(connection, regFeeReceivingAccountPDA, "Reg Fee"),
+        ]);
+
+        // Build the transaction with explicit compute budget
+        const corePDATx = new Transaction();
+        corePDATx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({
+            units: COMPUTE_UNITS_PER_TX,
+          })
         );
 
-        // Verify account rent-exemption status
-        const accounts = [
-          {
-            name: "Bridge Contract State",
-            pubkey: bridgeContractState.publicKey,
-          },
-          { name: "Bridge Nodes Data", pubkey: bridgeNodeDataAccountPDA },
-          {
-            name: "Temp Service Requests",
-            pubkey: tempServiceRequestsDataAccountPDA,
-          },
-          {
-            name: "Service Request Txid Mapping",
-            pubkey: serviceRequestTxidMappingDataAccountPDA,
-          },
-          {
-            name: "Aggregated Consensus Data",
-            pubkey: aggregatedConsensusDataAccountPDA,
-          },
-          { name: "Bridge Reward Pool", pubkey: rewardPoolAccountPDA },
-          { name: "Bridge Escrow", pubkey: bridgeEscrowAccountPDA },
-          {
-            name: "Registration Fee Receiving",
-            pubkey: regFeeReceivingAccountPDA,
-          },
-        ];
+        // Add the core PDA initialization instruction
+        const initCorePDAsIx = await program.methods
+          .initializeCorePdas()
+          .accounts(corePDAInstructionAccounts)
+          .instruction();
 
-        for (const account of accounts) {
-          const accountInfo = await connection.getAccountInfo(account.pubkey);
-          if (!accountInfo) {
-            throw new Error(`${account.name} account not found`);
+        corePDATx.add(initCorePDAsIx);
+
+        // Send and confirm with detailed error handling
+        try {
+          const signature = await provider.sendAndConfirm(corePDATx, [], {
+            skipPreflight: true,
+            commitment: "confirmed",
+            preflightCommitment: "confirmed",
+          });
+
+          console.log("Core PDAs initialization signature:", signature);
+
+          // Wait for confirmation with retries
+          for (let i = 0; i < 3; i++) {
+            try {
+              await provider.connection.confirmTransaction(
+                {
+                  signature,
+                  ...(await provider.connection.getLatestBlockhash()),
+                },
+                "confirmed"
+              );
+              break;
+            } catch (e) {
+              if (i === 2) throw e;
+              await sleep(1000);
+            }
           }
 
-          const rent = await connection.getMinimumBalanceForRentExemption(
-            accountInfo.data.length
+          // Verify accounts after initialization
+          await Promise.all([
+            logAccountState(
+              connection,
+              rewardPoolAccountPDA,
+              "Reward Pool After"
+            ),
+            logAccountState(connection, bridgeEscrowAccountPDA, "Escrow After"),
+            logAccountState(
+              connection,
+              regFeeReceivingAccountPDA,
+              "Reg Fee After"
+            ),
+          ]);
+
+          // Verify the state was updated
+          const updatedState = await program.account.bridgeContractState.fetch(
+            bridgeContractState.publicKey
           );
-          assert.isTrue(
-            accountInfo.lamports >= rent,
-            `${account.name} account should be rent-exempt. Required: ${rent}, Current: ${accountInfo.lamports}`
+          console.log("Contract state after core init:", updatedState);
+
+          console.log("Core PDAs initialization complete");
+        } catch (error) {
+          console.error("Core PDA initialization failed with error:", error);
+          if (error.logs) {
+            console.error("Program logs:", error.logs);
+          }
+          // Get detailed error information if available
+          try {
+            const simulationResult =
+              await provider.connection.simulateTransaction(corePDATx);
+            console.error("Simulation result:", simulationResult);
+          } catch (simError) {
+            console.error("Simulation failed:", simError);
+          }
+          throw error;
+        }
+        await sleep(2000);
+
+        console.log("Starting sequential data PDA initialization...");
+        // Log initial states of all accounts
+        await Promise.all([
+          logAccountState(
+            connection,
+            bridgeNodeDataAccountPDA,
+            "Bridge Node Data Initial"
+          ),
+          logAccountState(
+            connection,
+            tempServiceRequestsDataAccountPDA,
+            "Temp Service Requests Initial"
+          ),
+          logAccountState(
+            connection,
+            serviceRequestTxidMappingDataAccountPDA,
+            "TXID Mapping Initial"
+          ),
+          logAccountState(
+            connection,
+            aggregatedConsensusDataAccountPDA,
+            "Consensus Data Initial"
+          ),
+        ]);
+
+        // Initialize Bridge Nodes Data Account
+        try {
+          console.log("Initializing Bridge Nodes Data Account...");
+          const bridgeNodesTx = new Transaction().add(
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS_PER_TX,
+            })
           );
+
+          const bridgeNodesIx = await program.methods
+            .initializeBridgeNodesData()
+            .accounts({
+              bridgeContractState: bridgeContractState.publicKey,
+              user: provider.wallet.publicKey,
+              bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .instruction();
+
+          bridgeNodesTx.add(bridgeNodesIx);
+
+          const bridgeNodesSignature = await provider.sendAndConfirm(
+            bridgeNodesTx,
+            [],
+            {
+              skipPreflight: true,
+              commitment: "confirmed",
+            }
+          );
+          console.log(
+            "Bridge Nodes Data initialization signature:",
+            bridgeNodesSignature
+          );
+          await sleep(2000);
+        } catch (error) {
+          console.error("Bridge Nodes Data initialization failed:", error);
+          throw error;
         }
 
-        // Verify data structures initialization
-        const bridgeNodesData =
-          await program.account.bridgeNodesDataAccount.fetch(
-            bridgeNodeDataAccountPDA
+        // Initialize Temp Service Requests Account
+        try {
+          console.log("Initializing Temp Service Requests Account...");
+          const tempRequestsTx = new Transaction().add(
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS_PER_TX,
+            })
           );
-        assert.isArray(
-          bridgeNodesData.bridgeNodes,
-          "Bridge nodes should be initialized as empty array"
-        );
-        assert.equal(
-          bridgeNodesData.bridgeNodes.length,
-          0,
-          "Bridge nodes array should be empty"
-        );
 
-        const tempServiceRequestsData =
-          await program.account.tempServiceRequestsDataAccount.fetch(
-            tempServiceRequestsDataAccountPDA
-          );
-        assert.isArray(
-          tempServiceRequestsData.serviceRequests,
-          "Service requests should be initialized as empty array"
-        );
-        assert.equal(
-          tempServiceRequestsData.serviceRequests.length,
-          0,
-          "Service requests array should be empty"
-        );
+          const tempRequestsIx = await program.methods
+            .initializeTempRequestsData()
+            .accounts({
+              bridgeContractState: bridgeContractState.publicKey,
+              user: provider.wallet.publicKey,
+              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .instruction();
 
-        const txidMappingData =
-          await program.account.serviceRequestTxidMappingDataAccount.fetch(
-            serviceRequestTxidMappingDataAccountPDA
-          );
-        assert.isArray(
-          txidMappingData.mappings,
-          "TXID mappings should be initialized as empty array"
-        );
-        assert.equal(
-          txidMappingData.mappings.length,
-          0,
-          "TXID mappings array should be empty"
-        );
+          tempRequestsTx.add(tempRequestsIx);
 
-        const consensusData =
-          await program.account.aggregatedConsensusDataAccount.fetch(
-            aggregatedConsensusDataAccountPDA
+          const tempRequestsSignature = await provider.sendAndConfirm(
+            tempRequestsTx,
+            [],
+            {
+              skipPreflight: true,
+              commitment: "confirmed",
+            }
           );
-        assert.isArray(
-          consensusData.consensusData,
-          "Consensus data should be initialized as empty array"
+          console.log(
+            "Temp Service Requests initialization signature:",
+            tempRequestsSignature
+          );
+          await sleep(2000);
+        } catch (error) {
+          console.error("Temp Service Requests initialization failed:", error);
+          throw error;
+        }
+
+        // Initialize TXID Mapping Account
+        try {
+          console.log("Initializing TXID Mapping Account...");
+          const txidMappingTx = new Transaction().add(
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS_PER_TX,
+            })
+          );
+
+          const txidMappingIx = await program.methods
+            .initializeTxidMappingData()
+            .accounts({
+              bridgeContractState: bridgeContractState.publicKey,
+              user: provider.wallet.publicKey,
+              serviceRequestTxidMappingDataAccount:
+                serviceRequestTxidMappingDataAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .instruction();
+
+          txidMappingTx.add(txidMappingIx);
+
+          const txidMappingSignature = await provider.sendAndConfirm(
+            txidMappingTx,
+            [],
+            {
+              skipPreflight: true,
+              commitment: "confirmed",
+            }
+          );
+          console.log(
+            "TXID Mapping initialization signature:",
+            txidMappingSignature
+          );
+          await sleep(2000);
+        } catch (error) {
+          console.error("TXID Mapping initialization failed:", error);
+          throw error;
+        }
+
+        // Initialize Consensus Data Account
+        try {
+          console.log("Initializing Consensus Data Account...");
+          const consensusDataTx = new Transaction().add(
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS_PER_TX,
+            })
+          );
+
+          const consensusDataIx = await program.methods
+            .initializeConsensusData()
+            .accounts({
+              bridgeContractState: bridgeContractState.publicKey,
+              user: provider.wallet.publicKey,
+              aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .instruction();
+
+          consensusDataTx.add(consensusDataIx);
+
+          const consensusDataSignature = await provider.sendAndConfirm(
+            consensusDataTx,
+            [],
+            {
+              skipPreflight: true,
+              commitment: "confirmed",
+            }
+          );
+          console.log(
+            "Consensus Data initialization signature:",
+            consensusDataSignature
+          );
+          await sleep(2000);
+        } catch (error) {
+          console.error("Consensus Data initialization failed:", error);
+          throw error;
+        }
+
+        // Verify final states of all accounts
+        console.log("Verifying final account states...");
+        await Promise.all([
+          logAccountState(
+            connection,
+            bridgeNodeDataAccountPDA,
+            "Bridge Node Data Final"
+          ),
+          logAccountState(
+            connection,
+            tempServiceRequestsDataAccountPDA,
+            "Temp Service Requests Final"
+          ),
+          logAccountState(
+            connection,
+            serviceRequestTxidMappingDataAccountPDA,
+            "TXID Mapping Final"
+          ),
+          logAccountState(
+            connection,
+            aggregatedConsensusDataAccountPDA,
+            "Consensus Data Final"
+          ),
+        ]);
+
+        // Verify final bridge contract state
+        const finalState = await program.account.bridgeContractState.fetch(
+          bridgeContractState.publicKey
         );
-        assert.equal(
-          consensusData.consensusData.length,
-          0,
-          "Consensus data array should be empty"
-        );
+        console.log("Final contract state:", finalState);
+
+        // Comprehensive state verification
+        const verifyState = () => {
+          assert.isTrue(
+            finalState.isInitialized,
+            "Bridge contract state should be initialized"
+          );
+          assert.isFalse(
+            finalState.isPaused,
+            "Bridge contract should not be paused initially"
+          );
+
+          const stateChecks = [
+            {
+              actual: finalState.adminPubkey,
+              expected: provider.wallet.publicKey,
+              name: "Admin public key",
+            },
+            {
+              actual: finalState.bridgeNodesDataAccountPubkey,
+              expected: bridgeNodeDataAccountPDA,
+              name: "Bridge nodes data account",
+            },
+            {
+              actual: finalState.tempServiceRequestsDataAccountPubkey,
+              expected: tempServiceRequestsDataAccountPDA,
+              name: "Temp service requests data account",
+            },
+            {
+              actual: finalState.aggregatedConsensusDataAccountPubkey,
+              expected: aggregatedConsensusDataAccountPDA,
+              name: "Aggregated consensus data account",
+            },
+            {
+              actual: finalState.serviceRequestTxidMappingAccountPubkey,
+              expected: serviceRequestTxidMappingDataAccountPDA,
+              name: "Service request txid mapping account",
+            },
+            {
+              actual: finalState.bridgeRewardPoolAccountPubkey,
+              expected: rewardPoolAccountPDA,
+              name: "Bridge reward pool account",
+            },
+            {
+              actual: finalState.bridgeEscrowAccountPubkey,
+              expected: bridgeEscrowAccountPDA,
+              name: "Bridge escrow account",
+            },
+            {
+              actual: finalState.regFeeReceivingAccountPubkey,
+              expected: regFeeReceivingAccountPDA,
+              name: "Registration fee receiving account",
+            },
+          ];
+
+          stateChecks.forEach((check) => {
+            assert.equal(
+              check.actual.toString(),
+              check.expected.toString(),
+              `${check.name} should be set correctly`
+            );
+          });
+        };
+
+        // Run final state verification
+        verifyState();
+        console.log("Data PDAs initialization and verification complete");
+
+        // Verify rent-exemption status for all accounts
+        const verifyRentExemption = async () => {
+          const accounts = [
+            {
+              name: "Bridge Contract State",
+              pubkey: bridgeContractState.publicKey,
+            },
+            { name: "Bridge Nodes Data", pubkey: bridgeNodeDataAccountPDA },
+            {
+              name: "Temp Service Requests",
+              pubkey: tempServiceRequestsDataAccountPDA,
+            },
+            {
+              name: "Service Request Txid Mapping",
+              pubkey: serviceRequestTxidMappingDataAccountPDA,
+            },
+            {
+              name: "Aggregated Consensus Data",
+              pubkey: aggregatedConsensusDataAccountPDA,
+            },
+            { name: "Bridge Reward Pool", pubkey: rewardPoolAccountPDA },
+            { name: "Bridge Escrow", pubkey: bridgeEscrowAccountPDA },
+            {
+              name: "Registration Fee Receiving",
+              pubkey: regFeeReceivingAccountPDA,
+            },
+          ];
+
+          for (const account of accounts) {
+            const accountInfo = await connection.getAccountInfo(account.pubkey);
+            assert(accountInfo !== null, `${account.name} account not found`);
+
+            const rentExempt =
+              await connection.getMinimumBalanceForRentExemption(
+                accountInfo.data.length
+              );
+
+            assert.isTrue(
+              accountInfo.lamports >= rentExempt,
+              `${account.name} account should be rent-exempt. Required: ${rentExempt}, Current: ${accountInfo.lamports}`
+            );
+          }
+        };
+
+        await verifyRentExemption();
+
+        // Verify data structure initialization
+        const verifyDataStructures = async () => {
+          // Verify bridge nodes data
+          const bridgeNodesData =
+            await program.account.bridgeNodesDataAccount.fetch(
+              bridgeNodeDataAccountPDA
+            );
+          assert.isArray(
+            bridgeNodesData.bridgeNodes,
+            "Bridge nodes should be initialized as array"
+          );
+          assert.equal(
+            bridgeNodesData.bridgeNodes.length,
+            0,
+            "Bridge nodes array should be empty"
+          );
+
+          // Verify service requests data
+          const tempServiceRequestsData =
+            await program.account.tempServiceRequestsDataAccount.fetch(
+              tempServiceRequestsDataAccountPDA
+            );
+          assert.isArray(
+            tempServiceRequestsData.serviceRequests,
+            "Service requests should be initialized as array"
+          );
+          assert.equal(
+            tempServiceRequestsData.serviceRequests.length,
+            0,
+            "Service requests array should be empty"
+          );
+
+          // Verify txid mapping data
+          const txidMappingData =
+            await program.account.serviceRequestTxidMappingDataAccount.fetch(
+              serviceRequestTxidMappingDataAccountPDA
+            );
+          assert.isArray(
+            txidMappingData.mappings,
+            "TXID mappings should be initialized as array"
+          );
+          assert.equal(
+            txidMappingData.mappings.length,
+            0,
+            "TXID mappings array should be empty"
+          );
+
+          // Verify consensus data
+          const consensusData =
+            await program.account.aggregatedConsensusDataAccount.fetch(
+              aggregatedConsensusDataAccountPDA
+            );
+          assert.isArray(
+            consensusData.consensusData,
+            "Consensus data should be initialized as array"
+          );
+          assert.equal(
+            consensusData.consensusData.length,
+            0,
+            "Consensus data array should be empty"
+          );
+        };
+
+        await verifyDataStructures();
 
         console.log("All initialization verifications completed successfully");
       } catch (error) {

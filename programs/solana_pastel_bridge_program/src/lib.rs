@@ -351,6 +351,7 @@ pub struct BridgeContractState {
     pub reg_fee_receiving_account_pubkey: Pubkey,     
 }
 
+
 // Reward pool account for bridge nodes
 #[account]
 #[derive(Default, PartialEq, Eq)]
@@ -467,18 +468,18 @@ pub struct InitializeBase<'info> {
     #[account(
         init,
         payer = user,
-        space = 8 + // Discriminator
-        1 + // is_initialized
-        1 + // is_paused
-        32 + // admin_pubkey
-        32 + // oracle_contract_pubkey
-        32 + // bridge_reward_pool_account_pubkey
-        32 + // bridge_escrow_account_pubkey
-        32 + // bridge_nodes_data_account_pubkey
-        32 + // temp_service_requests_data_account_pubkey
-        32 + // aggregated_consensus_data_account_pubkey
-        32 + // service_request_txid_mapping_account_pubkey
-        32   // reg_fee_receiving_account_pubkey
+        space = 8 +  // Discriminator
+                1 +  // is_initialized
+                1 +  // is_paused
+                32 + // admin_pubkey
+                32 + // oracle_contract_pubkey
+                32 + // bridge_reward_pool_account_pubkey
+                32 + // bridge_escrow_account_pubkey
+                32 + // bridge_nodes_data_account_pubkey
+                32 + // temp_service_requests_data_account_pubkey
+                32 + // aggregated_consensus_data_account_pubkey
+                32 + // service_request_txid_mapping_account_pubkey
+                32   // reg_fee_receiving_account_pubkey
     )]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
     
@@ -487,7 +488,7 @@ pub struct InitializeBase<'info> {
     
     pub system_program: Program<'info, System>,
 }
-// Split PDAs into core accounts
+
 #[derive(Accounts)]
 pub struct InitializeCorePDAs<'info> {
     #[account(mut)]
@@ -507,15 +508,6 @@ pub struct InitializeCorePDAs<'info> {
     
     #[account(
         init,
-        seeds = [b"reg_fee_receiving_account"],
-        bump,
-        payer = user,
-        space = 8
-    )]
-    pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
-
-    #[account(
-        init,
         seeds = [b"bridge_escrow_account"],
         bump,
         payer = user,
@@ -523,12 +515,20 @@ pub struct InitializeCorePDAs<'info> {
     )]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
 
+    #[account(
+        init,
+        seeds = [b"reg_fee_receiving_account"],
+        bump,
+        payer = user,
+        space = 8
+    )]
+    pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
+
     pub system_program: Program<'info, System>,
 }
 
-// Data accounts in separate initialization
 #[derive(Accounts)]
-pub struct InitializeDataPDAs<'info> {
+pub struct InitBridgeNodesData<'info> {
     #[account(mut)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
     
@@ -540,135 +540,76 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"bridge_nodes_data"],
         bump,
         payer = user,
-        space = 8 +  // Discriminator
-                4 +  // Vec length
-                (10 * (
-                    64 +    // pastel_id (String ~32 chars)
-                    32 +    // reward_address
-                    64 +    // bridge_node_psl_address (String ~32 chars)
-                    64 +    // registration_entrance_fee_transaction_signature
-                    8 +     // compliance_score
-                    8 +     // reliability_score
-                    8 +     // last_active_timestamp
-                    4 +     // total_price_quotes_submitted
-                    4 +     // total_service_requests_attempted
-                    4 +     // successful_service_requests_count
-                    4 +     // current_streak
-                    4 +     // failed_service_requests_count
-                    8 +     // ban_expiry
-                    1 +     // is_eligible_for_rewards
-                    1 +     // is_recently_active
-                    1 +     // is_reliable
-                    1       // is_banned
-                ))
+        space = 8 + 4 + (10 * 280),  // Adjusted size
+        rent_exempt = enforce
     )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitTempRequestsData<'info> {
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    
+    #[account(mut)]
+    pub user: Signer<'info>,
 
     #[account(
         init,
         seeds = [b"temp_service_requests_data"],
         bump,
         payer = user,
-        space = 8 +  // Discriminator
-                4 +  // Vec length
-                (10 * (
-                    32 +    // service_request_id
-                    1 +     // service_type
-                    8 +     // first_6_characters_of_hash (String)
-                    64 +    // ipfs_cid (String)
-                    8 +     // file_size_bytes
-                    32 +    // user_sol_address
-                    1 +     // status
-                    1 +     // payment_in_escrow
-                    8 +     // request_expiry
-                    9 +     // Option<u64> sol_received_timestamp
-                    65 +    // Option<String> selected_bridge_node_pastelid
-                    9 +     // Option<u64> best_quoted_price
-                    9 +     // service_request_creation_timestamp
-                    9 +     // Option<u64> bridge_node_selection_timestamp
-                    9 +     // Option<u64> bridge_node_submission_of_txid_timestamp
-                    9 +     // Option<u64> submission_of_txid_to_oracle_timestamp
-                    9 +     // Option<u64> service_request_completion_timestamp
-                    9 +     // Option<u64> payment_received_timestamp
-                    9 +     // Option<u64> payment_release_timestamp
-                    9 +     // Option<u64> escrow_amount_lamports
-                    9 +     // Option<u64> service_fee_retained_by_bridge_contract_lamports
-                    65      // Option<String> pastel_txid
-                ))
+        space = 8 + 4 + (10 * 512),  // Adjusted size
+        rent_exempt = enforce
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
-    #[account(
-        init,
-        seeds = [b"aggregated_consensus_data"],
-        bump,
-        payer = user,
-        space = 8 +  // Discriminator
-                4 +  // Vec length
-                (10 * (
-                    64 +    // txid
-                    16 +    // status_weights [4 * i32]
-                    4 +     // Vec length for hash_weights
-                    (10 * (
-                        64 + // hash
-                        4    // weight
-                    )) +    // hash_weights vec assumed max 10 entries
-                    8 +     // first_6_characters_hash
-                    8       // last_updated
-                ))
-    )]
-    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitTxidMappingData<'info> {
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    
+    #[account(mut)]
+    pub user: Signer<'info>,
 
     #[account(
         init,
         seeds = [b"service_request_txid_map"],
         bump,
         payer = user,
-        space = 8 +  // Discriminator
-                4 +  // Vec length
-                (10 * (
-                    32 +    // service_request_id
-                    64      // pastel_txid
-                ))
+        space = 8 + 4 + (10 * 96),  // Adjusted size
+        rent_exempt = enforce
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct InitConsensusData<'info> {
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    
+    #[account(mut)]
+    pub user: Signer<'info>,
 
-impl<'info> InitializeDataPDAs<'info> {
-    fn validate_rent_exemption(&self, rent: &Rent) -> Result<()> {
-        let accounts = [
-            (
-                &self.bridge_nodes_data_account.to_account_info(),
-                "Bridge Nodes Data Account",
-            ),
-            (
-                &self.temp_service_requests_data_account.to_account_info(),
-                "Temp Service Requests Data Account",
-            ),
-            (
-                &self.aggregated_consensus_data_account.to_account_info(),
-                "Aggregated Consensus Data Account",
-            ),
-            (
-                &self.service_request_txid_mapping_data_account.to_account_info(),
-                "Service Request TXID Mapping Account",
-            ),
-        ];
+    #[account(
+        init,
+        seeds = [b"aggregated_consensus_data"],
+        bump,
+        payer = user,
+        space = 8 + 4 + (10 * 1024),  // Adjusted size
+        rent_exempt = enforce
+    )]
+    pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
-        for (account, name) in accounts.iter() {
-            if !rent.is_exempt(account.lamports(), account.data_len()) {
-                msg!("{} is not rent exempt", name);
-                return err!(BridgeError::NotRentExempt);
-            }
-        }
-
-        Ok(())
-    }
+    pub system_program: Program<'info, System>,
 }
-
 
 #[derive(Accounts)]
 pub struct ReallocateBridgeState<'info> {
@@ -2148,8 +2089,10 @@ declare_id!("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
 #[program]
 pub mod solana_pastel_bridge_program {
     use super::*;
-    pub fn initialize_base(ctx: Context<InitializeBase>, admin_pubkey: Pubkey) -> Result<()> {
+
+       pub fn initialize_base(ctx: Context<InitializeBase>, admin_pubkey: Pubkey) -> Result<()> {
         msg!("Initializing Bridge Contract Base State");
+        require!(!ctx.accounts.bridge_contract_state.is_initialized, BridgeError::ContractStateAlreadyInitialized);
 
         let state = &mut ctx.accounts.bridge_contract_state;
         state.is_initialized = true;
@@ -2163,69 +2106,78 @@ pub mod solana_pastel_bridge_program {
 
     pub fn initialize_core_pdas(ctx: Context<InitializeCorePDAs>) -> Result<()> {
         msg!("Initializing Core PDAs");
+        
+        // Ensure bridge contract state is initialized
+        require!(
+            ctx.accounts.bridge_contract_state.is_initialized,
+            BridgeError::ContractNotInitialized
+        );
 
         let state = &mut ctx.accounts.bridge_contract_state;
         
-        // Link core PDAs
+        // Initialize the reward pool account
+        msg!("Initializing reward pool account...");
         state.bridge_reward_pool_account_pubkey = ctx.accounts.bridge_reward_pool_account.key();
+        
+        // Initialize the escrow account
+        msg!("Initializing escrow account...");
         state.bridge_escrow_account_pubkey = ctx.accounts.bridge_escrow_account.key();
+        
+        // Initialize the registration fee account
+        msg!("Initializing registration fee account...");
         state.reg_fee_receiving_account_pubkey = ctx.accounts.reg_fee_receiving_account.key();
 
-        msg!("Core PDAs Initialized Successfully");
+        // Log successful initialization
+        msg!(
+            "Core PDAs initialized with reward pool: {}, escrow: {}, reg fee: {}",
+            ctx.accounts.bridge_reward_pool_account.key(),
+            ctx.accounts.bridge_escrow_account.key(),
+            ctx.accounts.reg_fee_receiving_account.key()
+        );
+
         Ok(())
     }
 
-    pub fn initialize_data_pdas(ctx: Context<InitializeDataPDAs>) -> Result<()> {
-        msg!("Starting data PDA initialization with rent validation");
-    
-        // Validate rent exemption for all accounts
-        let rent = Rent::get()?;
-        ctx.accounts.validate_rent_exemption(&rent)?;
-    
-        // Initialize accounts with explicit error handling
+    pub fn initialize_bridge_nodes_data(ctx: Context<InitBridgeNodesData>) -> Result<()> {
         msg!("Initializing bridge nodes data account");
         ctx.accounts.bridge_nodes_data_account.bridge_nodes = Vec::with_capacity(10);
-    
-        msg!("Initializing temp service requests data account");
-        ctx.accounts.temp_service_requests_data_account.service_requests = Vec::with_capacity(10);
-    
-        msg!("Initializing consensus data account");
-        ctx.accounts.aggregated_consensus_data_account.consensus_data = Vec::with_capacity(10);
-    
-        msg!("Initializing txid mapping account");
-        ctx.accounts.service_request_txid_mapping_data_account.mappings = Vec::with_capacity(10);
-    
-        // Update bridge contract state with validation
-        let state = &mut ctx.accounts.bridge_contract_state;
         
-        msg!("Updating bridge contract state with PDA pubkeys");
+        let state = &mut ctx.accounts.bridge_contract_state;
         state.bridge_nodes_data_account_pubkey = ctx.accounts.bridge_nodes_data_account.key();
-        state.temp_service_requests_data_account_pubkey = ctx.accounts.temp_service_requests_data_account.key();
-        state.aggregated_consensus_data_account_pubkey = ctx.accounts.aggregated_consensus_data_account.key();
-        state.service_request_txid_mapping_account_pubkey = ctx.accounts.service_request_txid_mapping_data_account.key();
-    
-        // Verify account sizes
-        for (account, name) in [
-            (&ctx.accounts.bridge_nodes_data_account.to_account_info(), "Bridge Nodes"),
-            (&ctx.accounts.temp_service_requests_data_account.to_account_info(), "Service Requests"),
-            (&ctx.accounts.aggregated_consensus_data_account.to_account_info(), "Consensus Data"),
-            (&ctx.accounts.service_request_txid_mapping_data_account.to_account_info(), "TXID Mapping"),
-        ] {
-            if account.data_len() < 8 {  // Minimum size for discriminator
-                msg!("Invalid account size for {}", name);
-                return err!(BridgeError::InvalidAccountSize);
-            }
-        }
-    
-        msg!("Data PDAs initialization completed successfully");
-        msg!("Bridge nodes account: {}", ctx.accounts.bridge_nodes_data_account.key());
-        msg!("Temp service requests account: {}", ctx.accounts.temp_service_requests_data_account.key());
-        msg!("Consensus data account: {}", ctx.accounts.aggregated_consensus_data_account.key());
-        msg!("Txid mapping account: {}", ctx.accounts.service_request_txid_mapping_data_account.key());
-    
+        
         Ok(())
     }
-    
+
+    pub fn initialize_temp_requests_data(ctx: Context<InitTempRequestsData>) -> Result<()> {
+        msg!("Initializing temp service requests account");
+        ctx.accounts.temp_service_requests_data_account.service_requests = Vec::with_capacity(10);
+        
+        let state = &mut ctx.accounts.bridge_contract_state;
+        state.temp_service_requests_data_account_pubkey = ctx.accounts.temp_service_requests_data_account.key();
+        
+        Ok(())
+    }
+
+    pub fn initialize_txid_mapping_data(ctx: Context<InitTxidMappingData>) -> Result<()> {
+        msg!("Initializing txid mapping account");
+        ctx.accounts.service_request_txid_mapping_data_account.mappings = Vec::with_capacity(10);
+        
+        let state = &mut ctx.accounts.bridge_contract_state;
+        state.service_request_txid_mapping_account_pubkey = ctx.accounts.service_request_txid_mapping_data_account.key();
+        
+        Ok(())
+    }
+
+    pub fn initialize_consensus_data(ctx: Context<InitConsensusData>) -> Result<()> {
+        msg!("Initializing consensus data account");
+        ctx.accounts.aggregated_consensus_data_account.consensus_data = Vec::with_capacity(10);
+        
+        let state = &mut ctx.accounts.bridge_contract_state;
+        state.aggregated_consensus_data_account_pubkey = ctx.accounts.aggregated_consensus_data_account.key();
+        
+        Ok(())
+    }
+
     pub fn reallocate_bridge_state(ctx: Context<ReallocateBridgeState>) -> Result<()> {
         ReallocateBridgeState::execute(ctx)
     }
