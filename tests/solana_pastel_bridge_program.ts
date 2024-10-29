@@ -1357,6 +1357,9 @@ describe("Solana Pastel Bridge Tests", () => {
           [Buffer.from("temp_service_requests_data")],
           program.programId
         );
+      console.log("Derived temp requests PDA:", tempServiceRequestsDataAccountPDA.toString());
+      console.log("Program ID used:", program.programId.toString());
+      
       [aggregatedConsensusDataAccountPDA] =
         await PublicKey.findProgramAddressSync(
           [Buffer.from("aggregated_consensus_data")],
@@ -1369,10 +1372,14 @@ describe("Solana Pastel Bridge Tests", () => {
 
     // Verify account initialization with retries
     let accountInfo = null;
+    console.log("About to verify account exists at:", tempServiceRequestsDataAccountPDA.toString());
+    
     for (let attempt = 0; attempt < 3; attempt++) {
+      console.log(`Attempt ${attempt + 1} to get account info...`);
       accountInfo = await provider.connection.getAccountInfo(
         tempServiceRequestsDataAccountPDA
       );
+      console.log("Account info received:", accountInfo ? "exists" : "null");
       if (accountInfo) break;
       await sleep(1000);
     }
@@ -1452,21 +1459,51 @@ describe("Solana Pastel Bridge Tests", () => {
             program.programId
           );
 
+        // Derive best price quote account PDA
+        const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("bpx"), truncatedServiceRequestIdBytes],
+          program.programId
+        );
+
         console.log({
           fileHash,
           pastelTicketTypeString,
           ipfsCid,
           fileSizeBytes,
           serviceRequestId,
-          truncatedServiceRequestId: serviceRequestId.substring(0, 24), // Log truncated ID for verification
+          truncatedServiceRequestId: serviceRequestId.substring(0, 24),
           submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
+          bestPriceQuoteAccountPDA: bestPriceQuoteAccountPDA.toString(),
         });
+
+        // Initialize best price quote account first
+        try {
+          const initQuoteTx = await program.methods
+            .initializeBestPriceQuote(serviceRequestId)
+            .accounts({
+              bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+              user: endUserKeypair.publicKey,
+              systemProgram: SystemProgram.programId,
+            })
+            .preInstructions([modifyComputeBudgetIx])
+            .signers([endUserKeypair])
+            .rpc({
+              skipPreflight: true,
+              commitment: "confirmed",
+            });
+
+          await confirmTransaction(initQuoteTx);
+          console.log(`Best price quote account initialized for request ${i + 1}`);
+        } catch (error) {
+          console.error(`Failed to initialize best price quote account for request ${i + 1}:`, error);
+          throw error;
+        }
 
         // Submit service request with retries
         let submitTx;
         let retryCount = 0;
         const maxRetries = 3;
-
+        
         while (retryCount < maxRetries) {
           try {
             submitTx = await program.methods

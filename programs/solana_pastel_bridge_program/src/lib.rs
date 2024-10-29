@@ -561,7 +561,7 @@ pub struct InitTempRequestsData<'info> {
         seeds = [b"temp_service_requests_data"],
         bump,
         payer = user,
-        space = 8 + 4 + (10 * 512),  // Adjusted size
+        space = 8 + 4 + (15 * 512),  // Adjusted size
         rent_exempt = enforce
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
@@ -989,6 +989,7 @@ pub fn submit_service_request_helper(
     ipfs_cid: String,
     file_size_bytes: u64,
 ) -> Result<()> {
+    
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
     // Convert the pastel_ticket_type_string to PastelTicketType enum
