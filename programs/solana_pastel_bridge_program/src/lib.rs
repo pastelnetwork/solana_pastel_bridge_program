@@ -287,6 +287,7 @@ impl Default for ServiceRequest {
 }
 
 // This holds the information for an individual price quote from a given bridge node for a particular service request.
+// Price quote structure for bridge node responses
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServicePriceQuote {
     pub service_request_id: String,
@@ -296,26 +297,36 @@ pub struct ServicePriceQuote {
     pub price_quote_status: ServicePriceQuoteStatus,
 }
 
-// Struct to hold final consensus of the txid's status from the oracle contract
-#[derive(Debug, Clone, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
-pub struct AggregatedConsensusData {
-    pub txid: String,
-    pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
-    pub hash_weights: Vec<HashWeight>,
-    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,  
-    pub last_updated: u64, // Unix timestamp indicating the last update time
-}
+// Mapping between service requests and Pastel transaction IDs
 #[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServiceRequestTxidMapping {
     pub service_request_id: String,
     pub pastel_txid: String,
 }
 
-// Account to receive registration fees from bridge nodes before it is transferred to the bridge contract reward pool account 
+// Hash weight structure for consensus data
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
+pub struct HashWeight {
+    pub hash: String,
+    pub weight: i32,
+}
+
+// Consensus data structure from oracle contract
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
+pub struct AggregatedConsensusData {
+    pub txid: String,
+    pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
+    pub hash_weights: Vec<HashWeight>,
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
+    pub last_updated: u64,
+}
+
+// Account to receive registration fees
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct RegFeeReceivingAccount {}
 
+// Main contract state account
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct BridgeContractState {
@@ -332,46 +343,113 @@ pub struct BridgeContractState {
     pub reg_fee_receiving_account_pubkey: Pubkey,     
 }
 
-// PDA that distributes rewards to bridge nodes for fulfilling service requests successfully
+// Reward pool account for bridge nodes
 #[account]
 #[derive(Default, PartialEq, Eq)]
-pub struct BridgeRewardPoolAccount {
-    // Since this account is only used for holding and transferring SOL, no fields are necessary.
-}
+pub struct BridgeRewardPoolAccount {}
 
-// PDA that acts as a temporary escrow account for holding SOL while service requests are being processed
+// Escrow account for holding SOL during service requests
 #[account]
 #[derive(Default, PartialEq, Eq)]
-pub struct BridgeEscrowAccount {
-    // Since this account is only used for holding and transferring SOL, no fields are necessary.
-}
+pub struct BridgeEscrowAccount {}
 
-// PDA to hold the list of bridge nodes and their details
+// Account holding bridge node data
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct BridgeNodesDataAccount {
     pub bridge_nodes: Vec<BridgeNode>,
 }
 
-// PDA to hold the corresponding txid for each service request id
+// Account for txid mappings
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct ServiceRequestTxidMappingDataAccount {
     pub mappings: Vec<ServiceRequestTxidMapping>,
 }
 
-// Temporary account to hold service requests while they are being processed; these are cleared out after completion or expiration.
+// Account for temporary service request data
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct TempServiceRequestsDataAccount {
     pub service_requests: Vec<ServiceRequest>,
 }
 
-// Account to hold the aggregated consensus data about the status of service request TXIDs from the oracle contract; this is cleared out periodically.
+// Account for aggregated consensus data
 #[account]
 #[derive(Default, PartialEq, Eq)]
 pub struct AggregatedConsensusDataAccount {
     pub consensus_data: Vec<AggregatedConsensusData>,
+}
+
+// Implementation for accounts that only hold SOL
+impl BridgeRewardPoolAccount {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl BridgeEscrowAccount {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl RegFeeReceivingAccount {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+// Implementations for data-holding accounts
+impl BridgeNodesDataAccount {
+    pub fn new() -> Self {
+        Self {
+            bridge_nodes: Vec::new(),
+        }
+    }
+}
+
+impl ServiceRequestTxidMappingDataAccount {
+    pub fn new() -> Self {
+        Self {
+            mappings: Vec::new(),
+        }
+    }
+}
+
+impl TempServiceRequestsDataAccount {
+    pub fn new() -> Self {
+        Self {
+            service_requests: Vec::new(),
+        }
+    }
+}
+
+impl AggregatedConsensusDataAccount {
+    pub fn new() -> Self {
+        Self {
+            consensus_data: Vec::new(),
+        }
+    }
+}
+
+// Implementation for main contract state
+impl BridgeContractState {
+    pub fn new() -> Self {
+        Self {
+            is_initialized: false,
+            is_paused: false,
+            admin_pubkey: Pubkey::default(),
+            oracle_contract_pubkey: Pubkey::default(),
+            bridge_reward_pool_account_pubkey: Pubkey::default(),
+            bridge_escrow_account_pubkey: Pubkey::default(),
+            bridge_nodes_data_account_pubkey: Pubkey::default(),
+            temp_service_requests_data_account_pubkey: Pubkey::default(),
+            aggregated_consensus_data_account_pubkey: Pubkey::default(),
+            service_request_txid_mapping_account_pubkey: Pubkey::default(),
+            reg_fee_receiving_account_pubkey: Pubkey::default(),
+        }
+    }
 }
 
 // First stage initialization accounts
@@ -454,7 +532,9 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"bridge_nodes_data"],
         bump,
         payer = user,
-        space = 8 + 4 + 1000 * (32 + 32 + 32 + 64 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 1 + 1 + 1 + 1)
+        space = 8 + // Discriminator
+               4 + // Vec length
+               10 * (32 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 1 + 1 + 1 + 1)
     )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
@@ -463,7 +543,9 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"temp_service_requests_data"],
         bump,
         payer = user,
-        space = 8 + 4 + 1000 * (32 + 1 + 12 + 64 + 8 + 32 + 1 + 1 + 8 + 9 + 32 + 8 + 16 + 32)
+        space = 8 + // Discriminator
+               4 + // Vec length
+               10 * (32 + 1 + 12 + 64 + 8 + 32 + 1 + 1 + 8 + 9 + 32 + 8 + 16 + 32)
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
@@ -472,7 +554,9 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"aggregated_consensus_data"],
         bump,
         payer = user,
-        space = 8 + 4 + 1000 * (32 + 16 + 200 + 12 + 8)
+        space = 8 + // Discriminator
+               4 + // Vec length
+               10 * (32 + 16 + 100 + 12 + 8) // Reduced size for initial allocation
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -481,7 +565,9 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"service_request_txid_map"],
         bump,
         payer = user,
-        space = 8 + 4 + 1000 * (32 + 64)
+        space = 8 + // Discriminator
+               4 + // Vec length
+               10 * (32 + 64) // Reduced size for initial allocation
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
@@ -1794,12 +1880,6 @@ pub fn handle_post_transaction_tasks(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
-pub struct HashWeight {
-    pub hash: String,
-    pub weight: i32,
-}
-
 pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
     match index {
         0 => Some(TxidStatus::Invalid),
@@ -2001,32 +2081,40 @@ pub mod solana_pastel_bridge_program {
 
     pub fn initialize_data_pdas(ctx: Context<InitializeDataPDAs>) -> Result<()> {
         msg!("Initializing Data PDAs");
-
+    
+        // Initialize BridgeNodesDataAccount with an empty Vec
+        let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
+        bridge_nodes_data_account.bridge_nodes = Vec::new();
+    
+        // Initialize TempServiceRequestsDataAccount with an empty Vec
+        let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
+        temp_service_requests_data_account.service_requests = Vec::new();
+    
+        // Initialize AggregatedConsensusDataAccount with an empty Vec
+        let aggregated_consensus_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
+        aggregated_consensus_data_account.consensus_data = Vec::new();
+    
+        // Initialize ServiceRequestTxidMappingDataAccount with an empty Vec
+        let service_request_txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
+        service_request_txid_mapping_data_account.mappings = Vec::new();
+    
+        // Update bridge contract state with the PDA pubkeys
         let state = &mut ctx.accounts.bridge_contract_state;
-        
-        // Link data PDAs
         state.bridge_nodes_data_account_pubkey = ctx.accounts.bridge_nodes_data_account.key();
         state.temp_service_requests_data_account_pubkey = ctx.accounts.temp_service_requests_data_account.key();
         state.aggregated_consensus_data_account_pubkey = ctx.accounts.aggregated_consensus_data_account.key();
         state.service_request_txid_mapping_account_pubkey = ctx.accounts.service_request_txid_mapping_data_account.key();
-
-        // Initialize data structures
-        let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
-        bridge_nodes_data_account.bridge_nodes = Vec::new();
-
-        let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
-        temp_service_requests_data_account.service_requests = Vec::new();
-
-        let aggregated_consensus_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
-        aggregated_consensus_data_account.consensus_data = Vec::new();
-
-        let service_request_txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-        service_request_txid_mapping_data_account.mappings = Vec::new();
-
-        msg!("Data PDAs Initialized Successfully");
+    
+        // Verify initialization
+        msg!("Data PDAs initialized successfully");
+        msg!("Bridge nodes account: {}", ctx.accounts.bridge_nodes_data_account.key());
+        msg!("Temp service requests account: {}", ctx.accounts.temp_service_requests_data_account.key());
+        msg!("Consensus data account: {}", ctx.accounts.aggregated_consensus_data_account.key());
+        msg!("Txid mapping account: {}", ctx.accounts.service_request_txid_mapping_data_account.key());
+    
         Ok(())
     }
-    
+
     pub fn reallocate_bridge_state(ctx: Context<ReallocateBridgeState>) -> Result<()> {
         ReallocateBridgeState::execute(ctx)
     }
