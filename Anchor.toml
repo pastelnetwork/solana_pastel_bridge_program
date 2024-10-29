@@ -1,9 +1,9 @@
 [toolchain]
-anchor_version = "0.29.0"
-solana_version = "1.17.0"
+anchor_version = "0.30.1"
+solana_version = "1.18.15"
 
 [features]
-seeds = false
+resolution = false
 skip-lint = false
 
 [programs.localnet]
@@ -13,10 +13,9 @@ solana_pastel_bridge_program = "Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
-wallet = "/home/ubuntu/.config/solana/id.json"
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
 
 [scripts]
-build = "RUSTUP_TOOLCHAIN=nightly cargo build --release"
+# build = "RUSTUP_TOOLCHAIN=nightly cargo build --release"
 test = "sh scripts/run_tests_with_logs.sh"
-

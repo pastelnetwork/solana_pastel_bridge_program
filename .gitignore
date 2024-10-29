@@ -35,3 +35,4 @@ test-ledger
 # Generated files (for example, when using cbindgen)
 *.generated.rs
 yarn.lock
+solana_pastel_bridge_code_single_file.txt

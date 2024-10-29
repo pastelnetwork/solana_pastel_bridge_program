@@ -1,12 +1,32 @@
+pub mod big_number;
+pub mod fixed_exp;
+pub mod fixed_giga;
+
+use crate::big_number::{CheckedMulDiv, CheckedDivCeil, CheckedDivFloor};
+use crate::fixed_giga::*;
+use fixed::types::U34F30;
+
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::entrypoint::ProgramResult;
-use anchor_lang::solana_program::account_info::AccountInfo;
-use anchor_lang::solana_program::sysvar::clock::Clock;
-use anchor_lang::solana_program::hash::hash;
+use anchor_lang::solana_program::hash::{hash, Hash};
 use anchor_lang::solana_program::program::invoke;
+use anchor_lang::solana_program::sysvar::{clock::Clock, rent::Rent};
 use anchor_lang::solana_program::system_instruction;
+use anchor_lang::system_program::{transfer, Transfer};
 use std::convert::TryInto;
 
+// Fixed point constants
+pub const ZERO: u64 = 0;
+pub const ONE: u64 = 1_000_000_000; // 1 with 9 decimal places
+pub const TWO: u64 = 2_000_000_000; // 2 with 9 decimal places
+pub const BITS_ONE: u64 = 0x40000000; // 1 << 30
+
+// Bridge program specific fixed-point constants
+pub const MIN_COMPLIANCE_SCORE_FOR_REWARD: u64 = 65_000_000_000; // 65.0 in fixed point
+pub const MIN_RELIABILITY_SCORE_FOR_REWARD: u64 = 80_000_000_000; // 80.0 in fixed point
+pub const MAX_COMPLIANCE_SCORE: u64 = 100_000_000_000; // 100.0 in fixed point
+pub const RELIABILITY_RATIO_THRESHOLD: u64 = 800_000_000; // 0.8 in fixed point
+
+// Time-based constants
 const MAX_QUOTE_RESPONSE_TIME: u64 = 600; // Max time for bridge nodes to respond with a quote in seconds (10 minutes)
 const QUOTE_VALIDITY_DURATION: u64 = 21_600; // The time for which a submitted price quote remains valid. e.g., 6 hours in seconds
 const ESCROW_DURATION: u64 = 7_200; // Duration to hold SOL in escrow in seconds (2 hours); if the service request is not fulfilled within this time, the SOL is refunded to the user and the bridge node won't receive any payment even if they fulfill the request later.
@@ -15,12 +35,10 @@ const TRANSACTION_FEE_PERCENTAGE: u8 = 2; // Percentage of the selected (best) q
 const BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS: u64 = 1_000_000; // Registration fee for bridge nodes in lamports
 const SERVICE_REQUEST_VALIDITY: u64 = 86_400; // Time until a service request expires if not responded to. e.g., 24 hours in seconds
 const BRIDGE_NODE_INACTIVITY_THRESHOLD: u64 = 86_400; // e.g., 24 hours in seconds
-const MIN_COMPLIANCE_SCORE_FOR_REWARD: f32 = 65.0; // Bridge Node must have a compliance score of at least N to be eligible for rewards
-const MIN_RELIABILITY_SCORE_FOR_REWARD: f32 = 80.0; // Minimum reliability score to be eligible for rewards
 const SERVICE_REQUESTS_FOR_PERMANENT_BAN: u32 = 250; // 
 const SERVICE_REQUESTS_FOR_TEMPORARY_BAN: u32 = 50; // Considered for temporary ban after 50 service requests
 const TEMPORARY_BAN_SERVICE_FAILURES_THRESHOLD: u32 = 5; // Number of non-consensus report submissions for temporary ban
-const TEMPORARY_BAN_DURATION: u64 =  24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
+const TEMPORARY_BAN_DURATION: u64 = 24 * 60 * 60; // Duration of temporary ban in seconds (e.g., 1 day)
 const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE: u64 = 2 * 60; // Maximum duration in seconds from service quote request before selecting the best quote (e.g., 2 minutes)
 const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
@@ -28,137 +46,92 @@ const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
 const MAX_ALLOWED_TIMESTAMP_DIFFERENCE: u64 = 600; // 10 minutes in seconds; maximum allowed time difference between the last update of the oracle's consensus data and the bridge contract's access to this data to ensure the bridge contract acts on timely and accurate data.
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000; // Number of lamports in one SOL
 
-
 #[error_code]
 pub enum BridgeError {
     #[msg("Bridge Contract state is already initialized")]
     ContractStateAlreadyInitialized,
-
     #[msg("Bridge node is already registered")]
     BridgeNodeAlreadyRegistered,
-
     #[msg("Action attempted by an unregistered bridge node")]
     UnregisteredBridgeNode,
-
     #[msg("Service request is invalid or malformed")]
     InvalidServiceRequest,
-
     #[msg("Escrow account for service request is not adequately funded")]
     EscrowNotFunded,
-
     #[msg("File size exceeds the maximum allowed limit")]
     InvalidFileSize,
-
     #[msg("Invalid or unsupported service type in service request")]
     InvalidServiceType,
-
     #[msg("Submitted price quote has expired and is no longer valid")]
     QuoteExpired,
-
     #[msg("Bridge node is inactive based on defined inactivity threshold")]
     BridgeNodeInactive,
-
     #[msg("Insufficient funds in escrow to cover the transaction")]
     InsufficientEscrowFunds,
-
     #[msg("Duplicate service request ID")]
     DuplicateServiceRequestId,
-
     #[msg("Contract is paused and no operations are allowed")]
     ContractPaused,
-
     #[msg("Invalid or missing first 6 characters of SHA3-256 hash")]
     InvalidFileHash,
-
     #[msg("IPFS CID is empty")]
     InvalidIpfsCid,
-
     #[msg("User Solana address is missing or invalid")]
     InvalidUserSolAddress,
-
     #[msg("Initial service request status must be Pending")]
     InvalidRequestStatus,
-
     #[msg("Payment in escrow should initially be false")]
     InvalidPaymentInEscrow,
-
     #[msg("Initial values for certain fields must be None")]
     InvalidInitialFieldValues,
-
     #[msg("Initial escrow amount and fees must be None or zero")]
     InvalidEscrowOrFeeAmounts,
-
     #[msg("Invalid service request ID.")]
     InvalidServiceRequestId,
-
     #[msg("Invalid Pastel transaction ID.")]
     InvalidPastelTxid,
-
     #[msg("Bridge node has not been selected for the service request.")]
     BridgeNodeNotSelected,
-
     #[msg("Unauthorized bridge node.")]
     UnauthorizedBridgeNode,
-
     #[msg("Bridge contract is not initialized.")]
-    ContractNotInitialized,    
-
+    ContractNotInitialized,
     #[msg("Service request to Pastel transaction ID mapping not found")]
     MappingNotFound,
-
     #[msg("Pastel transaction ID does not match with any service request")]
     TxidMismatch,
-
     #[msg("Consensus data from the oracle is outdated")]
-    OutdatedConsensusData,    
-
+    OutdatedConsensusData,
     #[msg("Service request not found")]
     ServiceRequestNotFound,
-
     #[msg("Service request is not in a pending state")]
     ServiceRequestNotPending,
-
     #[msg("Price quote submitted too late")]
     QuoteResponseTimeExceeded,
-
     #[msg("Bridge node is currently banned")]
     BridgeNodeBanned,
-
     #[msg("Quoted price cannot be zero")]
     InvalidQuotedPrice,
-
     #[msg("Price quote status is not set to 'Submitted'")]
     InvalidQuoteStatus,
-
     #[msg("Bridge node does not meet the minimum score requirements for rewards")]
     BridgeNodeScoreTooLow,
-
     #[msg("Pastel TXID not found in oracle data")]
     TxidNotFound,
-
     #[msg("Txid to Service Request ID Mapping account not found")]
     TxidMappingNotFound,
-
     #[msg("Insufficient registration fee paid by bridge node")]
     InsufficientRegistrationFee,
-
     #[msg("Withdrawal request from unauthorized account")]
     UnauthorizedWithdrawalAccount,
-
     #[msg("Insufficient funds for withdrawal request")]
     InsufficientFunds,
-    
     #[msg("Timestamp conversion error")]
     TimestampConversionError,
-
     #[msg("Registration fee not paid")]
-    RegistrationFeeNotPaid,    
-}
-
-impl From<BridgeError> for ProgramError {
-    fn from(e: BridgeError) -> Self {
-        ProgramError::Custom(e as u32)
-    }
+    RegistrationFeeNotPaid,
+    #[msg("Maximum account size exceeded")]
+    MaxSizeExceeded,
 }
 
 // Enums:
@@ -211,7 +184,6 @@ pub enum EmergencyAction {
     PauseOperations, // Pause all contract operations.
     ResumeOperations, // Resume all contract operations.
     ModifyParameters { key: String, value: String }, // Modify certain operational parameters.
-    // Additional emergency actions as needed...
 }
 
 // These are the various states that a service request can assume during its lifecycle.
@@ -228,16 +200,15 @@ pub enum RequestStatus {
     Expired, // The request has expired due to inactivity or non-fulfillment.
     Refunded, // Indicates that the request has been refunded to the user.
 }
-
 // The nodes that perform the service requests on behalf of the end users are called bridge nodes.
-#[derive(Debug, Clone, PartialEq, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct BridgeNode {
     pub pastel_id: String, // The unique identifier of the bridge node in the Pastel network, used as the primary key throughout the bridge contract to identify the bridge node.
     pub reward_address: Pubkey, // The Solana address of the bridge node, used to send rewards to the bridge node.
     pub bridge_node_psl_address: String, // The Pastel address of the bridge node, used to pay for service requests made by the bridge node on behalf of end users.
     pub registration_entrance_fee_transaction_signature: String, // The signature of the transaction that paid the registration fee in SOL for the bridge node to register with the bridge contract.
-    pub compliance_score: f32, // The compliance score of the bridge node, which is a combined measure of the bridge node's overall track record of performing services quickly, accurately, and reliably.
-    pub reliability_score: f32, // The reliability score of the bridge node, which is the percentage of all attempted service requests that were completed successfully by the bridge node.
+    pub compliance_score: u64, // The compliance score of the bridge node, which is a combined measure of the bridge node's overall track record of performing services quickly, accurately, and reliably.
+    pub reliability_score: u64, // The reliability score of the bridge node, which is the percentage of all attempted service requests that were completed successfully by the bridge node.
     pub last_active_timestamp: u64, // The timestamp of the last time the bridge node performed a service request.
     pub total_price_quotes_submitted: u32, // The total number of price quotes submitted by the bridge node since registration.
     pub total_service_requests_attempted: u32, // The total number of service requests attempted by the bridge node since registration.
@@ -300,16 +271,15 @@ pub struct ServicePriceQuote {
 }
 
 // Struct to hold final consensus of the txid's status from the oracle contract
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
 pub struct AggregatedConsensusData {
     pub txid: String,
     pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
     pub hash_weights: Vec<HashWeight>,
-    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
+    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,  
     pub last_updated: u64, // Unix timestamp indicating the last update time
 }
-
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct ServiceRequestTxidMapping {
     pub service_request_id: String,
     pub pastel_txid: String,
@@ -317,9 +287,11 @@ pub struct ServiceRequestTxidMapping {
 
 // Account to receive registration fees from bridge nodes before it is transferred to the bridge contract reward pool account 
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct RegFeeReceivingAccount {}
 
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct BridgeContractState {
     pub is_initialized: bool,
     pub is_paused: bool,
@@ -336,36 +308,42 @@ pub struct BridgeContractState {
 
 // PDA that distributes rewards to bridge nodes for fulfilling service requests successfully
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct BridgeRewardPoolAccount {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
 }
 
 // PDA that acts as a temporary escrow account for holding SOL while service requests are being processed
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct BridgeEscrowAccount {
     // Since this account is only used for holding and transferring SOL, no fields are necessary.
 }
 
 // PDA to hold the list of bridge nodes and their details
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct BridgeNodesDataAccount {
     pub bridge_nodes: Vec<BridgeNode>,
 }
 
 // PDA to hold the corresponding txid for each service request id
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct ServiceRequestTxidMappingDataAccount {
     pub mappings: Vec<ServiceRequestTxidMapping>,
 }
 
 // Temporary account to hold service requests while they are being processed; these are cleared out after completion or expiration.
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct TempServiceRequestsDataAccount {
     pub service_requests: Vec<ServiceRequest>,
 }
 
 // Account to hold the aggregated consensus data about the status of service request TXIDs from the oracle contract; this is cleared out periodically.
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct AggregatedConsensusDataAccount {
     pub consensus_data: Vec<AggregatedConsensusData>,
 }
@@ -374,35 +352,141 @@ pub struct AggregatedConsensusDataAccount {
 #[derive(Accounts)]
 #[instruction(admin_pubkey: Pubkey)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 10_240)] // Adjusted space
+    #[account(
+        init,
+        payer = user,
+        space = 8 + // Discriminator
+        1 + // is_initialized
+        1 + // is_paused
+        32 + // admin_pubkey
+        32 + // oracle_contract_pubkey
+        32 + // bridge_reward_pool_account_pubkey
+        32 + // bridge_escrow_account_pubkey
+        32 + // bridge_nodes_data_account_pubkey
+        32 + // temp_service_requests_data_account_pubkey
+        32 + // aggregated_consensus_data_account_pubkey
+        32 + // service_request_txid_mapping_account_pubkey
+        32   // reg_fee_receiving_account_pubkey
+    )]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
-
+    
     #[account(mut)]
     pub user: Signer<'info>,
-
-    #[account(init, seeds = [b"bridge_reward_pool_account"], bump, payer = user, space = 1024)]
+    
+    #[account(
+        init,
+        seeds = [b"bridge_reward_pool_account"],
+        bump,
+        payer = user,
+        space = 8  // Just discriminator since it only holds SOL
+    )]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
-
-    #[account(init, seeds = [b"reg_fee_receiving_account"], bump, payer = user, space = 1024)]
+    
+    #[account(
+        init,
+        seeds = [b"reg_fee_receiving_account"],
+        bump,
+        payer = user,
+        space = 8  // Just discriminator since it only holds SOL
+    )]
     pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
 
-    #[account(init, seeds = [b"bridge_escrow_account"], bump, payer = user, space = 1024)]
+    #[account(
+        init,
+        seeds = [b"bridge_escrow_account"],
+        bump,
+        payer = user,
+        space = 8  // Just discriminator since it only holds SOL
+    )]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
 
-    #[account(init, seeds = [b"bridge_nodes_data"], bump, payer = user, space = 10_240)]
+    #[account(
+        init,
+        seeds = [b"bridge_nodes_data"],
+        bump,
+        payer = user,
+        space = 8 + // Discriminator
+        4 + // Vec length prefix
+        1000 * (
+            32 + // pastel_id (String overhead + max length)
+            32 + // reward_address
+            32 + // bridge_node_psl_address (String overhead + max length)
+            64 + // registration_entrance_fee_transaction_signature (String overhead + max length)
+            8 + // compliance_score (fixed point u64)
+            8 + // reliability_score (fixed point u64)
+            8 + // last_active_timestamp
+            4 + // total_price_quotes_submitted
+            4 + // total_service_requests_attempted
+            4 + // successful_service_requests_count
+            4 + // current_streak
+            4 + // failed_service_requests_count
+            8 + // ban_expiry
+            1 + // is_eligible_for_rewards
+            1 + // is_recently_active
+            1 + // is_reliable
+            1   // is_banned
+        )
+    )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
-    #[account(init, seeds = [b"temp_service_requests_data"], bump, payer = user, space = 10_240)]
+    #[account(
+        init,
+        seeds = [b"temp_service_requests_data"],
+        bump,
+        payer = user,
+        space = 8 + // Discriminator
+        4 + // Vec length prefix
+        1000 * (
+            32 + // service_request_id
+            1 + // service_type enum
+            12 + // first_6_characters_hash
+            64 + // ipfs_cid
+            8 + // file_size_bytes
+            32 + // user_sol_address
+            1 + // status enum
+            1 + // payment_in_escrow
+            8 + // request_expiry
+            9 + // Optional timestamps (8 bytes each)
+            32 + // selected_bridge_node_pastelid
+            8 + // best_quoted_price
+            16 + // Optional amount fields (8 bytes each)
+            32   // Optional pastel_txid
+        )
+    )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
-    #[account(init, seeds = [b"aggregated_consensus_data"], bump, payer = user, space = 10_240)]
+    #[account(
+        init,
+        seeds = [b"aggregated_consensus_data"],
+        bump,
+        payer = user,
+        space = 8 + // Discriminator
+        4 + // Vec length prefix
+        1000 * (
+            32 + // txid
+            16 + // status_weights array
+            200 + // hash_weights vector (estimated max size)
+            12 + // first_6_characters_hash
+            8    // last_updated
+        )
+    )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
-    #[account(init, seeds = [b"service_request_txid_map"], bump, payer = user, space = 10_240)]
+    #[account(
+        init,
+        seeds = [b"service_request_txid_map"],
+        bump,
+        payer = user,
+        space = 8 + // Discriminator
+        4 + // Vec length prefix
+        1000 * (
+            32 + // service_request_id
+            64   // pastel_txid
+        )
+    )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
-    // System program is needed for account creation
-    pub system_program: Program<'info, System>,    
+    pub system_program: Program<'info, System>,
 }
 
 impl<'info> Initialize<'info> {
@@ -412,7 +496,7 @@ impl<'info> Initialize<'info> {
         let state = &mut self.bridge_contract_state;
         // Ensure the bridge_contract_state is not already initialized
         if state.is_initialized {
-            return Err(BridgeError::ContractStateAlreadyInitialized.into());
+            return err!(BridgeError::ContractStateAlreadyInitialized);
         }
         state.is_initialized = true;
         state.is_paused = false;
@@ -429,6 +513,7 @@ impl<'info> Initialize<'info> {
 
         state.oracle_contract_pubkey = Pubkey::default();
         msg!("Oracle Contract Pubkey set to default");
+        
         // Initialize bridge nodes data PDA
         let bridge_nodes_data_account = &mut self.bridge_nodes_data_account;
         bridge_nodes_data_account.bridge_nodes = Vec::new();
@@ -449,11 +534,9 @@ impl<'info> Initialize<'info> {
         Ok(())
     }
 }
-
-
 #[derive(Accounts)]
 pub struct ReallocateBridgeState<'info> {
-    #[account(mut, has_one = admin_pubkey)]
+    #[account(mut, has_one = admin_pubkey @ BridgeError::UnauthorizedWithdrawalAccount)]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
     pub admin_pubkey: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -468,53 +551,149 @@ pub struct ReallocateBridgeState<'info> {
 }
 
 // Define the reallocation thresholds and limits
-const REALLOCATION_THRESHOLD: f32 = 0.9;
+// Convert floating point to fixed point
+pub const REALLOCATION_THRESHOLD_GIGA: u64 = 900_000_000; // 0.9 in fixed point notation
 const ADDITIONAL_SPACE: usize = 10_240;
 const MAX_SIZE: usize = 100 * 1024; // 100KB
 
 // Function to reallocate account data
-fn reallocate_account_data(account: &mut AccountInfo, current_usage: usize) -> Result<()> {
+fn reallocate_account_data(
+    account: &mut AccountInfo,
+    current_usage: usize,
+    payer: &AccountInfo<'_>,
+    system_program: &AccountInfo<'_>,
+) -> Result<()> {
     let current_size = account.data_len();
-    let usage_ratio = current_usage as f32 / current_size as f32;
+    
+    // Convert usage ratio to fixed point calculation
+    let usage_ratio = (current_usage as u64)
+        .checked_mul(ONE)
+        .and_then(|n| n.checked_div(current_size as u64))
+        .ok_or(error!(BridgeError::TimestampConversionError))?;
 
-    if usage_ratio > REALLOCATION_THRESHOLD {
+    if usage_ratio > REALLOCATION_THRESHOLD_GIGA {
         let new_size = std::cmp::min(current_size + ADDITIONAL_SPACE, MAX_SIZE);
+
+        // Prevent reallocating beyond MAX_SIZE
+        if new_size > MAX_SIZE {
+            msg!(
+                "Cannot reallocate account beyond MAX_SIZE of {} bytes.",
+                MAX_SIZE
+            );
+            return err!(BridgeError::MaxSizeExceeded);
+        }
+
+        // Attempt to reallocate
         account.realloc(new_size, false)?;
-        msg!("Account reallocated to new size: {}", new_size);
+        msg!(
+            "Account reallocated from {} bytes to {} bytes.",
+            current_size,
+            new_size
+        );
+
+        // Calculate new rent minimum
+        let rent = Rent::get()?;
+        let new_rent_minimum = rent.minimum_balance(new_size);
+        let current_lamports = account.lamports();
+        let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
+
+        if lamports_needed > 0 {
+            // Transfer lamports from payer to the account to meet rent exemption
+            invoke(
+                &system_instruction::transfer(
+                    payer.key,
+                    account.key,
+                    lamports_needed,
+                ),
+                &[
+                    payer.clone(),
+                    account.clone(),
+                    system_program.clone(),
+                ],
+            )?;
+            msg!(
+                "Transferred {} lamports from payer to account to meet rent-exemption.",
+                lamports_needed
+            );
+        }
+
+        // Verify rent-exemption
+        let updated_lamports = account.lamports();
+        let is_rent_exempt = rent.is_exempt(updated_lamports, new_size);
+        if !is_rent_exempt {
+            msg!(
+                "Account is not rent-exempt after reallocation. Required: {}, Current: {}",
+                new_rent_minimum,
+                updated_lamports
+            );
+            return err!(BridgeError::InsufficientFunds);
+        }
+
+        msg!(
+            "Account is now rent-exempt with a size of {} bytes.",
+            new_size
+        );
     }
 
     Ok(())
 }
 
-
 impl<'info> ReallocateBridgeState<'info> {
     pub fn execute(ctx: Context<ReallocateBridgeState>) -> Result<()> {
-        // Reallocate TempServiceRequestsDataAccount
-        let temp_service_requests_usage = ctx.accounts.temp_service_requests_data_account.service_requests.len() * std::mem::size_of::<ServiceRequest>();
-        reallocate_account_data(&mut ctx.accounts.temp_service_requests_data_account.to_account_info(), temp_service_requests_usage)?;
+        let payer = &ctx.accounts.admin_pubkey.to_account_info(); // Admin is the payer
+        let system_program = &ctx.accounts.system_program.to_account_info();
 
-        // Reallocate BridgeNodesDataAccount
-        let bridge_nodes_usage = ctx.accounts.bridge_nodes_data_account.bridge_nodes.len() * std::mem::size_of::<BridgeNode>();
-        reallocate_account_data(&mut ctx.accounts.bridge_nodes_data_account.to_account_info(), bridge_nodes_usage)?;
+        // Calculate sizes including the new fixed point number types
+        // Reallocate TempServiceRequestsDataAccount
+        let temp_service_requests_usage = ctx.accounts.temp_service_requests_data_account.service_requests.len() * 
+            std::mem::size_of::<ServiceRequest>();
+        reallocate_account_data(
+            &mut ctx.accounts.temp_service_requests_data_account.to_account_info(),
+            temp_service_requests_usage,
+            &payer,
+            &system_program,
+        )?;
+
+        // Reallocate BridgeNodesDataAccount - note the BridgeNode now uses u64 for fixed point
+        let bridge_nodes_usage = ctx.accounts.bridge_nodes_data_account.bridge_nodes.len() * 
+            std::mem::size_of::<BridgeNode>();
+        reallocate_account_data(
+            &mut ctx.accounts.bridge_nodes_data_account.to_account_info(),
+            bridge_nodes_usage,
+            &payer,
+            &system_program,
+        )?;
 
         // Reallocate ServiceRequestTxidMappingDataAccount
-        let txid_mapping_usage = ctx.accounts.service_request_txid_mapping_data_account.mappings.len() * std::mem::size_of::<ServiceRequestTxidMapping>();
-        reallocate_account_data(&mut ctx.accounts.service_request_txid_mapping_data_account.to_account_info(), txid_mapping_usage)?;
+        let txid_mapping_usage = ctx.accounts.service_request_txid_mapping_data_account.mappings.len() * 
+            std::mem::size_of::<ServiceRequestTxidMapping>();
+        reallocate_account_data(
+            &mut ctx.accounts.service_request_txid_mapping_data_account.to_account_info(),
+            txid_mapping_usage,
+            &payer,
+            &system_program,
+        )?;
 
         // Reallocate AggregatedConsensusDataAccount
-        let consensus_data_usage = ctx.accounts.aggregated_consensus_data_account.consensus_data.len() * std::mem::size_of::<AggregatedConsensusData>();
-        reallocate_account_data(&mut ctx.accounts.aggregated_consensus_data_account.to_account_info(), consensus_data_usage)?;
+        let consensus_data_usage = ctx.accounts.aggregated_consensus_data_account.consensus_data.len() * 
+            std::mem::size_of::<AggregatedConsensusData>();
+        reallocate_account_data(
+            &mut ctx.accounts.aggregated_consensus_data_account.to_account_info(),
+            consensus_data_usage,
+            &payer,
+            &system_program,
+        )?;
 
-        msg!("Reallocation of bridge contract state and related PDAs completed.");
+        msg!("All accounts reallocated and rent-exempt status ensured.");
         Ok(())
     }
 }
 
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct BridgeNodeDataAccount {
     pub bridge_nodes: Vec<BridgeNode>,
 }
-
 #[derive(Accounts)]
 pub struct RegisterNewBridgeNode<'info> {
     /// CHECK: Manual checks are performed in the instruction to ensure the contributor_account is valid and safe to use.
@@ -544,37 +723,42 @@ pub fn register_new_bridge_node_helper(
     // Check if the bridge node is already registered
     if bridge_nodes_data_account.bridge_nodes.iter().any(|node| node.pastel_id == pastel_id) {
         msg!("Registration failed: Bridge Node already registered with Pastel ID: {}", pastel_id);
-        return Err(BridgeError::BridgeNodeAlreadyRegistered.into());
+        return err!(BridgeError::BridgeNodeAlreadyRegistered);
     }
 
     // Retrieve mutable references to the lamport balance
     let fee_receiving_account_info = ctx.accounts.reg_fee_receiving_account.to_account_info();
-    let mut fee_receiving_account_lamports = fee_receiving_account_info.lamports.borrow_mut();
+    let mut fee_receiving_account_lamports = fee_receiving_account_info.try_borrow_mut_lamports()?;
 
     let reward_pool_account_info = ctx.accounts.bridge_reward_pool_account.to_account_info();
-    let mut reward_pool_account_lamports = reward_pool_account_info.lamports.borrow_mut();
+    let mut reward_pool_account_lamports = reward_pool_account_info.try_borrow_mut_lamports()?;
 
     // Check if the reg_fee_receiving_account received the registration fee
     if **fee_receiving_account_lamports < BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS {
-        return Err(BridgeError::RegistrationFeeNotPaid.into());
+        return err!(BridgeError::RegistrationFeeNotPaid);
     }
 
     msg!("Registration fee verified. Attempting to register new bridge node {}", ctx.accounts.user.key());
 
     // Deduct the registration fee from the reg_fee_receiving_account and add it to the reward pool account
-    **fee_receiving_account_lamports -= BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
-    **reward_pool_account_lamports += BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS;
+    **fee_receiving_account_lamports = fee_receiving_account_lamports
+        .checked_sub(BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS)
+        .ok_or(error!(BridgeError::InsufficientFunds))?;
 
-    let last_active_timestamp = Clock::get()?.unix_timestamp as u64;
+    **reward_pool_account_lamports = reward_pool_account_lamports
+        .checked_add(BRIDGE_NODE_REGISTRATION_FEE_IN_LAMPORTS)
+        .ok_or(error!(BridgeError::InsufficientFunds))?;
+
+    let last_active_timestamp = Clock::get()?.unix_timestamp.try_into().map_err(|_| error!(BridgeError::TimestampConversionError))?;
     
-    // Create and add the new bridge node
+    // Create and add the new bridge node with fixed point scores
     let new_bridge_node = BridgeNode {
         pastel_id: pastel_id.clone(),
         reward_address: *ctx.accounts.user.key,
         bridge_node_psl_address,
         registration_entrance_fee_transaction_signature: String::new(), // Replace with actual data if available
-        compliance_score: 1.0, // Initial compliance score
-        reliability_score: 1.0, // Initial reliability score
+        compliance_score: ONE, // Initial compliance score (1.0 in fixed point)
+        reliability_score: ONE, // Initial reliability score (1.0 in fixed point)
         last_active_timestamp, // Set the last active timestamp to the current time
         total_price_quotes_submitted: 0, // Initially, no price quotes have been submitted
         total_service_requests_attempted: 0, // Initially, no service requests attempted
@@ -598,16 +782,15 @@ pub fn register_new_bridge_node_helper(
 
 // Function to generate the service_request_id based on the service type, first 6 characters of the file hash, and the end user's Solana address from which they will be paying for the service.
 pub fn generate_service_request_id(
-    pastel_ticket_type_string: &String,
-    first_6_chars_of_hash: &String,
+    pastel_ticket_type_string: &str,
+    first_6_chars_of_hash: &str,
     user_sol_address: &Pubkey,
 ) -> String {
-    let user_sol_address_str = user_sol_address.to_string();
     let concatenated_str = format!(
         "{}{}{}",
         pastel_ticket_type_string,
         first_6_chars_of_hash,
-        user_sol_address_str,
+        user_sol_address.to_string(),
     );
 
     // Convert the concatenated string to bytes
@@ -626,8 +809,8 @@ pub fn generate_service_request_id(
 }
 
 // Operational accounts for the bridge contract for handling submissions of service requests from end users and price quotes and service request updates from bridge nodes:
-
 #[account]
+#[derive(Default, PartialEq, Eq)]
 pub struct ServiceRequestSubmissionAccount {
     pub service_request: ServiceRequest,
 }
@@ -639,13 +822,17 @@ pub struct SubmitServiceRequest<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        seeds = [b"srq", generate_service_request_id(
-            &pastel_ticket_type_string,
-            &first_6_chars_of_hash,
-            &user.key()
-        ).as_bytes()],
+        seeds = [
+            b"srq",
+            &generate_service_request_id(
+                &pastel_ticket_type_string,
+                &first_6_chars_of_hash,
+                &user.key()
+            ).as_bytes()[..12]
+        ],
         bump,
-        space = 12 + std::mem::size_of::<ServiceRequest>()
+        space = 8 + // Discriminator
+                std::mem::size_of::<ServiceRequestSubmissionAccount>()
     )]
     pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
 
@@ -665,70 +852,72 @@ pub struct SubmitServiceRequest<'info> {
 }
 
 pub fn validate_service_request(request: &ServiceRequest) -> Result<()> {
-    // Check if the first 6 characters of the SHA3-256 hash are valid
-    if request.first_6_characters_of_sha3_256_hash_of_corresponding_file.len() != 6 
-        || !request.first_6_characters_of_sha3_256_hash_of_corresponding_file.chars().all(|c| c.is_ascii_hexdigit()) {
-        msg!("Error: Invalid or missing first 6 characters of SHA3-256 hash");
-        return Err(BridgeError::InvalidFileHash.into());
+    if request.first_6_characters_of_sha3_256_hash_of_corresponding_file.len() != 6 {
+        return err!(BridgeError::InvalidFileHash);  
     }
 
     // Check if IPFS CID is present
     if request.ipfs_cid.trim().is_empty() {
         msg!("Error: IPFS CID is empty");
-        return Err(BridgeError::InvalidIpfsCid.into());
+        return err!(BridgeError::InvalidIpfsCid);
     }
 
     // Check file size
     if request.file_size_bytes == 0 {
         msg!("Error: File size cannot be zero");
-        return Err(BridgeError::InvalidFileSize.into());
+        return err!(BridgeError::InvalidFileSize);
     }
 
     // Check if the user Solana address is valid
     if request.user_sol_address == Pubkey::default() {
         msg!("Error: User Solana address is missing or invalid");
-        return Err(BridgeError::InvalidUserSolAddress.into());
+        return err!(BridgeError::InvalidUserSolAddress);
     }
 
     if !matches!(request.service_type, PastelTicketType::Sense | PastelTicketType::Cascade | PastelTicketType::Nft | PastelTicketType::InferenceApi) {
         msg!("Error: Invalid or unsupported service type");
-        return Err(BridgeError::InvalidServiceType.into());
+        return err!(BridgeError::InvalidServiceType);
     }
 
     if request.status != RequestStatus::Pending {
         msg!("Error: Initial service request status must be Pending");
-        return Err(BridgeError::InvalidRequestStatus.into());
+        return err!(BridgeError::InvalidRequestStatus);
     }
 
     if request.payment_in_escrow {
         msg!("Error: Payment in escrow should initially be false");
-        return Err(BridgeError::InvalidPaymentInEscrow.into());
+        return err!(BridgeError::InvalidPaymentInEscrow);
     }
 
     if request.selected_bridge_node_pastelid.is_some() || request.best_quoted_price_in_lamports.is_some() {
         msg!("Error: Initial values for certain fields must be None");
-        return Err(BridgeError::InvalidInitialFieldValues.into());
+        return err!(BridgeError::InvalidInitialFieldValues);
     }
 
     if request.escrow_amount_lamports.is_some() || request.service_fee_retained_by_bridge_contract_lamports.is_some() {
         msg!("Error: Initial escrow amount and fees must be None or zero");
-        return Err(BridgeError::InvalidEscrowOrFeeAmounts.into());
+        return err!(BridgeError::InvalidEscrowOrFeeAmounts);
     }
     
     Ok(())
 }
 
-
-pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_ticket_type_string: String, first_6_chars_of_hash: String, ipfs_cid: String, file_size_bytes: u64) -> ProgramResult {
+pub fn submit_service_request_helper(
+    ctx: Context<SubmitServiceRequest>,
+    pastel_ticket_type_string: String,
+    first_6_chars_of_hash: String,
+    ipfs_cid: String,
+    file_size_bytes: u64,
+) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
     // Convert the pastel_ticket_type_string to PastelTicketType enum
-    let service_type: PastelTicketType = match pastel_ticket_type_string.as_str() {
+    let service_type = match pastel_ticket_type_string.as_str() {
         "Sense" => PastelTicketType::Sense,
         "Cascade" => PastelTicketType::Cascade,
         "Nft" => PastelTicketType::Nft,
         "InferenceApi" => PastelTicketType::InferenceApi,
-        _ => return Err(ProgramError::InvalidArgument),
+        _ => return err!(BridgeError::InvalidServiceType),
     };
 
     // Generate the service_request_id
@@ -742,7 +931,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
     let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
     if temp_service_requests_data_account.service_requests.iter().any(|request| request.service_request_id == service_request_id) {
         msg!("Error: Duplicate service request ID submitted");
-        return Err(BridgeError::DuplicateServiceRequestId.into());
+        return err!(BridgeError::DuplicateServiceRequestId);
     }
 
     // Create or update the ServiceRequest struct
@@ -756,7 +945,7 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
         user_sol_address: *ctx.accounts.user.key,
         status: RequestStatus::Pending,
         payment_in_escrow: false,
-        request_expiry: current_timestamp + ESCROW_DURATION, // Set appropriate expiry timestamp
+        request_expiry: current_timestamp + ESCROW_DURATION,
         sol_received_from_user_timestamp: None,
         selected_bridge_node_pastelid: None,
         best_quoted_price_in_lamports: None,
@@ -772,16 +961,12 @@ pub fn submit_service_request_helper(ctx: Context<SubmitServiceRequest>, pastel_
         pastel_txid: None,
     };
 
-    // Call validate_service_request function
     validate_service_request(&service_request_account.service_request)?;        
 
-    // Append the new service request to the temp_service_requests_data_account
-    let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
     temp_service_requests_data_account.service_requests.push(service_request_account.service_request.clone());
 
     Ok(())
 }
-
 
 #[account]
 pub struct BestPriceQuoteReceivedForServiceRequest {
@@ -799,14 +984,13 @@ pub struct ServicePriceQuoteSubmissionAccount {
 }
 
 #[derive(Accounts)]
-#[instruction(truncated_service_request_id: [u8; 12])]
 pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"px_quote", truncated_service_request_id.as_ref()],
+        seeds = [b"px_quote", service_request_id.as_bytes()],
         bump,
-        space = 12 + std::mem::size_of::<ServicePriceQuoteSubmissionAccount>()
+        space = 8 + std::mem::size_of::<ServicePriceQuoteSubmissionAccount>()
     )]
     pub price_quote_submission_account: Account<'info, ServicePriceQuoteSubmissionAccount>,
 
@@ -826,7 +1010,7 @@ pub struct SubmitPriceQuote<'info> {
 
     #[account(
         mut,
-        seeds = [b"bpx", truncated_service_request_id.as_ref()],
+        seeds = [b"bpx", service_request_id.as_bytes()],
         bump
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
@@ -837,39 +1021,38 @@ pub fn submit_price_quote_helper(
     bridge_node_pastel_id: String,
     service_request_id: String,
     quoted_price_lamports: u64,
-) -> ProgramResult {
-    let truncated_service_request_id: [u8; 12] = service_request_id.as_bytes()[..12].try_into().expect("ID must be 12 bytes");
-
+) -> Result<()> {
     let quote_timestamp = Clock::get()?.unix_timestamp as u64;
 
     let service_request = ctx.accounts.temp_service_requests_data_account.service_requests.iter()
-        .find(|request| request.service_request_id.as_bytes()[..12] == truncated_service_request_id)
-        .ok_or(ProgramError::Custom(BridgeError::ServiceRequestNotFound as u32))?;
+        .find(|request| request.service_request_id == service_request_id)
+        .ok_or_else(|| error!(BridgeError::ServiceRequestNotFound))?;
 
-    if quote_timestamp < service_request.service_request_creation_timestamp + DURATION_IN_SECONDS_TO_WAIT_AFTER_ANNOUNCING_NEW_PENDING_SERVICE_REQUEST_BEFORE_SELECTING_BEST_QUOTE {
+    if quote_timestamp < service_request.service_request_creation_timestamp + 
+        DURATION_IN_SECONDS_TO_WAIT_AFTER_ANNOUNCING_NEW_PENDING_SERVICE_REQUEST_BEFORE_SELECTING_BEST_QUOTE {
         msg!("Quote submission is too early. Please wait until the waiting period is over.");
-        return Err(ProgramError::Custom(BridgeError::QuoteResponseTimeExceeded as u32));
+        return err!(BridgeError::QuoteResponseTimeExceeded);
     }
 
     validate_price_quote_submission(
         &ctx.accounts.bridge_nodes_data_account,
         &ctx.accounts.temp_service_requests_data_account,
         &ctx.accounts.price_quote_submission_account,
-        String::from_utf8(truncated_service_request_id.to_vec()).unwrap(),
+        service_request_id.clone(),
         bridge_node_pastel_id.clone(),
         quoted_price_lamports,
         quote_timestamp,
     )?;
 
-    let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter_mut().find(|node| {
-        node.reward_address == ctx.accounts.user.key()
-    }).ok_or(BridgeError::UnauthorizedBridgeNode)?;
+    let submitting_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter_mut()
+        .find(|node| node.reward_address == ctx.accounts.user.key())
+        .ok_or(BridgeError::UnauthorizedBridgeNode)?;
 
     submitting_bridge_node.total_price_quotes_submitted += 1;
 
     let price_quote_account = &mut ctx.accounts.price_quote_submission_account;
     price_quote_account.price_quote = ServicePriceQuote {
-        service_request_id: String::from_utf8(truncated_service_request_id.to_vec()).unwrap(),
+        service_request_id,
         bridge_node_pastel_id: submitting_bridge_node.pastel_id.clone(),
         quoted_price_lamports,
         quote_timestamp,
@@ -878,7 +1061,7 @@ pub fn submit_price_quote_helper(
 
     let best_quote_account = &mut ctx.accounts.best_price_quote_account;
     if best_quote_account.best_quote_selection_status == BestQuoteSelectionStatus::NoQuotesReceivedYet ||
-    quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
+       quoted_price_lamports < best_quote_account.best_quoted_price_in_lamports {
         best_quote_account.best_bridge_node_pastel_id = submitting_bridge_node.pastel_id.clone();
         best_quote_account.best_quoted_price_in_lamports = quoted_price_lamports;
         best_quote_account.best_quote_timestamp = quote_timestamp;
@@ -887,6 +1070,7 @@ pub fn submit_price_quote_helper(
 
     Ok(())
 }
+
 
 pub fn validate_price_quote_submission(
     bridge_nodes_data_account: &BridgeNodesDataAccount,
@@ -905,18 +1089,19 @@ pub fn validate_price_quote_submission(
 
     if service_request.status != RequestStatus::Pending {
         msg!("Error: Service request is not in a pending state");
-        return Err(BridgeError::ServiceRequestNotPending.into());
+        return err!(BridgeError::ServiceRequestNotPending);
     }
 
     if quote_timestamp > service_request.service_request_creation_timestamp + MAX_QUOTE_RESPONSE_TIME {
         msg!("Error: Price quote submitted beyond the maximum response time");
-        return Err(BridgeError::QuoteResponseTimeExceeded.into());
+        return err!(BridgeError::QuoteResponseTimeExceeded);
     }
 
     let current_timestamp = Clock::get()?.unix_timestamp as u64;
-    if quote_timestamp > service_request.service_request_creation_timestamp + MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE {
+    if quote_timestamp > service_request.service_request_creation_timestamp + 
+       MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNING_QUOTE {
         msg!("Error: Price quote submitted too late");
-        return Err(BridgeError::QuoteResponseTimeExceeded.into());
+        return err!(BridgeError::QuoteResponseTimeExceeded);
     }
 
     let registered_bridge_node = bridge_nodes_data_account
@@ -927,41 +1112,42 @@ pub fn validate_price_quote_submission(
     if let Some(bridge_node) = registered_bridge_node {
         if bridge_node.calculate_is_banned(current_timestamp) {
             msg!("Error: Bridge node is currently banned");
-            return Err(BridgeError::BridgeNodeBanned.into());
+            return err!(BridgeError::BridgeNodeBanned);
+        }
+
+        // Check compliance and reliability scores using fixed point comparison
+        if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD ||
+           bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
+            msg!("Error: Bridge node does not meet the minimum score requirements for rewards");
+            return err!(BridgeError::BridgeNodeScoreTooLow);
+        }
+
+        if current_timestamp > bridge_node.last_active_timestamp + BRIDGE_NODE_INACTIVITY_THRESHOLD {
+            msg!("Error: Bridge node is inactive");
+            return err!(BridgeError::BridgeNodeInactive);
         }
     } else {
         msg!("Error: Bridge node is not registered");
-        return Err(BridgeError::UnregisteredBridgeNode.into());
+        return err!(BridgeError::UnregisteredBridgeNode);
     }
 
     if quoted_price_lamports == 0 {
         msg!("Error: Quoted price cannot be zero");
-        return Err(BridgeError::InvalidQuotedPrice.into());
+        return err!(BridgeError::InvalidQuotedPrice);
     }
 
     if price_quote_submission_account.price_quote_status != ServicePriceQuoteStatus::Submitted {
         msg!("Error: Price quote status is not set to 'Submitted'");
-        return Err(BridgeError::InvalidQuoteStatus.into());
+        return err!(BridgeError::InvalidQuoteStatus);
     }
 
     if current_timestamp > price_quote_submission_account.price_quote.quote_timestamp + QUOTE_VALIDITY_DURATION {
         msg!("Error: Price quote has expired");
-        return Err(BridgeError::QuoteExpired.into());
+        return err!(BridgeError::QuoteExpired);
     }
 
-    if let Some(bridge_node) = registered_bridge_node {
-        if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD || bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
-            msg!("Error: Bridge node does not meet the minimum score requirements for rewards");
-            return Err(BridgeError::BridgeNodeScoreTooLow.into());
-        }
-        if current_timestamp > bridge_node.last_active_timestamp + BRIDGE_NODE_INACTIVITY_THRESHOLD {
-            msg!("Error: Bridge node is inactive");
-            return Err(BridgeError::BridgeNodeInactive.into());
-        }
-    }
     Ok(())
 }
-
 pub fn choose_best_price_quote(
     best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
     temp_service_requests_data_account: &mut TempServiceRequestsDataAccount,
@@ -970,10 +1156,10 @@ pub fn choose_best_price_quote(
     let service_request = temp_service_requests_data_account.service_requests
         .iter_mut()
         .find(|request| request.service_request_id == best_quote_account.service_request_id)
-        .ok_or(BridgeError::ServiceRequestNotFound)?;
+        .ok_or(error!(BridgeError::ServiceRequestNotFound))?;
 
     if current_timestamp > best_quote_account.best_quote_timestamp + QUOTE_VALIDITY_DURATION {
-        return Err(BridgeError::QuoteExpired.into());
+        return err!(BridgeError::QuoteExpired);
     }
 
     service_request.selected_bridge_node_pastelid = Some(best_quote_account.best_bridge_node_pastel_id.clone());
@@ -988,7 +1174,7 @@ fn update_txid_mapping(
     txid_mapping_data_account: &mut Account<ServiceRequestTxidMappingDataAccount>, 
     service_request_id: String, 
     pastel_txid: String
-) -> ProgramResult {
+) -> Result<()> {  // Changed from ProgramResult to Result<()>
     // Check if a mapping for the service_request_id already exists
     if let Some(mapping) = txid_mapping_data_account.mappings.iter_mut().find(|m| m.service_request_id == service_request_id) {
         mapping.pastel_txid = pastel_txid;
@@ -1012,20 +1198,15 @@ pub struct SubmitPastelTxid<'info> {
     )]
     pub service_request_submission_account: Account<'info, ServiceRequestSubmissionAccount>,
 
-    // The bridge contract state
     #[account(
         mut,
         constraint = bridge_contract_state.is_initialized @ BridgeError::ContractNotInitialized
     )]
     pub bridge_contract_state: Account<'info, BridgeContractState>,
 
-    // Bridge Nodes Data Account
-    #[account(
-        mut,
-    )]
+    #[account(mut)]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
-    // Account for the ServiceRequestTxidMappingDataAccount PDA
     #[account(
         mut,
         seeds = [b"service_request_txid_map"],
@@ -1033,31 +1214,35 @@ pub struct SubmitPastelTxid<'info> {
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
-    // System program
     pub system_program: Program<'info, System>,
 }
 
-pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>, service_request_id: String, pastel_txid: String) -> ProgramResult {
+pub fn submit_pastel_txid_from_bridge_node_helper(
+    ctx: Context<SubmitPastelTxid>, 
+    service_request_id: String, 
+    pastel_txid: String
+) -> Result<()> {  // Changed from ProgramResult to Result<()>
     let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
 
     // Validate that the service_request_id matches
     if service_request.service_request_id != service_request_id {
-        return Err(BridgeError::InvalidServiceRequestId.into());
+        return err!(BridgeError::InvalidServiceRequestId);
     }
 
     // Validate the format and length of the Pastel TxID
     if pastel_txid.is_empty() || pastel_txid.len() > MAX_TXID_LENGTH {
-        return Err(BridgeError::InvalidPastelTxid.into());
+        return err!(BridgeError::InvalidPastelTxid);
     }
 
     // Find the bridge node that matches the selected_pastel_id
-    let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes.iter().find(|node| {
-        node.pastel_id == *service_request.selected_bridge_node_pastelid.as_ref().unwrap()
-    }).ok_or(BridgeError::UnregisteredBridgeNode)?;
+    let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes
+        .iter()
+        .find(|node| node.pastel_id == *service_request.selected_bridge_node_pastelid.as_ref().unwrap())
+        .ok_or_else(|| error!(BridgeError::UnregisteredBridgeNode))?;
 
     // Check if the transaction is being submitted by the selected bridge node
     if selected_bridge_node.reward_address != ctx.accounts.system_program.key() {
-        return Err(BridgeError::UnauthorizedBridgeNode.into());
+        return err!(BridgeError::UnauthorizedBridgeNode);
     }
 
     // Update the service request with the provided Pastel TxID
@@ -1068,11 +1253,14 @@ pub fn submit_pastel_txid_from_bridge_node_helper(ctx: Context<SubmitPastelTxid>
     service_request.status = RequestStatus::AwaitingCompletionConfirmation;
 
     // Log the TxID submission
-    msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", selected_bridge_node.pastel_id, service_request_id.to_string());
+    msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", 
+        selected_bridge_node.pastel_id, 
+        service_request_id.to_string()
+    );
 
     // Update the TxID mapping for the service request
     let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid.clone())?;
+    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
 
     Ok(())
 }
@@ -1082,10 +1270,10 @@ pub struct AccessOracleData<'info> {
     #[account(
         seeds = [b"aggregated_consensus_data"],
         bump,
-        constraint = aggregated_consensus_data_account.to_account_info().owner == &bridge_contract_state.oracle_contract_pubkey
+        has_one = oracle_contract_pubkey @ BridgeError::ContractNotInitialized
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
-
+    
     #[account(
         seeds = [b"service_request_txid_map"],
         bump
@@ -1134,8 +1322,8 @@ pub fn get_aggregated_data<'a>(
 
 impl<'info> AccessOracleData<'info> {
     pub fn process(
-        &mut self, 
-        txid: String, 
+        &mut self,
+        txid: String,
         service_request_id: &String,
         bridge_escrow_account: &mut AccountInfo<'info>,
         system_program: &Program<'info, System>,
@@ -1143,9 +1331,16 @@ impl<'info> AccessOracleData<'info> {
     ) -> Result<()> {
         let current_timestamp = Clock::get()?.unix_timestamp as u64;
 
-        let service_request = self.temp_service_requests_data_account.service_requests.iter()
+        // Update error propagation using ? operator and err! macro
+        let service_request = self.temp_service_requests_data_account
+            .service_requests
+            .iter()
             .find(|request| &request.service_request_id == service_request_id)
-            .ok_or(BridgeError::ServiceRequestNotFound)?;
+            .ok_or_else(|| error!(BridgeError::ServiceRequestNotFound))?;
+
+        if service_request.user_sol_address != *self.user_account.key {
+            return err!(BridgeError::InvalidUserSolAddress);
+        }
 
         // Validate user account
         if service_request.user_sol_address != *self.user_account.key {
@@ -1329,12 +1524,18 @@ impl<'info> AccessOracleData<'info> {
         service_request_data: (Pubkey, Option<u64>),
     ) -> Result<()> {
         let (user_sol_address, escrow_amount_lamports) = service_request_data;
-        let escrow_amount = escrow_amount_lamports.ok_or(BridgeError::EscrowNotFunded)?;
+        let escrow_amount = escrow_amount_lamports.ok_or_else(|| error!(BridgeError::EscrowNotFunded))?;
     
         if is_success {
             // Calculate the service fee
-            let service_fee = escrow_amount * TRANSACTION_FEE_PERCENTAGE as u64 / 100;
-            let amount_to_bridge_node = escrow_amount - service_fee;
+            let service_fee = escrow_amount
+                .checked_mul(TRANSACTION_FEE_PERCENTAGE.into())
+                .and_then(|v| v.checked_div(100))
+                .ok_or_else(|| error!(BridgeError::TimestampConversionError))?;
+    
+            let amount_to_bridge_node = escrow_amount
+                .checked_sub(service_fee)
+                .ok_or_else(|| error!(BridgeError::TimestampConversionError))?;
     
             // Transfer the service fee to the bridge reward pool account
             send_sol(
@@ -1355,13 +1556,13 @@ impl<'info> AccessOracleData<'info> {
             // Update the service request state to Completed
             self.update_service_request_state_to_completed(consensus_data)?;
     
-            msg!("Service Request ID: {} completed successfully! Sent {} SOL to Bridge Node at address: {} and transferred the service fee of {} SOL to the Bridge Reward Pool",
+            msg!(
+                "Service Request ID: {} completed successfully! Sent {} SOL to Bridge Node at address: {} and transferred the service fee of {} SOL to the Bridge Reward Pool",
                 service_request_id,
                 amount_to_bridge_node as f64 / LAMPORTS_PER_SOL as f64,
                 self.get_selected_bridge_node_sol_address(service_request_id)?,
                 service_fee as f64 / LAMPORTS_PER_SOL as f64,
             );
-
         } else {
             // Refund the full escrow amount to the user in case of failure
             send_sol(
@@ -1373,6 +1574,13 @@ impl<'info> AccessOracleData<'info> {
     
             // Update the service request state to Failed
             self.update_service_request_state(service_request_id, RequestStatus::Failed)?;
+    
+            msg!(
+                "Service Request ID: {} failed. Refunded {} SOL to user at address: {}",
+                service_request_id,
+                escrow_amount as f64 / LAMPORTS_PER_SOL as f64,
+                user_sol_address,
+            );
         }
     
         Ok(())
@@ -1382,26 +1590,26 @@ impl<'info> AccessOracleData<'info> {
 
 
 // Refactored to be standalone functions
-pub fn send_sol<'info>(
-    from_account: &mut AccountInfo<'info>, 
-    to_pubkey: Pubkey, 
-    amount: u64,
-    system_program: &Program<'info, System>,
-) -> ProgramResult {
-    let ix = system_instruction::transfer(
-        from_account.key, 
-        &to_pubkey, 
-        amount,
-    );
+    pub fn send_sol<'info>(
+        from_account: &AccountInfo<'info>,
+        to_pubkey: Pubkey,
+        amount: u64,
+        system_program: &Program<'info, System>,
+    ) -> Result<()> {
+        let ix = system_instruction::transfer(
+            from_account.key,
+            &to_pubkey,
+            amount,
+        );
 
-    invoke(
-        &ix,
-        &[
-            from_account.clone(),
-            system_program.to_account_info(),
-        ],
-    )
-}
+        invoke(
+            &ix,
+            &[
+                from_account.clone(),
+                system_program.to_account_info(),
+            ],
+        ).map_err(Into::into)
+    }
 
 pub fn refund_escrow_to_user(
     escrow_account: &mut AccountInfo<'_>, 
@@ -1580,7 +1788,7 @@ pub fn handle_post_transaction_tasks(
     Ok(())
 }
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AnchorSerialize, AnchorDeserialize)]
 pub struct HashWeight {
     pub hash: String,
     pub weight: i32,
@@ -1770,7 +1978,6 @@ pub mod solana_pastel_bridge_program {
         pastel_id: String,
         bridge_node_psl_address: String,
     ) -> Result<()> {
-        // Call the helper function
         register_new_bridge_node_helper(ctx, pastel_id, bridge_node_psl_address)
     }
 
@@ -1780,7 +1987,7 @@ pub mod solana_pastel_bridge_program {
         first_6_chars_of_hash: String,
         ipfs_cid: String,
         file_size_bytes: u64,
-    ) -> ProgramResult {
+    ) -> Result<()> {  // Change from ProgramResult
         submit_service_request_helper(ctx, pastel_ticket_type_string, first_6_chars_of_hash, ipfs_cid, file_size_bytes)
     }
 
