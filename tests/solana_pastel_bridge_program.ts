@@ -581,6 +581,7 @@ describe("Solana Pastel Bridge Tests", () => {
             })
           );
 
+          console.log("About to create bridgeNodesIx...");
           const bridgeNodesIx = await program.methods
             .initializeBridgeNodesData()
             .accounts({
@@ -590,6 +591,7 @@ describe("Solana Pastel Bridge Tests", () => {
               systemProgram: SystemProgram.programId,
             })
             .instruction();
+          console.log("bridgeNodesIx:", bridgeNodesIx);
 
           bridgeNodesTx.add(bridgeNodesIx);
 
@@ -699,6 +701,7 @@ describe("Solana Pastel Bridge Tests", () => {
             })
           );
 
+          console.log("About to create consensusDataIx...");
           const consensusDataIx = await program.methods
             .initializeConsensusData()
             .accounts({
@@ -708,6 +711,7 @@ describe("Solana Pastel Bridge Tests", () => {
               systemProgram: SystemProgram.programId,
             })
             .instruction();
+          console.log("consensusDataIx:", consensusDataIx);
 
           consensusDataTx.add(consensusDataIx);
 
@@ -955,6 +959,7 @@ describe("Solana Pastel Bridge Tests", () => {
         units: COMPUTE_UNITS_PER_TX,
       });
 
+      // Get PDAs
       const [rewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
         [Buffer.from("bridge_reward_pool_account")],
         program.programId
@@ -971,6 +976,11 @@ describe("Solana Pastel Bridge Tests", () => {
       const [aggregatedConsensusDataAccountPDA] =
         await PublicKey.findProgramAddressSync(
           [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+      const [regFeeReceivingAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("reg_fee_receiving_account")],
           program.programId
         );
 
@@ -994,27 +1004,89 @@ describe("Solana Pastel Bridge Tests", () => {
         );
       }
 
-      // Try to reinitialize PDAs
+      // Try to reinitialize core PDAs
       try {
         await program.methods
-          .initializeDataPdas()
+          .initializeCorePdas()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            bridgeRewardPoolAccount: rewardPoolAccountPDA,
+            bridgeEscrowAccount: bridgeEscrowAccountPDA,
+            regFeeReceivingAccount: regFeeReceivingAccountPDA,
+            systemProgram: SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .rpc();
+        assert.fail("Should not be able to reinitialize core PDAs");
+      } catch (error) {
+        const anchorError = error as anchor.AnchorError;
+        assert.include(
+          anchorError.error.errorMessage,
+          "The program expected this account to be uninitialized"
+        );
+      }
+
+      // Try to reinitialize bridge nodes data
+      try {
+        await program.methods
+          .initializeBridgeNodesData()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
             user: adminPublicKey,
             bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+            systemProgram: SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .rpc();
+        assert.fail("Should not be able to reinitialize bridge nodes data");
+      } catch (error) {
+        const anchorError = error as anchor.AnchorError;
+        assert.include(
+          anchorError.error.errorMessage,
+          "The program expected this account to be uninitialized"
+        );
+      }
+
+      // Try to reinitialize temp requests data
+      try {
+        await program.methods
+          .initializeTempRequestsData()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
             tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-            serviceRequestTxidMappingDataAccount: bridgeNodeDataAccountPDA,
+            systemProgram: SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .rpc();
+        assert.fail("Should not be able to reinitialize temp requests data");
+      } catch (error) {
+        const anchorError = error as anchor.AnchorError;
+        assert.include(
+          anchorError.error.errorMessage,
+          "The program expected this account to be uninitialized"
+        );
+      }
+
+      // Try to reinitialize consensus data
+      try {
+        await program.methods
+          .initializeConsensusData()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
             aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
           .rpc();
-        assert.fail("Should not be able to reinitialize PDAs");
+        assert.fail("Should not be able to reinitialize consensus data");
       } catch (error) {
         const anchorError = error as anchor.AnchorError;
         assert.include(
           anchorError.error.errorMessage,
-          "Bridge Contract state is already initialized"
+          "The program expected this account to be uninitialized"
         );
       }
 

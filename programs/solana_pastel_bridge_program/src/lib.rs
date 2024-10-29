@@ -589,7 +589,6 @@ pub struct InitTxidMappingData<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 #[derive(Accounts)]
 pub struct InitConsensusData<'info> {
     #[account(mut)]
@@ -600,10 +599,10 @@ pub struct InitConsensusData<'info> {
 
     #[account(
         init,
-        seeds = [b"aggregated_consensus_data"],
+        seeds = [b"aggregated_consensus_data"],  
         bump,
         payer = user,
-        space = 8 + 4 + (10 * 1024),  // Adjusted size
+        space = 8 + 4 + (10 * 280),
         rent_exempt = enforce
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
