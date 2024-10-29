@@ -1,45 +1,44 @@
+import { assert, expect } from "chai";
+import Decimal from "decimal.js";
+import * as crypto from "crypto";
 import * as anchor from "@coral-xyz/anchor";
 import { Program, web3, AnchorProvider, BN } from "@coral-xyz/anchor";
+import { ComputeBudgetProgram, SystemProgram } from "@solana/web3.js";
+import { SolanaPastelBridgeProgram } from "../target/types/solana_pastel_bridge_program";
+import IDL from "../target/idl/solana_pastel_bridge_program.json";
 
-import {
-  SolanaPastelBridgeProgram,
-  IDL,
-} from "../target/types/solana_pastel_bridge_program";
-import { assert } from "chai";
-import * as crypto from "crypto";
+const { PublicKey, Keypair, Transaction } = anchor.web3;
 
-const { PublicKey, SystemProgram, Keypair, Transaction } = anchor.web3;
+// Global state tracking
+let bridgeContractState: web3.Keypair;
+let bridgeNodes: any[] = [];
+let serviceRequestIds: string[] = [];
+let totalComputeUnitsUsed = 0;
+let maxAccountStorageUsed = 0;
 
+const TURN_ON_STORAGE_AND_COMPUTE_PROFILING = true;
 process.env.ANCHOR_PROVIDER_URL = "http://127.0.0.1:8899";
 process.env.RUST_LOG =
   "solana_runtime::system_instruction_processor=trace,solana_runtime::message_processor=trace,solana_bpf_loader=debug,solana_rbpf=debug";
 
+// Provider setup
 const provider = AnchorProvider.env();
 anchor.setProvider(provider);
+const program = new Program<SolanaPastelBridgeProgram>(IDL as any, provider);
+const admin = provider.wallet;
 
 const programID = new anchor.web3.PublicKey(
   "Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79"
 );
+const adminPublicKey = admin.publicKey;
 
-// Load the IDL and the program
-const program = anchor.workspace
-  .SolanaPastelBridgeProgram as Program<SolanaPastelBridgeProgram>;
-
-// Use the provider's wallet
-const wallet = provider.wallet;
-const adminPublicKey = wallet.publicKey;
-
-console.log("Admin Public Key: ", adminPublicKey.toBase58());
-
-const bridgeContractState = web3.Keypair.generate();
-
-let bridgeNodes = [];
-
+// Constants
+const INITIAL_DATA_SIZE = 1024; // Start smaller
+const MAX_ACCOUNT_SIZE = 10240; // Limited by Solana
+const REALLOC_SIZE = 1024; // Smaller increments
 const maxSize = 100 * 1024;
-
 const NUM_BRIDGE_NODES = 3;
 const NUMBER_OF_SIMULATED_SERVICE_REQUESTS = 5;
-
 const REGISTRATION_ENTRANCE_FEE_SOL = 0.1;
 const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
 const MIN_NUMBER_OF_ORACLES = 8;
@@ -48,11 +47,11 @@ const BAD_BRIDGE_NODE_INDEX = 5;
 const MIN_COMPLIANCE_SCORE_FOR_REWARD = 65;
 const MIN_RELIABILITY_SCORE_FOR_REWARD = 80;
 const BASE_REWARD_AMOUNT_IN_LAMPORTS = 100000;
-const baselinePriceUSD = 3; // Maximum price in USD
-const solToUsdRate = 130; // 1 SOL = $130
-const baselinePriceSol = baselinePriceUSD / solToUsdRate; // Convert USD to SOL
+const baselinePriceUSD = 3;
+const solToUsdRate = 130;
+const baselinePriceSol = baselinePriceUSD / solToUsdRate;
 
-// Helper function to generate random price quote around baseline
+// Helper function to generate random price quote
 function generateRandomPriceQuote(baselinePriceLamports: number): BN {
   const randomIncrement =
     Math.floor(Math.random() * (baselinePriceLamports / 10)) -
@@ -60,49 +59,7 @@ function generateRandomPriceQuote(baselinePriceLamports: number): BN {
   return new BN(baselinePriceLamports + randomIncrement);
 }
 
-const ErrorCodeMap = {
-  0x0: "BridgeNodeAlreadyRegistered",
-  0x1: "UnregisteredBridgeNode",
-  0x2: "InvalidServiceRequest",
-  0x3: "EscrowNotFunded",
-  0x4: "InvalidFileSize",
-  0x5: "InvalidServiceType",
-  0x6: "QuoteExpired",
-  0x7: "BridgeNodeInactive",
-  0x8: "InsufficientEscrowFunds",
-  0x9: "DuplicateServiceRequestId",
-  0xa: "ContractPaused",
-  0xb: "InvalidFileHash",
-  0xc: "InvalidIpfsCid",
-  0xd: "InvalidUserSolAddress",
-  0xe: "InvalidRequestStatus",
-  0xf: "InvalidPaymentInEscrow",
-  0x10: "InvalidInitialFieldValues",
-  0x11: "InvalidEscrowOrFeeAmounts",
-  0x12: "InvalidServiceRequestId",
-  0x13: "InvalidPastelTxid",
-  0x14: "BridgeNodeNotSelected",
-  0x15: "UnauthorizedBridgeNode",
-  0x16: "ContractNotInitialized",
-  0x17: "MappingNotFound",
-  0x18: "TxidMismatch",
-  0x19: "OutdatedConsensusData",
-  0x1a: "ServiceRequestNotFound",
-  0x1b: "ServiceRequestNotPending",
-  0x1c: "QuoteResponseTimeExceeded",
-  0x1d: "BridgeNodeBanned",
-  0x1e: "InvalidQuotedPrice",
-  0x1f: "InvalidQuoteStatus",
-  0x20: "BridgeNodeScoreTooLow",
-  0x21: "TxidNotFound",
-  0x22: "TxidMappingNotFound",
-  0x23: "InsufficientRegistrationFee",
-  0x24: "UnauthorizedWithdrawalAccount",
-  0x25: "InsufficientFunds",
-  0x26: "TimestampConversionError",
-  0x27: "RegistrationFeeNotPaid",
-};
-
+// Enums
 const TxidStatusEnum = {
   Invalid: "Invalid",
   PendingMining: "PendingMining",
@@ -117,269 +74,498 @@ const PastelTicketTypeEnum = {
   InferenceApi: "InferenceApi",
 };
 
-console.log("Program ID:", programID.toString());
-console.log("Admin ID:", adminPublicKey.toString());
-
-it("Initializes and expands the bridge contract state", async () => {
-  try {
-    console.log("Starting PDA generation...");
-
-    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_reward_pool_account")],
-      program.programId
-    );
-    console.log("RewardPoolAccount PDA:", rewardPoolAccountPDA.toBase58());
-
-    const [feeReceivingContractAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_escrow_account")],
-      program.programId
-    );
-    console.log("FeeReceivingContractAccount PDA:", feeReceivingContractAccountPDA.toBase58());
-
-    const [bridgeNodeDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_nodes_data")],
-      program.programId
-    );
-    console.log("BridgeNodeDataAccount PDA:", bridgeNodeDataAccountPDA.toBase58());
-
-    const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("service_request_txid_map")],
-      program.programId
-    );
-    console.log("ServiceRequestTxidMappingDataAccount PDA:", serviceRequestTxidMappingDataAccountPDA.toBase58());
-
-    const [aggregatedConsensusDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("aggregated_consensus_data")],
-      program.programId
-    );
-    console.log("AggregatedConsensusDataAccount PDA:", aggregatedConsensusDataAccountPDA.toBase58());
-
-    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("temp_service_requests_data")],
-      program.programId
-    );
-    console.log("TempServiceRequestsDataAccount PDA:", tempServiceRequestsDataAccountPDA.toBase58());
-
-    const [regFeeReceivingAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("reg_fee_receiving_account")],
-      program.programId
-    );
-    console.log("RegFeeReceivingAccount PDA:", regFeeReceivingAccountPDA.toBase58());
-
-    const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
-    console.log("Minimum Balance for Rent Exemption:", minBalanceForRentExemption);
-
-    // Fund the bridge contract state account
-    const fundTx = new anchor.web3.Transaction().add(
-      anchor.web3.SystemProgram.transfer({
-        fromPubkey: adminPublicKey,
-        toPubkey: bridgeContractState.publicKey,
-        lamports: minBalanceForRentExemption,
-      })
-    );
-    await provider.sendAndConfirm(fundTx, []);
-    console.log("Bridge Contract State account funded successfully.");
-
-// First stage: Initialize base contract state
-console.log("Starting base initialization...");
-await program.methods
-  .initializeBase(adminPublicKey)
-  .accounts({
-    bridgeContractState: bridgeContractState.publicKey,
-    user: adminPublicKey,
-    systemProgram: web3.SystemProgram.programId,
-  })
-  .signers([bridgeContractState])
-  .rpc();
-console.log("Base initialization completed successfully.");
-
-// Second stage: Initialize core PDAs
-console.log("Starting core PDA initialization...");
-await program.methods
-  .initializeCorePdas()
-  .accounts({
-    bridgeContractState: bridgeContractState.publicKey,
-    user: adminPublicKey,
-    bridgeRewardPoolAccount: rewardPoolAccountPDA,
-    bridgeEscrowAccount: feeReceivingContractAccountPDA,
-    regFeeReceivingAccount: regFeeReceivingAccountPDA,
-    systemProgram: web3.SystemProgram.programId,
-  })
-  .rpc();
-console.log("Core PDA initialization completed successfully.");
-
-// Third stage: Initialize data PDAs
-console.log("Starting data PDA initialization...");
-await program.methods
-  .initializeDataPdas()
-  .accounts({
-    bridgeContractState: bridgeContractState.publicKey,
-    user: adminPublicKey,
-    bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-    tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-    serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
-    aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-    systemProgram: web3.SystemProgram.programId,
-  })
-  .rpc();
-console.log("Data PDA initialization completed successfully.");
-
-    // Verify initialization
-    let state = await program.account.bridgeContractState.fetch(
-      bridgeContractState.publicKey
-    );
-    console.log("Bridge Contract State fetched.");
-
-    assert.ok(
-      state.isInitialized,
-      "Bridge Contract State should be initialized after first init"
-    );
-    assert.equal(
-      state.adminPubkey.toString(),
-      adminPublicKey.toString(),
-      "Admin public key should match after first init"
-    );
-    console.log("Initial assertions passed.");
-
-    // Handle reallocation
-    let currentSize = 10_240;
-
-    while (currentSize < maxSize) {
-      console.log(
-        `Expanding Bridge Contract State size from ${currentSize} to ${
-          currentSize + 10_240
-        }`
-      );
-      await program.methods
-        .reallocateBridgeState()
-        .accounts({
-          bridgeContractState: bridgeContractState.publicKey,
-          adminPubkey: adminPublicKey,
-          tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-          bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-          serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
-          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .rpc();
-
-      currentSize += 10_240;
-      state = await program.account.bridgeContractState.fetch(
-        bridgeContractState.publicKey
-      );
-
-      console.log(`Bridge Contract State size after expansion: ${currentSize}`);
-    }
-
-    assert.equal(
-      currentSize,
-      maxSize,
-      "Bridge Contract State should reach the maximum size"
-    );
-    console.log("Bridge Contract State expanded to the maximum size successfully");
-  } catch (error) {
-    console.error("Error encountered:", error);
-    throw error;
-  }
+beforeEach(async () => {
+  // Reset state between tests
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 });
 
-  it("Registers new bridge nodes", async () => {
-    const [bridgeRewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_reward_pool_account")],
-      program.programId
+afterEach(async () => {
+  // Cleanup any leftover state
+  serviceRequestIds = [];
+});
+
+// Compute unit tracking
+const measureComputeUnitsAndStorage = async (txSignature: string) => {
+  if (!TURN_ON_STORAGE_AND_COMPUTE_PROFILING) return;
+
+  for (let attempts = 0; attempts < 5; attempts++) {
+    const txDetails = await provider.connection.getParsedTransaction(
+      txSignature,
+      {
+        commitment: "confirmed",
+      }
     );
 
-    const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_nodes_data")],
-      program.programId
-    );
+    if (txDetails) {
+      if (txDetails.meta?.computeUnitsConsumed) {
+        totalComputeUnitsUsed += txDetails.meta.computeUnitsConsumed;
+      }
 
-    const [regFeeReceivingAccountPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("reg_fee_receiving_account")],
-      program.programId
-    );
-
-    for (let i = 0; i < NUM_BRIDGE_NODES; i++) {
-      const bridgeNode = Keypair.generate();
-      console.log(
-        `Bridge Node ${i + 1} Keypair:`,
-        bridgeNode.publicKey.toBase58()
+      const accounts = txDetails.transaction.message.accountKeys.map(
+        (key) => new web3.PublicKey(key.pubkey)
       );
 
+      for (const account of accounts) {
+        const accountInfo = await provider.connection.getAccountInfo(account);
+        if (accountInfo && accountInfo.data.length > maxAccountStorageUsed) {
+          maxAccountStorageUsed = accountInfo.data.length;
+        }
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  console.error(
+    `Failed to fetch transaction details for signature: ${txSignature}`
+  );
+};
+
+const handleError = async (error: any, context: string) => {
+  console.error(`Error in ${context}:`, error);
+
+  if (error instanceof anchor.AnchorError) {
+    console.error(`Error Code: ${error.error.errorCode.code}`);
+    console.error(`Error Message: ${error.error.errorMessage}`);
+    if (error.error.origin) {
+      console.error(`Error Origin: ${error.error.origin}`);
+    }
+  }
+
+  // Get transaction logs if available
+  if (error.logs) {
+    console.error("Transaction logs:", error.logs);
+  }
+
+  throw error;
+};
+
+// Error parsing helper
+const parseError = (error: any) => {
+  if (error instanceof anchor.AnchorError) {
+    const anchorError = error as anchor.AnchorError;
+    console.error(`Error Code: ${anchorError.error.errorCode.code}`);
+    console.error(`Error Message: ${anchorError.error.errorMessage}`);
+    return anchorError;
+  }
+  console.error("Unknown error:", error);
+  throw error;
+};
+
+// Setup and cleanup
+before(async () => {
+  bridgeContractState = web3.Keypair.generate();
+  console.log("Program ID:", programID.toString());
+  console.log("Admin ID:", adminPublicKey.toString());
+});
+
+after(async () => {
+  console.log("Total compute units used:", totalComputeUnitsUsed);
+  console.log("Max account storage used:", maxAccountStorageUsed);
+});
+
+describe("Solana Pastel Bridge Tests", () => {
+  describe("Initialization", () => {
+    it("Initializes and expands the bridge contract state", async () => {
       try {
-        console.log(`Funding bridge node ${i + 1} with registration fee...`);
-        const fundTx = new Transaction().add(
-          SystemProgram.transfer({
+        console.log("Starting PDA generation...");
+
+        // Generate PDAs
+        const [rewardPoolAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("bridge_reward_pool_account")],
+            program.programId
+          );
+
+        const [feeReceivingContractAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("bridge_escrow_account")],
+            program.programId
+          );
+
+        const [bridgeNodeDataAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("bridge_nodes_data")],
+            program.programId
+          );
+
+        const [serviceRequestTxidMappingDataAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("service_request_txid_map")],
+            program.programId
+          );
+
+        const [aggregatedConsensusDataAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("aggregated_consensus_data")],
+            program.programId
+          );
+
+        const [tempServiceRequestsDataAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("temp_service_requests_data")],
+            program.programId
+          );
+
+        const [regFeeReceivingAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("reg_fee_receiving_account")],
+            program.programId
+          );
+
+        // Log PDA addresses
+        console.log("RewardPoolAccount PDA:", rewardPoolAccountPDA.toBase58());
+        console.log(
+          "FeeReceivingContractAccount PDA:",
+          feeReceivingContractAccountPDA.toBase58()
+        );
+        console.log(
+          "BridgeNodeDataAccount PDA:",
+          bridgeNodeDataAccountPDA.toBase58()
+        );
+        console.log(
+          "ServiceRequestTxidMappingDataAccount PDA:",
+          serviceRequestTxidMappingDataAccountPDA.toBase58()
+        );
+        console.log(
+          "AggregatedConsensusDataAccount PDA:",
+          aggregatedConsensusDataAccountPDA.toBase58()
+        );
+        console.log(
+          "TempServiceRequestsDataAccount PDA:",
+          tempServiceRequestsDataAccountPDA.toBase58()
+        );
+        console.log(
+          "RegFeeReceivingAccount PDA:",
+          regFeeReceivingAccountPDA.toBase58()
+        );
+
+        // Calculate and fund rent exemption
+        const minBalanceForRentExemption =
+          await provider.connection.getMinimumBalanceForRentExemption(maxSize);
+        console.log(
+          "Minimum Balance for Rent Exemption:",
+          minBalanceForRentExemption
+        );
+
+        const fundTx = new anchor.web3.Transaction().add(
+          anchor.web3.SystemProgram.transfer({
             fromPubkey: adminPublicKey,
-            toPubkey: bridgeNode.publicKey,
-            lamports:
-              REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL + 10000000,
+            toPubkey: bridgeContractState.publicKey,
+            lamports: minBalanceForRentExemption,
           })
         );
-        await provider.sendAndConfirm(fundTx, []);
-        console.log(`Bridge node ${i + 1} funded successfully.`);
+        const fundTxSignature = await provider.sendAndConfirm(fundTx, []);
+        await measureComputeUnitsAndStorage(fundTxSignature);
 
-        const uniquePastelId = crypto.randomBytes(32).toString("hex");
-        const uniquePslAddress = "P" + crypto.randomBytes(33).toString("hex");
-
-        console.log(`bridgeNode public key: ${bridgeNode.publicKey}`);
-        console.log(`uniquePastelId: ${uniquePastelId}`);
-        console.log(`uniquePslAddress: ${uniquePslAddress}`);
-
-        console.log(
-          `Transferring registration fee from bridge node ${
-            i + 1
-          } to fee receiving contract account...`
-        );
-        const transferTx = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: bridgeNode.publicKey,
-            toPubkey: regFeeReceivingAccountPDA,
-            lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
-          })
-        );
-        await provider.sendAndConfirm(transferTx, [bridgeNode]);
-        console.log(
-          `Registration fee transferred successfully for bridge node ${i + 1}.`
-        );
-
-        console.log(`Registering bridge node ${i + 1}...`);
-        await program.methods
-          .registerNewBridgeNode(uniquePastelId, uniquePslAddress)
+        // Initialize base contract state
+        console.log("Starting base initialization...");
+        const initBaseTxSignature = await program.methods
+          .initializeBase(adminPublicKey)
           .accounts({
-            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-            user: bridgeNode.publicKey,
-            bridgeRewardPoolAccount: bridgeRewardPoolAccountPDA,
-            regFeeReceivingAccount: regFeeReceivingAccountPDA,
-            systemProgram: SystemProgram.programId,
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            systemProgram: web3.SystemProgram.programId,
           })
-          .signers([bridgeNode])
+          .signers([bridgeContractState])
           .rpc();
-        console.log(
-          `Bridge Node ${i + 1} registered successfully with the address:`,
-          bridgeNode.publicKey.toBase58(),
-          `Pastel ID: ${uniquePastelId}`,
-          `PSL Address: ${uniquePslAddress}`
+        await measureComputeUnitsAndStorage(initBaseTxSignature);
+
+        // Initialize core PDAs
+        console.log("Starting core PDA initialization...");
+        const initCorePDAsTxSignature = await program.methods
+          .initializeCorePdas()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            bridgeRewardPoolAccount: rewardPoolAccountPDA,
+            bridgeEscrowAccount: feeReceivingContractAccountPDA,
+            regFeeReceivingAccount: regFeeReceivingAccountPDA,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .rpc();
+        await measureComputeUnitsAndStorage(initCorePDAsTxSignature);
+
+        // Initialize data PDAs
+        console.log("Starting data PDA initialization...");
+        const initDataPDAsTxSignature = await program.methods
+          .initializeDataPdas()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+            serviceRequestTxidMappingDataAccount:
+              serviceRequestTxidMappingDataAccountPDA,
+            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .preInstructions([
+            // Add compute budget instruction
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: 400_000, // Increase compute budget
+            }),
+          ])
+          .rpc();
+        await measureComputeUnitsAndStorage(initDataPDAsTxSignature);
+
+        // Verify initialization
+        let state = await program.account.bridgeContractState.fetch(
+          bridgeContractState.publicKey
         );
-        bridgeNodes.push({
-          keypair: bridgeNode,
-          pastelId: uniquePastelId,
-          pslAddress: uniquePslAddress,
-        });
+
+        assert.ok(
+          state.isInitialized,
+          "Bridge Contract State should be initialized after first init"
+        );
+        assert.equal(
+          state.adminPubkey.toString(),
+          adminPublicKey.toString(),
+          "Admin public key should match after first init"
+        );
+
+        // Handle reallocation
+        let currentSize = 10_240;
+        while (currentSize < maxSize) {
+          console.log(
+            `Expanding Bridge Contract State size from ${currentSize} to ${
+              currentSize + 10_240
+            }`
+          );
+
+          const reallocTxSignature = await program.methods
+            .reallocateBridgeState()
+            .accounts({
+              bridgeContractState: bridgeContractState.publicKey,
+              adminPubkey: adminPublicKey,
+              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+              bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+              serviceRequestTxidMappingDataAccount:
+                serviceRequestTxidMappingDataAccountPDA,
+              aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+              systemProgram: web3.SystemProgram.programId,
+            })
+            .rpc();
+
+          await measureComputeUnitsAndStorage(reallocTxSignature);
+          currentSize += 10_240;
+          state = await program.account.bridgeContractState.fetch(
+            bridgeContractState.publicKey
+          );
+          console.log(
+            `Bridge Contract State size after expansion: ${currentSize}`
+          );
+        }
+
+        assert.equal(
+          currentSize,
+          maxSize,
+          "Bridge Contract State should reach the maximum size"
+        );
+        console.log(
+          "Bridge Contract State expanded to the maximum size successfully"
+        );
       } catch (error) {
-        console.error(`Error registering bridge node ${i + 1}:`, error);
-        console.log(`bridgeNode: ${JSON.stringify(bridgeNode)}`);
-        console.log(`bridgeNode.publicKey: ${bridgeNode.publicKey}`);
+        console.error("Error encountered:", error);
         throw error;
       }
-    }
+    });
+  });
 
-    try {
+  describe("Reinitialization Prevention", () => {
+    it("Prevents reinitialization of BridgeContractState and PDAs", async () => {
+      const [rewardPoolAccountPDA] =
+        await web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_reward_pool_account")],
+          program.programId
+        );
+      const [bridgeNodeDataAccountPDA] =
+        await web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_nodes_data")],
+          program.programId
+        );
+      const [tempServiceRequestsDataAccountPDA] =
+        await web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
+        );
+      const [aggregatedConsensusDataAccountPDA] =
+        await web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+
+      // Try to reinitialize base state
+      try {
+        await program.methods
+          .initializeBase(adminPublicKey)
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .signers([]) // Remove bridgeContractState from signers
+          .rpc();
+        assert.fail("Reinitialization should have failed");
+      } catch (error) {
+        const expectedError = "ContractStateAlreadyInitialized";
+        assert.include(error.toString(), expectedError);
+      }
+
+      // Try to reinitialize PDAs
+      try {
+        await program.methods
+          .initializeDataPdas()
+          .accounts({
+            bridgeContractState: bridgeContractState.publicKey,
+            user: adminPublicKey,
+            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+            serviceRequestTxidMappingDataAccount: bridgeNodeDataAccountPDA,
+            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .rpc();
+        assert.fail("PDA reinitialization should have failed");
+      } catch (error) {
+        const anchorError = parseError(error);
+        assert.equal(
+          anchorError.error.errorCode.code,
+          "ContractStateAlreadyInitialized",
+          "Should throw ContractStateAlreadyInitialized error"
+        );
+      }
+
+      // Verify state remains unchanged
+      const state = await program.account.bridgeContractState.fetch(
+        bridgeContractState.publicKey
+      );
+      assert.ok(
+        state.isInitialized,
+        "Bridge Contract State should still be initialized"
+      );
+      assert.equal(
+        state.adminPubkey.toString(),
+        adminPublicKey.toString(),
+        "Admin public key should remain unchanged"
+      );
+    });
+  });
+
+  describe("Bridge Node Registration", () => {
+    it("Registers new bridge nodes", async () => {
+      // Verify account initialization first
+      const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("bridge_nodes_data")],
+        program.programId
+      );
+
+      // Wait for previous initialization to complete
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Verify account is initialized
+      const accountInfo = await provider.connection.getAccountInfo(
+        bridgeNodeDataAccountPDA
+      );
+      if (!accountInfo) {
+        throw new Error("Bridge nodes data account not initialized");
+      }
+
+      const [bridgeRewardPoolAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_reward_pool_account")],
+          program.programId
+        );
+
+      const [regFeeReceivingAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("reg_fee_receiving_account")],
+          program.programId
+        );
+
+      for (let i = 0; i < NUM_BRIDGE_NODES; i++) {
+        const bridgeNode = Keypair.generate();
+        console.log(
+          `Bridge Node ${i + 1} Keypair:`,
+          bridgeNode.publicKey.toBase58()
+        );
+
+        try {
+          // Fund bridge node
+          console.log(`Funding bridge node ${i + 1} with registration fee...`);
+          const fundTx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: adminPublicKey,
+              toPubkey: bridgeNode.publicKey,
+              lamports:
+                REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL +
+                10000000,
+            })
+          );
+          const fundTxSignature = await provider.sendAndConfirm(fundTx, []);
+          await measureComputeUnitsAndStorage(fundTxSignature);
+
+          const uniquePastelId = crypto.randomBytes(32).toString("hex");
+          const uniquePslAddress = "P" + crypto.randomBytes(33).toString("hex");
+
+          // Transfer registration fee
+          console.log(
+            `Transferring registration fee from bridge node ${
+              i + 1
+            } to fee receiving contract account...`
+          );
+          const transferTx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: bridgeNode.publicKey,
+              toPubkey: regFeeReceivingAccountPDA,
+              lamports: REGISTRATION_ENTRANCE_FEE_SOL * web3.LAMPORTS_PER_SOL,
+            })
+          );
+          const transferTxSignature = await provider.sendAndConfirm(
+            transferTx,
+            [bridgeNode]
+          );
+          await measureComputeUnitsAndStorage(transferTxSignature);
+
+          // Register bridge node
+          console.log(`Registering bridge node ${i + 1}...`);
+          const registerTxSignature = await program.methods
+            .registerNewBridgeNode(uniquePastelId, uniquePslAddress)
+            .accounts({
+              bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+              user: bridgeNode.publicKey,
+              bridgeRewardPoolAccount: bridgeRewardPoolAccountPDA,
+              regFeeReceivingAccount: regFeeReceivingAccountPDA,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([bridgeNode])
+            .rpc();
+
+          await measureComputeUnitsAndStorage(registerTxSignature);
+
+          console.log(
+            `Bridge Node ${i + 1} registered successfully:`,
+            `Address: ${bridgeNode.publicKey.toBase58()}`,
+            `Pastel ID: ${uniquePastelId}`,
+            `PSL Address: ${uniquePslAddress}`
+          );
+
+          bridgeNodes.push({
+            keypair: bridgeNode,
+            pastelId: uniquePastelId,
+            pslAddress: uniquePslAddress,
+          });
+        } catch (error) {
+          console.error(`Error registering bridge node ${i + 1}:`, error);
+          throw error;
+        }
+      }
+
+      // Verify registrations
       const bridgeNodeData = await program.account.bridgeNodesDataAccount.fetch(
         bridgeNodeDataAccountPDA
       );
       console.log(
-        "Total number of registered bridge nodes in BridgeNodesDataAccount:",
+        "Total registered bridge nodes:",
         bridgeNodeData.bridgeNodes.length
       );
 
@@ -397,411 +583,332 @@ console.log("Data PDA initialization completed successfully.");
           } should be registered in BridgeNodesDataAccount`
         );
       });
-    } catch (error) {
-      console.error("Error fetching and verifying bridge node data:", error);
-      throw error;
-    }
-  });
-
-  const serviceRequestIds: string[] = [];
-
-  it("Submits service requests", async () => {
-    const [tempServiceRequestsDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("temp_service_requests_data")],
-        program.programId
-      );
-    console.log(
-      "Found PDA for TempServiceRequestsDataAccount:",
-      tempServiceRequestsDataAccountPDA.toString()
-    );
-
-    const [aggregatedConsensusDataAccountPDA] =
-      await web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("aggregated_consensus_data")],
-        program.programId
-      );
-    console.log(
-      "Found PDA for AggregatedConsensusDataAccount:",
-      aggregatedConsensusDataAccountPDA.toString()
-    );
-
-    const COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING = 0.0001;
-    const lamports =
-      web3.LAMPORTS_PER_SOL * COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
-
-    const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
-    const totalFundingLamports =
-      lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
-
-    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      console.log(
-        `Generating service request ${
-          i + 1
-        } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
-      );
-
-      const endUserKeypair = web3.Keypair.generate();
-      console.log(
-        `Generated new Keypair for end user: ${endUserKeypair.publicKey.toString()}`
-      );
-
-      const transferTransaction = new web3.Transaction().add(
-        web3.SystemProgram.transfer({
-          fromPubkey: adminPublicKey,
-          toPubkey: endUserKeypair.publicKey,
-          lamports: totalFundingLamports,
-        })
-      );
-      await provider.sendAndConfirm(transferTransaction, []);
-      console.log(
-        `Funded end user account with ${totalFundingLamports} lamports`
-      );
-
-      const fileHash = crypto
-        .createHash("sha3-256")
-        .update(`file${i}`)
-        .digest("hex")
-        .substring(0, 6);
-      console.log(`Generated file hash for file${i}: ${fileHash}`);
-
-      const pastelTicketTypeString =
-        Object.keys(PastelTicketTypeEnum)[
-          i % Object.keys(PastelTicketTypeEnum).length
-        ];
-      console.log(`Selected PastelTicketType: ${pastelTicketTypeString}`);
-
-      const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
-      console.log(`Generated IPFS CID: ${ipfsCid}`);
-
-      const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
-      console.log(`Generated random file size: ${fileSizeBytes} bytes`);
-
-      const concatenatedStr =
-        pastelTicketTypeString + fileHash + endUserKeypair.publicKey.toString();
-      const expectedServiceRequestIdHash = crypto
-        .createHash("sha256")
-        .update(concatenatedStr)
-        .digest("hex");
-      const expectedServiceRequestId = expectedServiceRequestIdHash.substring(
-        0,
-        24
-      ); // Adjusted length to 12 bytes hex (24 chars)
-      console.log(`Expected service request ID: ${expectedServiceRequestId}`);
-
-      // Derive the service_request_submission_account PDA
-      const [serviceRequestSubmissionAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("srq"), Buffer.from(expectedServiceRequestId)],
-          program.programId
-        );
-      console.log(
-        `Derived service request submission account PDA: ${serviceRequestSubmissionAccountPDA.toString()}`
-      );
-
-      await program.methods
-        .submitServiceRequest(
-          pastelTicketTypeString,
-          fileHash,
-          ipfsCid,
-          new BN(fileSizeBytes)
-        )
-        .accounts({
-          serviceRequestSubmissionAccount: serviceRequestSubmissionAccountPDA,
-          bridgeContractState: bridgeContractState.publicKey,
-          tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-          aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-          user: endUserKeypair.publicKey, // End user keypair as user
-          systemProgram: web3.SystemProgram.programId,
-        })
-        .signers([endUserKeypair]) // Only endUserKeypair is needed as a signer
-        .rpc();
-      console.log(`Service request ${i + 1} submitted successfully`);
-
-      const serviceRequestSubmissionData =
-        await program.account.serviceRequestSubmissionAccount.fetch(
-          serviceRequestSubmissionAccountPDA
-        );
-      const actualServiceRequestId =
-        serviceRequestSubmissionData.serviceRequest.serviceRequestId;
-      console.log(`Actual service request ID: ${actualServiceRequestId}`);
-
-      assert.equal(
-        actualServiceRequestId,
-        expectedServiceRequestId,
-        `Service Request ID should match the expected value for request ${
-          i + 1
-        }`
-      );
-
-      serviceRequestIds.push(expectedServiceRequestId); // Add this line to push the IDs into the array
-    }
-
-    const tempServiceRequestsData =
-      await program.account.tempServiceRequestsDataAccount.fetch(
-        tempServiceRequestsDataAccountPDA
-      );
-    console.log(
-      "Fetched TempServiceRequestsDataAccount:",
-      tempServiceRequestsDataAccountPDA.toString()
-    );
-    console.log(
-      "Total number of submitted service requests in TempServiceRequestsDataAccount:",
-      tempServiceRequestsData.serviceRequests.length
-    );
-
-    serviceRequestIds.forEach((serviceRequestId, index) => {
-      const isSubmitted = tempServiceRequestsData.serviceRequests.some(
-        (sr) => sr.serviceRequestId === serviceRequestId
-      );
-      console.log(
-        `Verifying service request ${
-          index + 1
-        } with ID: ${serviceRequestId} - ${isSubmitted ? "Found" : "Not Found"}`
-      );
-      assert.isTrue(
-        isSubmitted,
-        `Service Request ${
-          index + 1
-        } should be submitted in TempServiceRequestsDataAccount`
-      );
     });
   });
 
-  it("Submits price quotes for service requests", async () => {
-    const [tempServiceRequestsDataAccountPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("temp_service_requests_data")],
-      program.programId
-    );
-  
-    const [bridgeNodesDataAccountPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("bridge_nodes_data")],
-      program.programId
-    );
-  
-    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      const serviceRequestId = serviceRequestIds[i];
-      const truncatedServiceRequestId = serviceRequestId.substring(0, 24);
-      console.log(`Processing service request ${i + 1}: ${serviceRequestId}`);
-  
-      const [serviceRequestSubmissionAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
-        program.programId
-      );
-  
-      const serviceRequestSubmissionData = await program.account.serviceRequestSubmissionAccount.fetch(
-        serviceRequestSubmissionAccountPDA
-      );
-  
-      const fileSizeBytes = new BN(
-        serviceRequestSubmissionData.serviceRequest.fileSizeBytes
-      ).toNumber();
-      console.log(`File size for service request ${i + 1}: ${fileSizeBytes} bytes`);
-  
-      const baselinePriceLamports = Math.floor(
-        (fileSizeBytes / 1000000) * baselinePriceSol * 1e9
-      );
-      console.log(`Baseline price for service request ${i + 1}: ${baselinePriceLamports} lamports`);
-  
-      const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
-        program.programId
-      );
-  
-      await program.methods
-        .initializeBestPriceQuote(truncatedServiceRequestId)
-        .accounts({
-          bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-          user: provider.wallet.publicKey,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      console.log(`Best price quote account initialized for service request ${i + 1}`);
-  
-      for (let j = 0; j < bridgeNodes.length; j++) {
-        const bridgeNode = bridgeNodes[j];
-        if (!bridgeNode || !bridgeNode.keypair || !bridgeNode.keypair.publicKey) {
-          console.error(`Bridge node ${j + 1} is not defined or does not have a publicKey`);
-          continue;
-        }
-  
-        const quotedPriceLamports = generateRandomPriceQuote(baselinePriceLamports);
-        console.log(`Submitting price quote from bridge node ${j + 1}: ${bridgeNode.keypair.publicKey.toBase58()}`);
-        console.log(`Quoted price: ${quotedPriceLamports.toString()} lamports`);
-  
-        const [priceQuoteSubmissionAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("px_quote"), Buffer.from(truncatedServiceRequestId)],
+  describe("Service Request Handling", () => {
+    it("Submits service requests", async () => {
+      const [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
           program.programId
         );
-  
-        console.log(`Derived priceQuoteSubmissionAccountPDA: ${priceQuoteSubmissionAccountPDA.toBase58()}`);
-  
-        console.log("Account parameters for submitPriceQuote:");
-        console.log(`priceQuoteSubmissionAccount: ${priceQuoteSubmissionAccountPDA.toBase58()}`);
-        console.log(`bridgeContractState: ${bridgeContractState.publicKey.toBase58()}`);
-        console.log(`tempServiceRequestsDataAccount: ${tempServiceRequestsDataAccountPDA.toBase58()}`);
-        console.log(`user: ${bridgeNode.keypair.publicKey.toBase58()}`);
-        console.log(`bridgeNodesDataAccount: ${bridgeNodesDataAccountPDA.toBase58()}`);
-        console.log(`bestPriceQuoteAccount: ${bestPriceQuoteAccountPDA.toBase58()}`);
-  
-        console.log("Method parameters for submitPriceQuote:");
-        console.log(`bridgeNode.pastelId: ${bridgeNode.pastelId}`);
-        console.log(`truncatedServiceRequestId: ${truncatedServiceRequestId}`);
-        console.log(`serviceRequestId: ${serviceRequestId}`);
-        console.log(`quotedPriceLamports: ${quotedPriceLamports.toString()}`);
-  
-        try {
-          await program.methods
-            .submitPriceQuote(
-              bridgeNode.pastelId,
-              serviceRequestId,
-              quotedPriceLamports
-            )
-            .accounts({
-              priceQuoteSubmissionAccount: priceQuoteSubmissionAccountPDA,
-              bridgeContractState: bridgeContractState.publicKey,
-              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-              user: bridgeNode.keypair.publicKey,
-              bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
-              bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-              systemProgram: SystemProgram.programId,
-            })
-            .signers([bridgeNode.keypair])
-            .rpc();
-  
-          console.log(`Price quote for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.keypair.publicKey.toBase58()}`);
-        } catch (error) {
-          console.error(`Error submitting price quote for service request ${i + 1}:`, error);
-          if (error instanceof anchor.AnchorError) {
-            console.error(`Error code: ${error.error.errorCode.number}`);
-            console.error(`Error message: ${error.error.errorMessage}`);
-          }
-          throw error;
-        }
+
+      // Verify account initialization
+      const accountInfo = await provider.connection.getAccountInfo(
+        tempServiceRequestsDataAccountPDA
+      );
+      if (!accountInfo) {
+        throw new Error("Temp service requests account not initialized");
       }
-    }
-  
-    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      const truncatedServiceRequestId = serviceRequestIds[i].substring(0, 24);
-  
-      const [bestPriceQuoteAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
-        program.programId
+
+      // Add null checks for serviceRequestIds
+      if (!serviceRequestIds.length) {
+        throw new Error("No service request IDs available");
+      }
+      console.log(
+        "TempServiceRequestsDataAccount PDA:",
+        tempServiceRequestsDataAccountPDA.toString()
       );
-  
-      const bestPriceQuoteData = await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
-        bestPriceQuoteAccountPDA
+
+      const [aggregatedConsensusDataAccountPDA] =
+        await web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+      console.log(
+        "AggregatedConsensusDataAccount PDA:",
+        aggregatedConsensusDataAccountPDA.toString()
       );
-      console.log(`Best price quotes received for service request ${i + 1}:`, bestPriceQuoteData);
-  
-      const bestQuote = bestPriceQuoteData.serviceRequestId === serviceRequestIds[i];
-      assert.isTrue(
-        bestQuote,
-        `Best price quote should be selected for service request ${i + 1}`
+
+      const lamports =
+        web3.LAMPORTS_PER_SOL *
+        COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
+      const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
+      const totalFundingLamports =
+        lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
+
+      for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+        console.log(
+          `Generating service request ${
+            i + 1
+          } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
+        );
+
+        // Generate and fund end user account
+        const endUserKeypair = web3.Keypair.generate();
+        console.log(`End user address: ${endUserKeypair.publicKey.toString()}`);
+
+        const transferTransaction = new web3.Transaction().add(
+          web3.SystemProgram.transfer({
+            fromPubkey: adminPublicKey,
+            toPubkey: endUserKeypair.publicKey,
+            lamports: totalFundingLamports,
+          })
+        );
+        const transferTxSignature = await provider.sendAndConfirm(
+          transferTransaction,
+          []
+        );
+        await measureComputeUnitsAndStorage(transferTxSignature);
+
+        // Generate request data
+        const fileHash = crypto
+          .createHash("sha3-256")
+          .update(`file${i}`)
+          .digest("hex")
+          .substring(0, 6);
+
+        const pastelTicketTypeString =
+          Object.keys(PastelTicketTypeEnum)[
+            i % Object.keys(PastelTicketTypeEnum).length
+          ];
+
+        const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
+        const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
+
+        // Generate service request ID
+        const concatenatedStr =
+          pastelTicketTypeString +
+          fileHash +
+          endUserKeypair.publicKey.toString();
+        const expectedServiceRequestIdHash = crypto
+          .createHash("sha256")
+          .update(concatenatedStr)
+          .digest("hex");
+        const expectedServiceRequestId = expectedServiceRequestIdHash.substring(
+          0,
+          24
+        );
+
+        // Derive submission account PDA
+        const [serviceRequestSubmissionAccountPDA] =
+          await web3.PublicKey.findProgramAddressSync(
+            [Buffer.from("srq"), Buffer.from(expectedServiceRequestId)],
+            program.programId
+          );
+
+        console.log({
+          fileHash,
+          pastelTicketTypeString,
+          ipfsCid,
+          fileSizeBytes,
+          expectedServiceRequestId,
+          submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
+        });
+
+        // Submit service request
+        const submitTxSignature = await program.methods
+          .submitServiceRequest(
+            pastelTicketTypeString,
+            fileHash,
+            ipfsCid,
+            new BN(fileSizeBytes)
+          )
+          .accounts({
+            serviceRequestSubmissionAccount: serviceRequestSubmissionAccountPDA,
+            bridgeContractState: bridgeContractState.publicKey,
+            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+            user: endUserKeypair.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .signers([endUserKeypair])
+          .rpc();
+
+        await measureComputeUnitsAndStorage(submitTxSignature);
+        console.log(`Service request ${i + 1} submitted successfully`);
+
+        // Verify submission
+        const serviceRequestSubmissionData =
+          await program.account.serviceRequestSubmissionAccount.fetch(
+            serviceRequestSubmissionAccountPDA
+          );
+        const actualServiceRequestId =
+          serviceRequestSubmissionData.serviceRequest.serviceRequestId;
+
+        assert.equal(
+          actualServiceRequestId,
+          expectedServiceRequestId,
+          `Service Request ID should match expected value for request ${i + 1}`
+        );
+
+        serviceRequestIds.push(expectedServiceRequestId);
+      }
+
+      // Verify all submissions in temp storage
+      const tempServiceRequestsData =
+        await program.account.tempServiceRequestsDataAccount.fetch(
+          tempServiceRequestsDataAccountPDA
+        );
+      console.log(
+        "Total submitted service requests:",
+        tempServiceRequestsData.serviceRequests.length
       );
-    }
+
+      serviceRequestIds.forEach((serviceRequestId, index) => {
+        const isSubmitted = tempServiceRequestsData.serviceRequests.some(
+          (sr) => sr.serviceRequestId === serviceRequestId
+        );
+        console.log(
+          `Service request ${index + 1} status:`,
+          `ID: ${serviceRequestId}`,
+          `Found: ${isSubmitted ? "Yes" : "No"}`
+        );
+        assert.isTrue(
+          isSubmitted,
+          `Service Request ${
+            index + 1
+          } should be in TempServiceRequestsDataAccount`
+        );
+      });
+    });
   });
-  
+
+  describe("Price Quote Management", () => {
+    it("Submits and manages price quotes", async () => {
+      assert.ok(
+        serviceRequestIds.length > 0,
+        "No service request IDs available"
+      );
+
+      const [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
+        );
+
+      const [bridgeNodesDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_nodes_data")],
+          program.programId
+        );
+
+      for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+        const serviceRequestId = serviceRequestIds[i];
+        if (!serviceRequestId) {
+          console.log(`Skipping invalid service request ID at index ${i}`);
+          continue;
+        }
+        const truncatedServiceRequestId = serviceRequestId.substring(0, 24);
+
+        console.log(`Processing service request ${i + 1}: ${serviceRequestId}`);
+
+        // Get service request data
+        const [serviceRequestSubmissionAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
+            program.programId
+          );
+
+        const serviceRequestSubmissionData =
+          await program.account.serviceRequestSubmissionAccount.fetch(
+            serviceRequestSubmissionAccountPDA
+          );
+
+        const fileSizeBytes = new BN(
+          serviceRequestSubmissionData.serviceRequest.fileSizeBytes
+        ).toNumber();
+
+        const baselinePriceLamports = Math.floor(
+          (fileSizeBytes / 1000000) * baselinePriceSol * 1e9
+        );
+
+        // Initialize best price quote account
+        const [bestPriceQuoteAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
+            program.programId
+          );
+
+        const initQuoteTxSignature = await program.methods
+          .initializeBestPriceQuote(truncatedServiceRequestId)
+          .accounts({
+            bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+            user: provider.wallet.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc();
+
+        await measureComputeUnitsAndStorage(initQuoteTxSignature);
+
+        // Submit quotes from each bridge node
+        for (let j = 0; j < bridgeNodes.length; j++) {
+          const bridgeNode = bridgeNodes[j];
+          if (!bridgeNode?.keypair?.publicKey) {
+            console.error(`Invalid bridge node at index ${j}`);
+            continue;
+          }
+
+          const quotedPriceLamports = generateRandomPriceQuote(
+            baselinePriceLamports
+          );
+          console.log(
+            `Quote from bridge node ${j + 1}:`,
+            `Address: ${bridgeNode.keypair.publicKey.toBase58()}`,
+            `Price: ${quotedPriceLamports.toString()}`
+          );
+
+          const [priceQuoteSubmissionAccountPDA] =
+            await PublicKey.findProgramAddressSync(
+              [Buffer.from("px_quote"), Buffer.from(truncatedServiceRequestId)],
+              program.programId
+            );
+
+          try {
+            const submitQuoteTxSignature = await program.methods
+              .submitPriceQuote(
+                bridgeNode.pastelId,
+                serviceRequestId,
+                quotedPriceLamports
+              )
+              .accounts({
+                priceQuoteSubmissionAccount: priceQuoteSubmissionAccountPDA,
+                bridgeContractState: bridgeContractState.publicKey,
+                tempServiceRequestsDataAccount:
+                  tempServiceRequestsDataAccountPDA,
+                user: bridgeNode.keypair.publicKey,
+                bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
+                bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+                systemProgram: SystemProgram.programId,
+              })
+              .signers([bridgeNode.keypair])
+              .rpc();
+
+            await measureComputeUnitsAndStorage(submitQuoteTxSignature);
+            console.log(
+              `Price quote submitted successfully for service request ${i + 1}`
+            );
+          } catch (error) {
+            console.error(
+              `Error submitting price quote for service request ${i + 1}:`,
+              error
+            );
+            if (error instanceof anchor.AnchorError) {
+              console.error(`Error code: ${error.error.errorCode.number}`);
+              console.error(`Error message: ${error.error.errorMessage}`);
+            }
+            throw error;
+          }
+        }
+
+        // Verify best price quote selection
+        const bestPriceQuoteData =
+          await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+            bestPriceQuoteAccountPDA
+          );
+        console.log(
+          `Best price quote data for request ${i + 1}:`,
+          bestPriceQuoteData
+        );
+
+        const bestQuote =
+          bestPriceQuoteData.serviceRequestId === serviceRequestIds[i];
+        assert.isTrue(
+          bestQuote,
+          `Best price quote should be selected for service request ${i + 1}`
+        );
+      }
+    });
+  });
 });
-
-//   // Submit Pastel TxIDs
-//   it("Submits Pastel TxIDs for service requests", async () => {
-//     // Find the PDA for the TempServiceRequestsDataAccount
-//     const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("temp_service_requests_data")],
-//       program.programId
-//     );
-
-//     // Find the PDA for the ServiceRequestTxidMappingDataAccount
-//     const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("service_request_txid_map")],
-//       program.programId
-//     );
-
-//     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-//       const serviceRequestId = serviceRequestIds[i];
-//       const bridgeNode = bridgeNodes[i % bridgeNodes.length];
-//       const pastelTxid = crypto.randomBytes(32).toString('hex'); // Generate a random Pastel TxID
-
-//       // Submit the Pastel TxID
-//       await program.methods
-//         .submitPastelTxid(serviceRequestId, pastelTxid)
-//         .accounts({
-//           serviceRequestSubmissionAccount: web3.Keypair.generate().publicKey,
-//           bridgeContractState: bridgeContractState.publicKey,
-//           bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
-//           serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
-//           systemProgram: web3.SystemProgram.programId,
-//         })
-//         .signers([bridgeNode])
-//         .rpc();
-
-//       console.log(`Pastel TxID for service request ${i + 1} submitted successfully by bridge node ${bridgeNode.publicKey.toBase58()}`);
-//     }
-
-//     // Fetch the ServiceRequestTxidMappingDataAccount to verify the TxIDs are submitted
-//     const serviceRequestTxidMappingData = await program.account.serviceRequestTxidMappingDataAccount.fetch(
-//       serviceRequestTxidMappingDataAccountPDA
-//     );
-//     console.log(
-//       "Total number of submitted Pastel TxIDs in ServiceRequestTxidMappingDataAccount:",
-//       serviceRequestTxidMappingData.mappings.length
-//     );
-
-//     // Verify each Pastel TxID is submitted in ServiceRequestTxidMappingDataAccount
-//     serviceRequestIds.forEach((serviceRequestId, index) => {
-//       const isSubmitted = serviceRequestTxidMappingData.mappings.some((mapping) =>
-//         mapping.serviceRequestId === serviceRequestId
-//       );
-//       assert.isTrue(
-//         isSubmitted,
-//         `Pastel TxID for Service Request ${
-//           index + 1
-//         } should be submitted in ServiceRequestTxidMappingDataAccount`
-//       );
-//     });
-//   });
-
-//   const adminKeypair = (provider.wallet as anchor.Wallet).payer;
-
-//   // Access Oracle Data
-//   it("Accesses Oracle data and handles post-transaction tasks", async () => {
-//     // Find the PDA for the AggregatedConsensusDataAccount
-//     const [aggregatedConsensusDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("aggregated_consensus_data")],
-//       program.programId
-//     );
-
-//     // Find the PDA for the ServiceRequestTxidMappingDataAccount
-//     const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
-//       [Buffer.from("service_request_txid_map")],
-//       program.programId
-//     );
-
-//     // Fetch aggregated consensus data for each service request
-//     for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-//       const serviceRequestId = serviceRequestIds[i];
-//       const txid = trackedTxids[i];
-
-//       // Access the Oracle data
-//       await program.methods
-//         .processOracleData(txid, serviceRequestId)
-//         .accounts({
-//           aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-//           serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
-//           tempServiceRequestsDataAccount: web3.Keypair.generate().publicKey,
-//           bridgeContractState: bridgeContractState.publicKey,
-//           bridgeNodesDataAccount: web3.Keypair.generate().publicKey,
-//           bridgeRewardPoolAccount: web3.Keypair.generate().publicKey,
-//           bridgeEscrowAccount: web3.Keypair.generate().publicKey,
-//           userAccount: admin.publicKey,
-//           systemProgram: web3.SystemProgram.programId,
-//         })
-//         .signers([adminKeypair]) // Use the payer from the provider's wallet
-//         .rpc();
-
-//       console.log(`Oracle data accessed and post-transaction tasks handled for service request ${i + 1} and TxID ${txid}`);
-//     }
-//   });
-
-// });
