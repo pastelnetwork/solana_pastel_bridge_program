@@ -374,10 +374,10 @@ pub struct AggregatedConsensusDataAccount {
     pub consensus_data: Vec<AggregatedConsensusData>,
 }
 
-// Main bridge contract state account that holds all the data for the bridge contract
+// First stage initialization accounts
 #[derive(Accounts)]
 #[instruction(admin_pubkey: Pubkey)]
-pub struct Initialize<'info> {
+pub struct InitializeBase<'info> {
     #[account(
         init,
         payer = user,
@@ -399,12 +399,23 @@ pub struct Initialize<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     
+    pub system_program: Program<'info, System>,
+}
+// Split PDAs into core accounts
+#[derive(Accounts)]
+pub struct InitializeCorePDAs<'info> {
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    
+    #[account(mut)]
+    pub user: Signer<'info>,
+
     #[account(
         init,
         seeds = [b"bridge_reward_pool_account"],
         bump,
         payer = user,
-        space = 8  // Just discriminator since it only holds SOL
+        space = 8
     )]
     pub bridge_reward_pool_account: Account<'info, BridgeRewardPoolAccount>,
     
@@ -413,7 +424,7 @@ pub struct Initialize<'info> {
         seeds = [b"reg_fee_receiving_account"],
         bump,
         payer = user,
-        space = 8  // Just discriminator since it only holds SOL
+        space = 8
     )]
     pub reg_fee_receiving_account: Account<'info, RegFeeReceivingAccount>,
 
@@ -422,36 +433,28 @@ pub struct Initialize<'info> {
         seeds = [b"bridge_escrow_account"],
         bump,
         payer = user,
-        space = 8  // Just discriminator since it only holds SOL
+        space = 8
     )]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+// Data accounts in separate initialization
+#[derive(Accounts)]
+pub struct InitializeDataPDAs<'info> {
+    #[account(mut)]
+    pub bridge_contract_state: Account<'info, BridgeContractState>,
+    
+    #[account(mut)]
+    pub user: Signer<'info>,
 
     #[account(
         init,
         seeds = [b"bridge_nodes_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-        4 + // Vec length prefix
-        1000 * (
-            32 + // pastel_id (String overhead + max length)
-            32 + // reward_address
-            32 + // bridge_node_psl_address (String overhead + max length)
-            64 + // registration_entrance_fee_transaction_signature (String overhead + max length)
-            8 + // compliance_score (fixed point u64)
-            8 + // reliability_score (fixed point u64)
-            8 + // last_active_timestamp
-            4 + // total_price_quotes_submitted
-            4 + // total_service_requests_attempted
-            4 + // successful_service_requests_count
-            4 + // current_streak
-            4 + // failed_service_requests_count
-            8 + // ban_expiry
-            1 + // is_eligible_for_rewards
-            1 + // is_recently_active
-            1 + // is_reliable
-            1   // is_banned
-        )
+        space = 8 + 4 + 1000 * (32 + 32 + 32 + 64 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 1 + 1 + 1 + 1)
     )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
@@ -460,24 +463,7 @@ pub struct Initialize<'info> {
         seeds = [b"temp_service_requests_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-        4 + // Vec length prefix
-        1000 * (
-            32 + // service_request_id
-            1 + // service_type enum
-            12 + // first_6_characters_hash
-            64 + // ipfs_cid
-            8 + // file_size_bytes
-            32 + // user_sol_address
-            1 + // status enum
-            1 + // payment_in_escrow
-            8 + // request_expiry
-            9 + // Optional timestamps (8 bytes each)
-            32 + // selected_bridge_node_pastelid
-            8 + // best_quoted_price
-            16 + // Optional amount fields (8 bytes each)
-            32   // Optional pastel_txid
-        )
+        space = 8 + 4 + 1000 * (32 + 1 + 12 + 64 + 8 + 32 + 1 + 1 + 8 + 9 + 32 + 8 + 16 + 32)
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
@@ -486,15 +472,7 @@ pub struct Initialize<'info> {
         seeds = [b"aggregated_consensus_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-        4 + // Vec length prefix
-        1000 * (
-            32 + // txid
-            16 + // status_weights array
-            200 + // hash_weights vector (estimated max size)
-            12 + // first_6_characters_hash
-            8    // last_updated
-        )
+        space = 8 + 4 + 1000 * (32 + 16 + 200 + 12 + 8)
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -503,63 +481,13 @@ pub struct Initialize<'info> {
         seeds = [b"service_request_txid_map"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-        4 + // Vec length prefix
-        1000 * (
-            32 + // service_request_id
-            64   // pastel_txid
-        )
+        space = 8 + 4 + 1000 * (32 + 64)
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 
     pub system_program: Program<'info, System>,
 }
 
-impl<'info> Initialize<'info> {
-    pub fn initialize_bridge_state(&mut self, admin_pubkey: Pubkey) -> Result<()> {
-        msg!("Setting up Bridge Contract State");
-
-        let state = &mut self.bridge_contract_state;
-        // Ensure the bridge_contract_state is not already initialized
-        if state.is_initialized {
-            return err!(BridgeError::ContractStateAlreadyInitialized);
-        }
-        state.is_initialized = true;
-        state.is_paused = false;
-        state.admin_pubkey = admin_pubkey;
-        msg!("Admin Pubkey set to: {:?}", admin_pubkey);
-
-        // Link to necessary PDAs
-        state.bridge_reward_pool_account_pubkey = self.bridge_reward_pool_account.key();
-        state.bridge_escrow_account_pubkey = self.bridge_escrow_account.key();
-        state.bridge_nodes_data_account_pubkey = self.bridge_nodes_data_account.key();
-        state.temp_service_requests_data_account_pubkey = self.temp_service_requests_data_account.key();
-        state.aggregated_consensus_data_account_pubkey = self.aggregated_consensus_data_account.key();
-        state.reg_fee_receiving_account_pubkey = self.reg_fee_receiving_account.key();
-
-        state.oracle_contract_pubkey = Pubkey::default();
-        msg!("Oracle Contract Pubkey set to default");
-        
-        // Initialize bridge nodes data PDA
-        let bridge_nodes_data_account = &mut self.bridge_nodes_data_account;
-        bridge_nodes_data_account.bridge_nodes = Vec::new();
-
-        // Initialize temporary service requests data PDA
-        let temp_service_requests_data_account = &mut self.temp_service_requests_data_account;
-        temp_service_requests_data_account.service_requests = Vec::new();
-
-        // Initialize aggregated consensus data PDA
-        let aggregated_consensus_data_account = &mut self.aggregated_consensus_data_account;
-        aggregated_consensus_data_account.consensus_data = Vec::new();
-
-        // Initialize service request TXID mapping data PDA
-        let service_request_txid_mapping_data_account = &mut self.service_request_txid_mapping_data_account;
-        service_request_txid_mapping_data_account.mappings = Vec::new();
-    
-        msg!("Bridge Contract State Initialization Complete");
-        Ok(())
-    }
-}
 #[derive(Accounts)]
 pub struct ReallocateBridgeState<'info> {
     #[account(mut, has_one = admin_pubkey @ BridgeError::UnauthorizedWithdrawalAccount)]
@@ -2044,26 +1972,61 @@ declare_id!("Ew8ohkPJ3JnWoZ3MWvkn86wYMRJkS385Bsis9TwQJo79");
 #[program]
 pub mod solana_pastel_bridge_program {
     use super::*;
+    pub fn initialize_base(ctx: Context<InitializeBase>, admin_pubkey: Pubkey) -> Result<()> {
+        msg!("Initializing Bridge Contract Base State");
 
-    pub fn initialize(ctx: Context<Initialize>, admin_pubkey: Pubkey) -> Result<()> {
-        msg!("Initializing Bridge Contract State");
+        let state = &mut ctx.accounts.bridge_contract_state;
+        state.is_initialized = true;
+        state.is_paused = false;
+        state.admin_pubkey = admin_pubkey;
+        state.oracle_contract_pubkey = Pubkey::default();
 
-        // Call the initialize_bridge_state method from the Initialize implementation
-        ctx.accounts.initialize_bridge_state(admin_pubkey)?;
-
-        msg!("Bridge Contract State Initialized with Admin Pubkey: {:?}", admin_pubkey);
-
-        // Logging PDAs for confirmation
-        msg!("Bridge Reward Pool Account PDA: {:?}", ctx.accounts.bridge_reward_pool_account.key());
-        msg!("Bridge Escrow Account PDA: {:?}", ctx.accounts.bridge_escrow_account.key());
-        msg!("Bridge Nodes Data Account PDA: {:?}", ctx.accounts.bridge_nodes_data_account.key());
-        msg!("Temporary Service Requests Data Account PDA: {:?}", ctx.accounts.temp_service_requests_data_account.key());
-        msg!("Aggregated Consensus Data Account PDA: {:?}", ctx.accounts.aggregated_consensus_data_account.key());
-        msg!("Service Request Txid Mapping Data Account PDA: {:?}", ctx.accounts.service_request_txid_mapping_data_account.key());
-
+        msg!("Bridge Contract Base State Initialized with Admin Pubkey: {:?}", admin_pubkey);
         Ok(())
     }
 
+    pub fn initialize_core_pdas(ctx: Context<InitializeCorePDAs>) -> Result<()> {
+        msg!("Initializing Core PDAs");
+
+        let state = &mut ctx.accounts.bridge_contract_state;
+        
+        // Link core PDAs
+        state.bridge_reward_pool_account_pubkey = ctx.accounts.bridge_reward_pool_account.key();
+        state.bridge_escrow_account_pubkey = ctx.accounts.bridge_escrow_account.key();
+        state.reg_fee_receiving_account_pubkey = ctx.accounts.reg_fee_receiving_account.key();
+
+        msg!("Core PDAs Initialized Successfully");
+        Ok(())
+    }
+
+    pub fn initialize_data_pdas(ctx: Context<InitializeDataPDAs>) -> Result<()> {
+        msg!("Initializing Data PDAs");
+
+        let state = &mut ctx.accounts.bridge_contract_state;
+        
+        // Link data PDAs
+        state.bridge_nodes_data_account_pubkey = ctx.accounts.bridge_nodes_data_account.key();
+        state.temp_service_requests_data_account_pubkey = ctx.accounts.temp_service_requests_data_account.key();
+        state.aggregated_consensus_data_account_pubkey = ctx.accounts.aggregated_consensus_data_account.key();
+        state.service_request_txid_mapping_account_pubkey = ctx.accounts.service_request_txid_mapping_data_account.key();
+
+        // Initialize data structures
+        let bridge_nodes_data_account = &mut ctx.accounts.bridge_nodes_data_account;
+        bridge_nodes_data_account.bridge_nodes = Vec::new();
+
+        let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
+        temp_service_requests_data_account.service_requests = Vec::new();
+
+        let aggregated_consensus_data_account = &mut ctx.accounts.aggregated_consensus_data_account;
+        aggregated_consensus_data_account.consensus_data = Vec::new();
+
+        let service_request_txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
+        service_request_txid_mapping_data_account.mappings = Vec::new();
+
+        msg!("Data PDAs Initialized Successfully");
+        Ok(())
+    }
+    
     pub fn reallocate_bridge_state(ctx: Context<ReallocateBridgeState>) -> Result<()> {
         ReallocateBridgeState::execute(ctx)
     }

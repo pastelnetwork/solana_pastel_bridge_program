@@ -120,175 +120,168 @@ const PastelTicketTypeEnum = {
 console.log("Program ID:", programID.toString());
 console.log("Admin ID:", adminPublicKey.toString());
 
-describe("Solana Pastel Bridge Program Tests", () => {
-  it("Initializes and expands the bridge contract state", async () => {
-    try {
-      console.log("Starting PDA generation...");
+it("Initializes and expands the bridge contract state", async () => {
+  try {
+    console.log("Starting PDA generation...");
 
-      const [rewardPoolAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_reward_pool_account")],
-          program.programId
-        );
-      console.log("RewardPoolAccount PDA:", rewardPoolAccountPDA.toBase58());
+    const [rewardPoolAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("bridge_reward_pool_account")],
+      program.programId
+    );
+    console.log("RewardPoolAccount PDA:", rewardPoolAccountPDA.toBase58());
 
-      const [feeReceivingContractAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_escrow_account")],
-          program.programId
-        );
+    const [feeReceivingContractAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("bridge_escrow_account")],
+      program.programId
+    );
+    console.log("FeeReceivingContractAccount PDA:", feeReceivingContractAccountPDA.toBase58());
+
+    const [bridgeNodeDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("bridge_nodes_data")],
+      program.programId
+    );
+    console.log("BridgeNodeDataAccount PDA:", bridgeNodeDataAccountPDA.toBase58());
+
+    const [serviceRequestTxidMappingDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("service_request_txid_map")],
+      program.programId
+    );
+    console.log("ServiceRequestTxidMappingDataAccount PDA:", serviceRequestTxidMappingDataAccountPDA.toBase58());
+
+    const [aggregatedConsensusDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("aggregated_consensus_data")],
+      program.programId
+    );
+    console.log("AggregatedConsensusDataAccount PDA:", aggregatedConsensusDataAccountPDA.toBase58());
+
+    const [tempServiceRequestsDataAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("temp_service_requests_data")],
+      program.programId
+    );
+    console.log("TempServiceRequestsDataAccount PDA:", tempServiceRequestsDataAccountPDA.toBase58());
+
+    const [regFeeReceivingAccountPDA] = await web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("reg_fee_receiving_account")],
+      program.programId
+    );
+    console.log("RegFeeReceivingAccount PDA:", regFeeReceivingAccountPDA.toBase58());
+
+    const minBalanceForRentExemption = await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
+    console.log("Minimum Balance for Rent Exemption:", minBalanceForRentExemption);
+
+    // Fund the bridge contract state account
+    const fundTx = new anchor.web3.Transaction().add(
+      anchor.web3.SystemProgram.transfer({
+        fromPubkey: adminPublicKey,
+        toPubkey: bridgeContractState.publicKey,
+        lamports: minBalanceForRentExemption,
+      })
+    );
+    await provider.sendAndConfirm(fundTx, []);
+    console.log("Bridge Contract State account funded successfully.");
+
+// First stage: Initialize base contract state
+console.log("Starting base initialization...");
+await program.methods
+  .initializeBase(adminPublicKey)
+  .accounts({
+    bridgeContractState: bridgeContractState.publicKey,
+    user: adminPublicKey,
+    systemProgram: web3.SystemProgram.programId,
+  })
+  .signers([bridgeContractState])
+  .rpc();
+console.log("Base initialization completed successfully.");
+
+// Second stage: Initialize core PDAs
+console.log("Starting core PDA initialization...");
+await program.methods
+  .initializeCorePdas()
+  .accounts({
+    bridgeContractState: bridgeContractState.publicKey,
+    user: adminPublicKey,
+    bridgeRewardPoolAccount: rewardPoolAccountPDA,
+    bridgeEscrowAccount: feeReceivingContractAccountPDA,
+    regFeeReceivingAccount: regFeeReceivingAccountPDA,
+    systemProgram: web3.SystemProgram.programId,
+  })
+  .rpc();
+console.log("Core PDA initialization completed successfully.");
+
+// Third stage: Initialize data PDAs
+console.log("Starting data PDA initialization...");
+await program.methods
+  .initializeDataPdas()
+  .accounts({
+    bridgeContractState: bridgeContractState.publicKey,
+    user: adminPublicKey,
+    bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+    tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+    serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
+    aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+    systemProgram: web3.SystemProgram.programId,
+  })
+  .rpc();
+console.log("Data PDA initialization completed successfully.");
+
+    // Verify initialization
+    let state = await program.account.bridgeContractState.fetch(
+      bridgeContractState.publicKey
+    );
+    console.log("Bridge Contract State fetched.");
+
+    assert.ok(
+      state.isInitialized,
+      "Bridge Contract State should be initialized after first init"
+    );
+    assert.equal(
+      state.adminPubkey.toString(),
+      adminPublicKey.toString(),
+      "Admin public key should match after first init"
+    );
+    console.log("Initial assertions passed.");
+
+    // Handle reallocation
+    let currentSize = 10_240;
+
+    while (currentSize < maxSize) {
       console.log(
-        "FeeReceivingContractAccount PDA:",
-        feeReceivingContractAccountPDA.toBase58()
+        `Expanding Bridge Contract State size from ${currentSize} to ${
+          currentSize + 10_240
+        }`
       );
-
-      const [bridgeNodeDataAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_nodes_data")],
-          program.programId
-        );
-      console.log(
-        "BridgeNodeDataAccount PDA:",
-        bridgeNodeDataAccountPDA.toBase58()
-      );
-
-      const [serviceRequestTxidMappingDataAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("service_request_txid_map")],
-          program.programId
-        );
-      console.log(
-        "ServiceRequestTxidMappingDataAccount PDA:",
-        serviceRequestTxidMappingDataAccountPDA.toBase58()
-      );
-
-      const [aggregatedConsensusDataAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("aggregated_consensus_data")],
-          program.programId
-        );
-      console.log(
-        "AggregatedConsensusDataAccount PDA:",
-        aggregatedConsensusDataAccountPDA.toBase58()
-      );
-
-      const [tempServiceRequestsDataAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("temp_service_requests_data")],
-          program.programId
-        );
-      console.log(
-        "TempServiceRequestsDataAccount PDA:",
-        tempServiceRequestsDataAccountPDA.toBase58()
-      );
-
-      const [regFeeReceivingAccountPDA] =
-        await web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("reg_fee_receiving_account")],
-          program.programId
-        );
-      console.log(
-        "RegFeeReceivingAccount PDA:",
-        regFeeReceivingAccountPDA.toBase58()
-      );
-
-      const minBalanceForRentExemption =
-        await provider.connection.getMinimumBalanceForRentExemption(100 * 1024); // 100KB
-      console.log(
-        "Minimum Balance for Rent Exemption:",
-        minBalanceForRentExemption
-      );
-
-      const fundTx = new anchor.web3.Transaction().add(
-        anchor.web3.SystemProgram.transfer({
-          fromPubkey: adminPublicKey,
-          toPubkey: bridgeContractState.publicKey,
-          lamports: minBalanceForRentExemption,
-        })
-      );
-      await provider.sendAndConfirm(fundTx, []);
-      console.log("Bridge Contract State account funded successfully.");
-
       await program.methods
-        .initialize(adminPublicKey)
+        .reallocateBridgeState()
         .accounts({
           bridgeContractState: bridgeContractState.publicKey,
-          bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-          user: adminPublicKey,
-          bridgeRewardPoolAccount: rewardPoolAccountPDA,
-          bridgeEscrowAccount: feeReceivingContractAccountPDA,
+          adminPubkey: adminPublicKey,
           tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-          serviceRequestTxidMappingDataAccount:
-            serviceRequestTxidMappingDataAccountPDA,
+          bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+          serviceRequestTxidMappingDataAccount: serviceRequestTxidMappingDataAccountPDA,
           aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-          regFeeReceivingAccount: regFeeReceivingAccountPDA,
           systemProgram: web3.SystemProgram.programId,
         })
-        .signers([bridgeContractState])
         .rpc();
-      console.log("Bridge Contract State initialized successfully.");
 
-      let state = await program.account.bridgeContractState.fetch(
+      currentSize += 10_240;
+      state = await program.account.bridgeContractState.fetch(
         bridgeContractState.publicKey
       );
-      console.log("Bridge Contract State fetched.");
 
-      assert.ok(
-        state.isInitialized,
-        "Bridge Contract State should be initialized after first init"
-      );
-      assert.equal(
-        state.adminPubkey.toString(),
-        adminPublicKey.toString(),
-        "Admin public key should match after first init"
-      );
-      console.log("Initial assertions passed.");
-
-      let currentSize = 10_240;
-
-      while (currentSize < maxSize) {
-        console.log(
-          `Expanding Bridge Contract State size from ${currentSize} to ${
-            currentSize + 10_240
-          }`
-        );
-        await program.methods
-          .reallocateBridgeState()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            adminPubkey: adminPublicKey,
-            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-            serviceRequestTxidMappingDataAccount:
-              serviceRequestTxidMappingDataAccountPDA,
-            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-            systemProgram: web3.SystemProgram.programId,
-          })
-          .rpc();
-
-        currentSize += 10_240;
-        state = await program.account.bridgeContractState.fetch(
-          bridgeContractState.publicKey
-        );
-
-        console.log(
-          `Bridge Contract State size after expansion: ${currentSize}`
-        );
-      }
-
-      assert.equal(
-        currentSize,
-        maxSize,
-        "Bridge Contract State should reach the maximum size"
-      );
-      console.log(
-        "Bridge Contract State expanded to the maximum size successfully"
-      );
-    } catch (error) {
-      console.error("Error encountered:", error);
-      throw error;
+      console.log(`Bridge Contract State size after expansion: ${currentSize}`);
     }
-  });
+
+    assert.equal(
+      currentSize,
+      maxSize,
+      "Bridge Contract State should reach the maximum size"
+    );
+    console.log("Bridge Contract State expanded to the maximum size successfully");
+  } catch (error) {
+    console.error("Error encountered:", error);
+    throw error;
+  }
+});
 
   it("Registers new bridge nodes", async () => {
     const [bridgeRewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
