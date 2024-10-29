@@ -532,9 +532,27 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"bridge_nodes_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-               4 + // Vec length
-               10 * (32 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 1 + 1 + 1 + 1)
+        space = 8 +  // Discriminator
+                4 +  // Vec length
+                10 * (
+                    64 +    // pastel_id (String ~32 chars)
+                    32 +    // reward_address
+                    64 +    // bridge_node_psl_address (String ~32 chars)
+                    64 +    // registration_entrance_fee_transaction_signature
+                    8 +     // compliance_score
+                    8 +     // reliability_score
+                    8 +     // last_active_timestamp
+                    4 +     // total_price_quotes_submitted
+                    4 +     // total_service_requests_attempted
+                    4 +     // successful_service_requests_count
+                    4 +     // current_streak
+                    4 +     // failed_service_requests_count
+                    8 +     // ban_expiry
+                    1 +     // is_eligible_for_rewards
+                    1 +     // is_recently_active
+                    1 +     // is_reliable
+                    1       // is_banned
+                )
     )]
     pub bridge_nodes_data_account: Account<'info, BridgeNodesDataAccount>,
 
@@ -543,9 +561,24 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"temp_service_requests_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-               4 + // Vec length
-               10 * (32 + 1 + 12 + 64 + 8 + 32 + 1 + 1 + 8 + 9 + 32 + 8 + 16 + 32)
+        space = 8 +  // Discriminator
+                4 +  // Vec length
+                10 * (
+                    32 +    // service_request_id
+                    1 +     // service_type
+                    8 +     // first_6_characters_of_hash (String)
+                    64 +    // ipfs_cid (String)
+                    8 +     // file_size_bytes
+                    32 +    // user_sol_address
+                    1 +     // status
+                    1 +     // payment_in_escrow
+                    8 +     // request_expiry
+                    8 +     // sol_received_timestamp
+                    64 +    // selected_bridge_node_pastelid
+                    8 +     // best_quoted_price
+                    8 * 6 + // various timestamps (6 of them)
+                    64      // pastel_txid
+                )
     )]
     pub temp_service_requests_data_account: Account<'info, TempServiceRequestsDataAccount>,
 
@@ -554,9 +587,15 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"aggregated_consensus_data"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-               4 + // Vec length
-               10 * (32 + 16 + 100 + 12 + 8) // Reduced size for initial allocation
+        space = 8 +  // Discriminator
+                4 +  // Vec length
+                10 * (
+                    64 +    // txid
+                    16 +    // status_weights
+                    256 +   // hash_weights vec
+                    8 +     // first_6_characters_hash
+                    8       // last_updated
+                )
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
 
@@ -565,9 +604,12 @@ pub struct InitializeDataPDAs<'info> {
         seeds = [b"service_request_txid_map"],
         bump,
         payer = user,
-        space = 8 + // Discriminator
-               4 + // Vec length
-               10 * (32 + 64) // Reduced size for initial allocation
+        space = 8 +  // Discriminator
+                4 +  // Vec length
+                10 * (
+                    32 +    // service_request_id
+                    64      // pastel_txid
+                )
     )]
     pub service_request_txid_mapping_data_account: Account<'info, ServiceRequestTxidMappingDataAccount>,
 

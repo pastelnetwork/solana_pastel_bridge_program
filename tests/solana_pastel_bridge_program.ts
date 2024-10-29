@@ -197,6 +197,17 @@ describe("Solana Pastel Bridge Tests", () => {
   describe("Initialization", () => {
     it("Initializes and expands the bridge contract state", async () => {
       try {
+        // Set up compute budget for all transactions
+        const modifyComputeBudgetIx =
+          web3.ComputeBudgetProgram.setComputeUnitLimit({
+            units: 1_400_000,
+          });
+
+        const modifyComputePriceIx =
+          web3.ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: 50,
+          });
+
         console.log("Starting PDA generation...");
 
         // Generate PDAs with proper seeds
@@ -254,104 +265,177 @@ describe("Solana Pastel Bridge Tests", () => {
           regFeeReceivingAccountPDA: regFeeReceivingAccountPDA.toBase58(),
         });
 
-        // Calculate initial rent for bridge contract state
-        const minBalanceForRentExemption =
-          await provider.connection.getMinimumBalanceForRentExemption(
-            ACCOUNT_SIZES.BASE_STATE
-          );
+        // Calculate initial rent exemption for all accounts
+        const connection = provider.connection;
+        const rent = await connection.getMinimumBalanceForRentExemption(
+          ACCOUNT_SIZES.BASE_STATE + 1024 // Adding buffer for safety
+        );
 
-        // Fund bridge contract state account
-        const fundTx = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: adminPublicKey,
+        // Fund the bridge contract state account
+        const fundTx = new web3.Transaction().add(
+          web3.SystemProgram.transfer({
+            fromPubkey: provider.wallet.publicKey,
             toPubkey: bridgeContractState.publicKey,
-            lamports: minBalanceForRentExemption * 2, // Double the minimum for safety
+            lamports: rent * 2, // Double the minimum for safety
           })
         );
 
         const fundTxSignature = await provider.sendAndConfirm(fundTx);
         await confirmTransaction(fundTxSignature);
+        console.log("Bridge contract state funded");
 
-        // Initialize base state with increased compute budget
+        // Initialize base state
         console.log("Starting base initialization...");
-        const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-          units: COMPUTE_UNITS_PER_TX,
-        });
-
         const initBaseTx = await program.methods
-          .initializeBase(adminPublicKey)
+          .initializeBase(provider.wallet.publicKey)
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
-            systemProgram: SystemProgram.programId,
+            user: provider.wallet.publicKey,
+            systemProgram: web3.SystemProgram.programId,
           })
-          .preInstructions([modifyComputeBudgetIx])
+          .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
           .signers([bridgeContractState])
           .rpc({ skipPreflight: true });
 
         await confirmTransaction(initBaseTx);
         console.log("Base initialization complete");
 
-        // Initialize core PDAs with proper space allocation
-        await sleep(OPERATION_DELAY);
-        console.log("Starting core PDA initialization...");
+        // Add delay between transactions
+        await sleep(2000);
 
+        // Initialize core PDAs
+        console.log("Starting core PDA initialization...");
         const initCorePDAsTx = await program.methods
           .initializeCorePdas()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             bridgeRewardPoolAccount: rewardPoolAccountPDA,
             bridgeEscrowAccount: bridgeEscrowAccountPDA,
             regFeeReceivingAccount: regFeeReceivingAccountPDA,
-            systemProgram: SystemProgram.programId,
+            systemProgram: web3.SystemProgram.programId,
           })
-          .preInstructions([modifyComputeBudgetIx])
+          .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
           .rpc({ skipPreflight: true });
 
         await confirmTransaction(initCorePDAsTx);
         console.log("Core PDAs initialization complete");
 
-        // Initialize data PDAs with calculated space
-        await sleep(OPERATION_DELAY);
-        console.log("Starting data PDA initialization...");
+        // Add delay between transactions
+        await sleep(2000);
 
+        // Initialize data PDAs
+        console.log("Starting data PDA initialization...");
         const initDataPDAsTx = await program.methods
           .initializeDataPdas()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
             tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
             serviceRequestTxidMappingDataAccount:
               serviceRequestTxidMappingDataAccountPDA,
             aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-            systemProgram: SystemProgram.programId,
+            systemProgram: web3.SystemProgram.programId,
           })
-          .preInstructions([modifyComputeBudgetIx])
-          .rpc({ skipPreflight: true });
+          .preInstructions([modifyComputeBudgetIx, modifyComputePriceIx])
+          .rpc({
+            skipPreflight: true,
+            commitment: "confirmed",
+          });
 
-        await confirmTransaction(initDataPDAsTx);
+        await confirmTransaction(initDataPDAsTx, "confirmed", 60000);
         console.log("Data PDAs initialization complete");
 
-        // Verify initialization
+        // Verify all PDAs were initialized correctly
+        const verifyAccounts = async () => {
+          const accounts = [
+            { name: "Bridge Node Data", pubkey: bridgeNodeDataAccountPDA },
+            {
+              name: "Temp Service Requests",
+              pubkey: tempServiceRequestsDataAccountPDA,
+            },
+            {
+              name: "Service Request Txid Mapping",
+              pubkey: serviceRequestTxidMappingDataAccountPDA,
+            },
+            {
+              name: "Aggregated Consensus Data",
+              pubkey: aggregatedConsensusDataAccountPDA,
+            },
+          ];
+
+          for (const account of accounts) {
+            const accountInfo = await connection.getAccountInfo(account.pubkey);
+            if (!accountInfo) {
+              throw new Error(`${account.name} account not initialized`);
+            }
+            console.log(
+              `${account.name} account initialized with ${accountInfo.data.length} bytes`
+            );
+          }
+        };
+
+        await verifyAccounts();
+
+        // Verify the bridge contract state
         const state = await program.account.bridgeContractState.fetch(
           bridgeContractState.publicKey
         );
 
+        // Perform assertions
         assert.isTrue(
           state.isInitialized,
           "Bridge contract state should be initialized"
         );
+        assert.isFalse(
+          state.isPaused,
+          "Bridge contract should not be paused initially"
+        );
         assert.equal(
           state.adminPubkey.toString(),
-          adminPublicKey.toString(),
+          provider.wallet.publicKey.toString(),
           "Admin public key should be set correctly"
         );
+        assert.equal(
+          state.bridgeNodesDataAccountPubkey.toString(),
+          bridgeNodeDataAccountPDA.toString(),
+          "Bridge nodes data account pubkey should be set correctly"
+        );
+        assert.equal(
+          state.tempServiceRequestsDataAccountPubkey.toString(),
+          tempServiceRequestsDataAccountPDA.toString(),
+          "Temp service requests data account pubkey should be set correctly"
+        );
+
+        console.log("All initialization verifications completed successfully");
       } catch (error) {
-        handleProgramError(error, "Initialization");
+        console.error("Detailed error information:", error);
+        if (error.logs) {
+          console.error("Program logs:", error.logs);
+        }
+        throw error;
       }
     });
+
+    // Helper function to verify account data
+    const verifyAccountData = async (
+      connection: web3.Connection,
+      accountPubkey: web3.PublicKey,
+      expectedMinSize: number,
+      accountName: string
+    ) => {
+      const accountInfo = await connection.getAccountInfo(accountPubkey);
+      if (!accountInfo) {
+        throw new Error(`${accountName} account not found`);
+      }
+      if (accountInfo.data.length < expectedMinSize) {
+        throw new Error(
+          `${accountName} account size (${accountInfo.data.length}) is less than minimum required (${expectedMinSize})`
+        );
+      }
+      return accountInfo;
+    };
   });
 
   describe("Reinitialization Prevention", () => {
