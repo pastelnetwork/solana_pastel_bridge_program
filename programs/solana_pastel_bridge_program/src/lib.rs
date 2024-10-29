@@ -3,7 +3,7 @@ pub mod fixed_exp;
 pub mod fixed_giga;
 
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::hash::{hash};
+use anchor_lang::solana_program::hash::hash;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::sysvar::{clock::Clock, rent::Rent};
 use anchor_lang::solana_program::system_instruction;
@@ -583,11 +583,11 @@ const ADDITIONAL_SPACE: usize = 10_240;
 const MAX_SIZE: usize = 100 * 1024; // 100KB
 
 // Function to reallocate account data
-fn reallocate_account_data(
-    account: &mut AccountInfo,
+fn reallocate_account_data<'a>(
+    account: &mut AccountInfo<'a>,
     current_usage: usize,
-    payer: &AccountInfo<'_>,
-    system_program: &AccountInfo<'_>,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
 ) -> Result<()> {
     let current_size = account.data_len();
     
@@ -624,7 +624,6 @@ fn reallocate_account_data(
         let lamports_needed = new_rent_minimum.saturating_sub(current_lamports);
 
         if lamports_needed > 0 {
-            // Transfer lamports from payer to the account to meet rent exemption
             invoke(
                 &system_instruction::transfer(
                     payer.key,
@@ -666,48 +665,53 @@ fn reallocate_account_data(
 
 impl<'info> ReallocateBridgeState<'info> {
     pub fn execute(ctx: Context<ReallocateBridgeState>) -> Result<()> {
-        let payer = &ctx.accounts.admin_pubkey.to_account_info(); // Admin is the payer
-        let system_program = &ctx.accounts.system_program.to_account_info();
+        // Create AccountInfo references that live for the entire function
+        let payer_info = ctx.accounts.admin_pubkey.to_account_info();
+        let system_program_info = ctx.accounts.system_program.to_account_info();
+        
+        // Store all account infos that we'll need to modify
+        let mut temp_requests_info = ctx.accounts.temp_service_requests_data_account.to_account_info();
+        let mut bridge_nodes_info = ctx.accounts.bridge_nodes_data_account.to_account_info();
+        let mut txid_mapping_info = ctx.accounts.service_request_txid_mapping_data_account.to_account_info();
+        let mut consensus_data_info = ctx.accounts.aggregated_consensus_data_account.to_account_info();
 
-        // Calculate sizes including the new fixed point number types
-        // Reallocate TempServiceRequestsDataAccount
+        // Calculate usages
         let temp_service_requests_usage = ctx.accounts.temp_service_requests_data_account.service_requests.len() * 
             std::mem::size_of::<ServiceRequest>();
-        reallocate_account_data(
-            &mut ctx.accounts.temp_service_requests_data_account.to_account_info(),
-            temp_service_requests_usage,
-            &payer,
-            &system_program,
-        )?;
-
-        // Reallocate BridgeNodesDataAccount - note the BridgeNode now uses u64 for fixed point
         let bridge_nodes_usage = ctx.accounts.bridge_nodes_data_account.bridge_nodes.len() * 
             std::mem::size_of::<BridgeNode>();
-        reallocate_account_data(
-            &mut ctx.accounts.bridge_nodes_data_account.to_account_info(),
-            bridge_nodes_usage,
-            &payer,
-            &system_program,
-        )?;
-
-        // Reallocate ServiceRequestTxidMappingDataAccount
         let txid_mapping_usage = ctx.accounts.service_request_txid_mapping_data_account.mappings.len() * 
             std::mem::size_of::<ServiceRequestTxidMapping>();
-        reallocate_account_data(
-            &mut ctx.accounts.service_request_txid_mapping_data_account.to_account_info(),
-            txid_mapping_usage,
-            &payer,
-            &system_program,
-        )?;
-
-        // Reallocate AggregatedConsensusDataAccount
         let consensus_data_usage = ctx.accounts.aggregated_consensus_data_account.consensus_data.len() * 
             std::mem::size_of::<AggregatedConsensusData>();
+
+        // Perform reallocations
         reallocate_account_data(
-            &mut ctx.accounts.aggregated_consensus_data_account.to_account_info(),
+            &mut temp_requests_info,
+            temp_service_requests_usage,
+            &payer_info,
+            &system_program_info,
+        )?;
+
+        reallocate_account_data(
+            &mut bridge_nodes_info,
+            bridge_nodes_usage,
+            &payer_info,
+            &system_program_info,
+        )?;
+
+        reallocate_account_data(
+            &mut txid_mapping_info,
+            txid_mapping_usage,
+            &payer_info,
+            &system_program_info,
+        )?;
+
+        reallocate_account_data(
+            &mut consensus_data_info,
             consensus_data_usage,
-            &payer,
-            &system_program,
+            &payer_info,
+            &system_program_info,
         )?;
 
         msg!("All accounts reallocated and rent-exempt status ensured.");
@@ -1677,15 +1681,22 @@ pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, succe
     let success_scaling = BridgeNode::to_fixed(
         (1.0 + bridge_node.current_streak as f32 * 0.1).min(2.0)
     );
+    
+    // Calculate and apply time weight to scale scores based on activity
     let time_weight = BridgeNode::to_fixed(
         1.0 / (1.0 + hours_inactive as f32 / 480.0)
     );
     
-    let score_increment = (BridgeNode::to_fixed(20.0) * success_scaling) / BridgeNode::SCORE_SCALE;
+    let score_increment = ((BridgeNode::to_fixed(20.0) * success_scaling) / BridgeNode::SCORE_SCALE)
+        .checked_mul(time_weight)
+        .and_then(|n| n.checked_div(BridgeNode::SCORE_SCALE))
+        .unwrap_or(0);
+
     let score_decrement = BridgeNode::to_fixed(
         20.0 * (1.0 + bridge_node.failed_service_requests_count as f32 * 0.5).min(3.0)
     );
     
+    // Apply decay rate based on inactivity
     let decay_rate = BridgeNode::to_fixed(0.99);
     let decay_factor = BridgeNode::to_fixed(
         0.99f32.powf(hours_inactive as f32 / 24.0)
@@ -1700,8 +1711,11 @@ pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, succe
     if success {
         bridge_node.successful_service_requests_count += 1;
         bridge_node.current_streak += 1;
+        
+        // Apply time-weighted score increment
+        let weighted_increment = (score_increment * time_weight) / BridgeNode::SCORE_SCALE;
         bridge_node.compliance_score = bridge_node.compliance_score
-            .saturating_add(score_increment)
+            .saturating_add(weighted_increment)
             .saturating_add(streak_bonus);
     } else {
         bridge_node.current_streak = 0;
@@ -1709,7 +1723,11 @@ pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, succe
             .saturating_sub(score_decrement);
     }
     
-    bridge_node.compliance_score = (bridge_node.compliance_score * decay_factor) / BridgeNode::SCORE_SCALE;
+    // Apply decay rate
+    bridge_node.compliance_score = ((bridge_node.compliance_score * decay_rate) / BridgeNode::SCORE_SCALE)
+        .checked_mul(decay_factor)
+        .and_then(|n| n.checked_div(BridgeNode::SCORE_SCALE))
+        .unwrap_or(bridge_node.compliance_score);
     
     let reliability_factor = if bridge_node.total_service_requests_attempted > 0 {
         (bridge_node.successful_service_requests_count as u64 * BridgeNode::SCORE_SCALE) / 
@@ -1718,17 +1736,18 @@ pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, succe
         0
     };
     
+    // Apply time weight to final compliance score
     bridge_node.compliance_score = ((bridge_node.compliance_score * reliability_factor) / BridgeNode::SCORE_SCALE)
+        .checked_mul(time_weight)
+        .and_then(|n| n.checked_div(BridgeNode::SCORE_SCALE))
+        .unwrap_or(bridge_node.compliance_score)
         .min(BridgeNode::to_fixed(100.0));
     
     bridge_node.reliability_score = reliability_factor;
     
-    if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD ||
-       bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
-        bridge_node.is_eligible_for_rewards = false;
-    } else {
-        bridge_node.is_eligible_for_rewards = true;
-    }
+    // Update reward eligibility
+    bridge_node.is_eligible_for_rewards = bridge_node.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD 
+        && bridge_node.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD;
     
     log_score_updates(bridge_node);
 }
@@ -1777,16 +1796,20 @@ pub fn update_bridge_node_status(
     update_statuses(bridge_node, current_timestamp);
 }
 
-
+// Update the update_statuses function to use fixed-point arithmetic
 pub fn update_statuses(bridge_node: &mut BridgeNode, current_timestamp: u64) {
     // Update the recently active status based on the last active timestamp and the inactivity threshold
     bridge_node.is_recently_active = current_timestamp - bridge_node.last_active_timestamp < BRIDGE_NODE_INACTIVITY_THRESHOLD;
 
     // Update the reliability status based on the ratio of successful to attempted service requests
     bridge_node.is_reliable = if bridge_node.total_service_requests_attempted > 0 {
-        let success_ratio = bridge_node.successful_service_requests_count as f32 
-                            / bridge_node.total_service_requests_attempted as f32;
-        success_ratio >= MIN_RELIABILITY_SCORE_FOR_REWARD / 100.0
+        let success_ratio = (bridge_node.successful_service_requests_count as u64)
+            .checked_mul(BridgeNode::SCORE_SCALE)
+            .and_then(|n| n.checked_div(bridge_node.total_service_requests_attempted as u64))
+            .unwrap_or(0);
+        
+        // Compare using fixed-point arithmetic
+        success_ratio >= MIN_RELIABILITY_SCORE_FOR_REWARD
     } else {
         false
     };
@@ -1795,7 +1818,6 @@ pub fn update_statuses(bridge_node: &mut BridgeNode, current_timestamp: u64) {
     bridge_node.is_eligible_for_rewards = bridge_node.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD 
                                         && bridge_node.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD;
 }
-
 
 pub fn apply_permanent_bans(bridge_nodes_data_account: &mut Account<BridgeNodesDataAccount>) {
     // Collect Pastel IDs of bridge nodes to be removed for efficient logging
@@ -1861,17 +1883,37 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
 }
 
 impl BridgeNode {
-    // Convert between fixed point and floating point using constants
     const SCORE_SCALE: u64 = 1_000_000_000; // 9 decimal places
     
+    /// Converts a floating point value to fixed point representation
     fn to_fixed(float_val: f32) -> u64 {
         (float_val * Self::SCORE_SCALE as f32) as u64
     }
     
+    /// Converts a fixed point value back to floating point
+    /// 
+    /// This function is provided for completeness of the fixed-point API
+    /// and debugging/display purposes
+    #[allow(dead_code)]
     fn from_fixed(fixed_val: u64) -> f32 {
         fixed_val as f32 / Self::SCORE_SCALE as f32
     }
+
+    /// Calculate if the bridge node is currently banned based on timestamp
+    pub fn calculate_is_banned(&self, current_timestamp: u64) -> bool {
+        if self.ban_expiry == u64::MAX {
+            // Permanent ban
+            true
+        } else if self.ban_expiry > current_timestamp {
+            // Temporary ban still active
+            true
+        } else {
+            // Not banned or ban expired
+            false
+        }
+    }
 }
+
 #[derive(Accounts)]
 pub struct SetOracleContract<'info> {
     #[account(mut, has_one = admin_pubkey)]
