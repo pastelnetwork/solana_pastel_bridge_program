@@ -2,16 +2,13 @@ pub mod big_number;
 pub mod fixed_exp;
 pub mod fixed_giga;
 
-use crate::big_number::{CheckedMulDiv, CheckedDivCeil, CheckedDivFloor};
-use crate::fixed_giga::*;
-use fixed::types::U34F30;
-
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::hash::{hash, Hash};
+use anchor_lang::solana_program::hash::{hash};
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::sysvar::{clock::Clock, rent::Rent};
 use anchor_lang::solana_program::system_instruction;
-use anchor_lang::system_program::{transfer, Transfer};
+use anchor_lang::Result;
+
 use std::convert::TryInto;
 
 // Fixed point constants
@@ -258,6 +255,35 @@ pub struct ServiceRequest {
     pub escrow_amount_lamports: Option<u64>, // Amount of SOL held in escrow for this service request.
     pub service_fee_retained_by_bridge_contract_lamports: Option<u64>, // Amount of SOL retained by the bridge contract as a service fee, taken from the escrowed amount when the service request is completed.
     pub pastel_txid: Option<String>, // The Pastel transaction ID for the service request once it is created.
+}
+
+impl Default for ServiceRequest {
+    fn default() -> Self {
+        ServiceRequest {
+            service_request_id: String::new(),
+            service_type: PastelTicketType::Sense, // Default value
+            first_6_characters_of_sha3_256_hash_of_corresponding_file: String::new(),
+            ipfs_cid: String::new(),
+            file_size_bytes: 0,
+            user_sol_address: Pubkey::default(),
+            status: RequestStatus::Pending,
+            payment_in_escrow: false,
+            request_expiry: 0,
+            sol_received_from_user_timestamp: None,
+            selected_bridge_node_pastelid: None,
+            best_quoted_price_in_lamports: None,
+            service_request_creation_timestamp: 0,
+            bridge_node_selection_timestamp: None,
+            bridge_node_submission_of_txid_timestamp: None,
+            submission_of_txid_to_oracle_timestamp: None,
+            service_request_completion_timestamp: None,
+            payment_received_timestamp: None,
+            payment_release_timestamp: None,
+            escrow_amount_lamports: None,
+            service_fee_retained_by_bridge_contract_lamports: None,
+            pastel_txid: None,
+        }
+    }
 }
 
 // This holds the information for an individual price quote from a given bridge node for a particular service request.
@@ -984,6 +1010,7 @@ pub struct ServicePriceQuoteSubmissionAccount {
 }
 
 #[derive(Accounts)]
+#[instruction(bridge_node_pastel_id: String, service_request_id: String, quoted_price_lamports: u64)]
 pub struct SubmitPriceQuote<'info> {
     #[account(
         init,
@@ -1269,8 +1296,7 @@ pub fn submit_pastel_txid_from_bridge_node_helper(
 pub struct AccessOracleData<'info> {
     #[account(
         seeds = [b"aggregated_consensus_data"],
-        bump,
-        has_one = oracle_contract_pubkey @ BridgeError::ContractNotInitialized
+        bump
     )]
     pub aggregated_consensus_data_account: Account<'info, AggregatedConsensusDataAccount>,
     
@@ -1295,7 +1321,7 @@ pub struct AccessOracleData<'info> {
     #[account(mut)]
     pub bridge_escrow_account: Account<'info, BridgeEscrowAccount>,
 
-    /// CHECK: This account is provided by the user and is manually checked in the program logic to ensure it matches the user who created the service request.
+    /// CHECK: This account is provided by the user and is manually checked in the program logic
     #[account(mut)]
     pub user_account: AccountInfo<'info>,
 
@@ -1611,22 +1637,22 @@ impl<'info> AccessOracleData<'info> {
         ).map_err(Into::into)
     }
 
-pub fn refund_escrow_to_user(
-    escrow_account: &mut AccountInfo<'_>, 
-    user_account: &mut AccountInfo<'_>, 
-    refund_amount: u64
-) -> ProgramResult {
-    // Check if escrow account has enough balance
-    if **escrow_account.lamports.borrow() < refund_amount {
-        return Err(BridgeError::InsufficientEscrowFunds.into());
+    pub fn refund_escrow_to_user(
+        escrow_account: &mut AccountInfo<'_>, 
+        user_account: &mut AccountInfo<'_>, 
+        refund_amount: u64
+    ) -> Result<()> {
+        // Check if escrow account has enough balance
+        if **escrow_account.lamports.borrow() < refund_amount {
+            return err!(BridgeError::InsufficientEscrowFunds);
+        }
+    
+        // Transfer the refund from the escrow account to the user account
+        **escrow_account.try_borrow_mut_lamports()? -= refund_amount;
+        **user_account.try_borrow_mut_lamports()? += refund_amount;
+    
+        Ok(())
     }
-
-    // Transfer the refund from the escrow account to the user account
-    **escrow_account.try_borrow_mut_lamports()? -= refund_amount;
-    **user_account.try_borrow_mut_lamports()? += refund_amount;
-
-    Ok(())
-}
 
 pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
     if !success {
@@ -1646,45 +1672,75 @@ pub fn apply_bans(bridge_node: &mut BridgeNode, current_timestamp: u64, success:
 
 pub fn update_scores(bridge_node: &mut BridgeNode, current_timestamp: u64, success: bool) {
     let time_diff = current_timestamp.saturating_sub(bridge_node.last_active_timestamp);
-    let hours_inactive: f32 = time_diff as f32 / 3_600.0;
-
-    let success_scaling = if success { (1.0 + bridge_node.current_streak as f32 * 0.1).min(2.0) } else { 1.0 };
-    let time_weight = 1.0 / (1.0 + hours_inactive / 480.0);
-    let score_increment = 20.0 * success_scaling * time_weight;
-    let score_decrement = 20.0 * (1.0 + bridge_node.failed_service_requests_count as f32 * 0.5).min(3.0);
-    let decay_rate: f32 = 0.99;
-    let decay_factor = decay_rate.powf(hours_inactive / 24.0);
-
-    let streak_bonus = if success { (bridge_node.current_streak as f32 / 10.0).min(3.0).max(0.0) } else { 0.0 };
-
+    let hours_inactive = time_diff / 3600;
+    
+    let success_scaling = BridgeNode::to_fixed(
+        (1.0 + bridge_node.current_streak as f32 * 0.1).min(2.0)
+    );
+    let time_weight = BridgeNode::to_fixed(
+        1.0 / (1.0 + hours_inactive as f32 / 480.0)
+    );
+    
+    let score_increment = (BridgeNode::to_fixed(20.0) * success_scaling) / BridgeNode::SCORE_SCALE;
+    let score_decrement = BridgeNode::to_fixed(
+        20.0 * (1.0 + bridge_node.failed_service_requests_count as f32 * 0.5).min(3.0)
+    );
+    
+    let decay_rate = BridgeNode::to_fixed(0.99);
+    let decay_factor = BridgeNode::to_fixed(
+        0.99f32.powf(hours_inactive as f32 / 24.0)
+    );
+    
+    let streak_bonus = if success {
+        BridgeNode::to_fixed((bridge_node.current_streak as f32 / 10.0).min(3.0).max(0.0))
+    } else {
+        0
+    };
+    
     if success {
         bridge_node.successful_service_requests_count += 1;
         bridge_node.current_streak += 1;
-        bridge_node.compliance_score += score_increment + streak_bonus;
+        bridge_node.compliance_score = bridge_node.compliance_score
+            .saturating_add(score_increment)
+            .saturating_add(streak_bonus);
     } else {
         bridge_node.current_streak = 0;
-        bridge_node.compliance_score = (bridge_node.compliance_score - score_decrement).max(0.0);
+        bridge_node.compliance_score = bridge_node.compliance_score
+            .saturating_sub(score_decrement);
     }
-
-    bridge_node.compliance_score *= decay_factor;
-
-    let reliability_factor = (bridge_node.successful_service_requests_count as f32 / bridge_node.total_service_requests_attempted as f32).clamp(0.0, 1.0);
-    bridge_node.compliance_score = (bridge_node.compliance_score * reliability_factor).min(100.0);
-    bridge_node.compliance_score = logistic_scale(bridge_node.compliance_score, 100.0, 0.1, 50.0);
-    bridge_node.reliability_score = reliability_factor * 100.0;
-
-    if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD || bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
+    
+    bridge_node.compliance_score = (bridge_node.compliance_score * decay_factor) / BridgeNode::SCORE_SCALE;
+    
+    let reliability_factor = if bridge_node.total_service_requests_attempted > 0 {
+        (bridge_node.successful_service_requests_count as u64 * BridgeNode::SCORE_SCALE) / 
+         bridge_node.total_service_requests_attempted as u64
+    } else {
+        0
+    };
+    
+    bridge_node.compliance_score = ((bridge_node.compliance_score * reliability_factor) / BridgeNode::SCORE_SCALE)
+        .min(BridgeNode::to_fixed(100.0));
+    
+    bridge_node.reliability_score = reliability_factor;
+    
+    if bridge_node.compliance_score < MIN_COMPLIANCE_SCORE_FOR_REWARD ||
+       bridge_node.reliability_score < MIN_RELIABILITY_SCORE_FOR_REWARD {
         bridge_node.is_eligible_for_rewards = false;
     } else {
         bridge_node.is_eligible_for_rewards = true;
     }
-
+    
     log_score_updates(bridge_node);
 }
 
-pub fn logistic_scale(score: f32, max_value: f32, steepness: f32, midpoint: f32) -> f32 {
-    max_value / (1.0 + (-steepness * (score - midpoint)).exp())
+pub fn logistic_scale(score: u64, max_value: u64, steepness: u64, midpoint: u64) -> u64 {
+    let exp_term = ((score as i64 - midpoint as i64) * steepness as i64) / 
+                   BridgeNode::SCORE_SCALE as i64;
+    let denom = BridgeNode::SCORE_SCALE + 
+                BridgeNode::to_fixed((-exp_term as f32).exp());
+    (max_value * BridgeNode::SCORE_SCALE) / denom
 }
+
 
 pub fn log_score_updates(bridge_node: &BridgeNode) {
     msg!("Scores After Update: Pastel ID: {}, Compliance Score: {}, Reliability Score: {}",
@@ -1805,20 +1861,17 @@ pub fn usize_to_txid_status(index: usize) -> Option<TxidStatus> {
 }
 
 impl BridgeNode {
-
-    // Check if the contributor is currently banned
-    pub fn calculate_is_banned(&self, current_time: u64) -> bool {
-        current_time < self.ban_expiry
+    // Convert between fixed point and floating point using constants
+    const SCORE_SCALE: u64 = 1_000_000_000; // 9 decimal places
+    
+    fn to_fixed(float_val: f32) -> u64 {
+        (float_val * Self::SCORE_SCALE as f32) as u64
     }
-
-    // Method to determine if the contributor is eligible for rewards
-    pub fn calculate_is_eligible_for_rewards(&self) -> bool {
-        self.reliability_score >= MIN_RELIABILITY_SCORE_FOR_REWARD && self.compliance_score >= MIN_COMPLIANCE_SCORE_FOR_REWARD
+    
+    fn from_fixed(fixed_val: u64) -> f32 {
+        fixed_val as f32 / Self::SCORE_SCALE as f32
     }
-
 }
-
-
 #[derive(Accounts)]
 pub struct SetOracleContract<'info> {
     #[account(mut, has_one = admin_pubkey)]
@@ -2003,7 +2056,7 @@ pub mod solana_pastel_bridge_program {
         bridge_node_pastel_id: String,
         service_request_id_string: String,
         quoted_price_lamports: u64,
-    ) -> ProgramResult {
+    ) -> Result<()> {
         submit_price_quote_helper(
             ctx,
             bridge_node_pastel_id,
@@ -2016,7 +2069,7 @@ pub mod solana_pastel_bridge_program {
         ctx: Context<SubmitPastelTxid>,
         service_request_id: String,
         pastel_txid: String,
-    ) -> ProgramResult {
+    ) -> Result<()> {
         submit_pastel_txid_from_bridge_node_helper(ctx, service_request_id, pastel_txid)
     }
 
