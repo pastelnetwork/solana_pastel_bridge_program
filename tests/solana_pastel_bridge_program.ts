@@ -156,6 +156,19 @@ const handleProgramError = (error: any, context: string) => {
   throw error;
 };
 
+async function generateServiceRequestId(
+  pastelTicketTypeString: string,
+  fileHash: string,
+  userPubkey: PublicKey
+): Promise<string> {
+  const concatenatedStr = `${pastelTicketTypeString}${fileHash}${userPubkey.toString()}`;
+  const hash = crypto
+    .createHash("sha256")
+    .update(concatenatedStr)
+    .digest("hex");
+  return hash;
+}
+
 const logAccountState = async (
   connection: web3.Connection,
   pubkey: web3.PublicKey,
@@ -959,30 +972,45 @@ describe("Solana Pastel Bridge Tests", () => {
         units: COMPUTE_UNITS_PER_TX,
       });
 
-      // Get PDAs
-      const [rewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bridge_reward_pool_account")],
-        program.programId
-      );
-      const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
-        [Buffer.from("bridge_nodes_data")],
-        program.programId
-      );
-      const [tempServiceRequestsDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("temp_service_requests_data")],
+      // Get PDAs with proper error handling
+      let rewardPoolAccountPDA: PublicKey,
+        bridgeNodeDataAccountPDA: PublicKey,
+        tempServiceRequestsDataAccountPDA: PublicKey,
+        aggregatedConsensusDataAccountPDA: PublicKey,
+        regFeeReceivingAccountPDA: PublicKey,
+        bridgeEscrowAccountPDA: PublicKey;
+
+      try {
+        [rewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_reward_pool_account")],
           program.programId
         );
-      const [aggregatedConsensusDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("aggregated_consensus_data")],
+        [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_nodes_data")],
           program.programId
         );
-      const [regFeeReceivingAccountPDA] =
-        await PublicKey.findProgramAddressSync(
+        [tempServiceRequestsDataAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("temp_service_requests_data")],
+            program.programId
+          );
+        [aggregatedConsensusDataAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("aggregated_consensus_data")],
+            program.programId
+          );
+        [regFeeReceivingAccountPDA] = await PublicKey.findProgramAddressSync(
           [Buffer.from("reg_fee_receiving_account")],
           program.programId
         );
+        [bridgeEscrowAccountPDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_escrow_account")],
+          program.programId
+        );
+      } catch (error) {
+        console.error("Error deriving PDAs:", error);
+        throw error;
+      }
 
       // Try to reinitialize base state
       try {
@@ -997,11 +1025,22 @@ describe("Solana Pastel Bridge Tests", () => {
           .rpc();
         assert.fail("Should not be able to reinitialize base state");
       } catch (error) {
-        const anchorError = error as anchor.AnchorError;
-        assert.include(
-          anchorError.error.errorMessage,
-          "Bridge Contract state is already initialized"
-        );
+        if (error instanceof anchor.AnchorError) {
+          assert.include(
+            error.error.errorMessage,
+            "Bridge Contract state is already initialized"
+          );
+        } else {
+          console.error(
+            "Unexpected error type during base state reinitialization:",
+            error
+          );
+          assert.include(
+            error.toString(),
+            "already initialized",
+            "Error should indicate initialization failure"
+          );
+        }
       }
 
       // Try to reinitialize core PDAs
@@ -1020,11 +1059,22 @@ describe("Solana Pastel Bridge Tests", () => {
           .rpc();
         assert.fail("Should not be able to reinitialize core PDAs");
       } catch (error) {
-        const anchorError = error as anchor.AnchorError;
-        assert.include(
-          anchorError.error.errorMessage,
-          "The program expected this account to be uninitialized"
-        );
+        if (error instanceof anchor.AnchorError) {
+          assert.include(
+            error.error.errorMessage,
+            "The program expected this account to be uninitialized"
+          );
+        } else {
+          console.error(
+            "Unexpected error type during core PDAs reinitialization:",
+            error
+          );
+          assert.include(
+            error.toString(),
+            "uninitialized",
+            "Error should indicate account should be uninitialized"
+          );
+        }
       }
 
       // Try to reinitialize bridge nodes data
@@ -1041,11 +1091,22 @@ describe("Solana Pastel Bridge Tests", () => {
           .rpc();
         assert.fail("Should not be able to reinitialize bridge nodes data");
       } catch (error) {
-        const anchorError = error as anchor.AnchorError;
-        assert.include(
-          anchorError.error.errorMessage,
-          "The program expected this account to be uninitialized"
-        );
+        if (error instanceof anchor.AnchorError) {
+          assert.include(
+            error.error.errorMessage,
+            "The program expected this account to be uninitialized"
+          );
+        } else {
+          console.error(
+            "Unexpected error type during bridge nodes data reinitialization:",
+            error
+          );
+          assert.include(
+            error.toString(),
+            "uninitialized",
+            "Error should indicate account should be uninitialized"
+          );
+        }
       }
 
       // Try to reinitialize temp requests data
@@ -1062,11 +1123,22 @@ describe("Solana Pastel Bridge Tests", () => {
           .rpc();
         assert.fail("Should not be able to reinitialize temp requests data");
       } catch (error) {
-        const anchorError = error as anchor.AnchorError;
-        assert.include(
-          anchorError.error.errorMessage,
-          "The program expected this account to be uninitialized"
-        );
+        if (error instanceof anchor.AnchorError) {
+          assert.include(
+            error.error.errorMessage,
+            "The program expected this account to be uninitialized"
+          );
+        } else {
+          console.error(
+            "Unexpected error type during temp requests data reinitialization:",
+            error
+          );
+          assert.include(
+            error.toString(),
+            "uninitialized",
+            "Error should indicate account should be uninitialized"
+          );
+        }
       }
 
       // Try to reinitialize consensus data
@@ -1083,26 +1155,74 @@ describe("Solana Pastel Bridge Tests", () => {
           .rpc();
         assert.fail("Should not be able to reinitialize consensus data");
       } catch (error) {
-        const anchorError = error as anchor.AnchorError;
-        assert.include(
-          anchorError.error.errorMessage,
-          "The program expected this account to be uninitialized"
-        );
+        if (error instanceof anchor.AnchorError) {
+          assert.include(
+            error.error.errorMessage,
+            "The program expected this account to be uninitialized"
+          );
+        } else {
+          console.error(
+            "Unexpected error type during consensus data reinitialization:",
+            error
+          );
+          assert.include(
+            error.toString(),
+            "uninitialized",
+            "Error should indicate account should be uninitialized"
+          );
+        }
       }
 
-      // Verify state remains unchanged
-      const state = await program.account.bridgeContractState.fetch(
-        bridgeContractState.publicKey
-      );
-      assert.isTrue(
-        state.isInitialized,
-        "Bridge Contract State should still be initialized"
-      );
-      assert.equal(
-        state.adminPubkey.toString(),
-        adminPublicKey.toString(),
-        "Admin public key should remain unchanged"
-      );
+      // Add delay to ensure state is settled
+      await sleep(OPERATION_DELAY);
+
+      // Verify state remains unchanged with proper error handling
+      try {
+        const state = await program.account.bridgeContractState.fetch(
+          bridgeContractState.publicKey
+        );
+
+        assert.isTrue(
+          state.isInitialized,
+          "Bridge Contract State should still be initialized"
+        );
+        assert.equal(
+          state.adminPubkey.toString(),
+          adminPublicKey.toString(),
+          "Admin public key should remain unchanged"
+        );
+
+        // Additional state verification
+        assert.isFalse(state.isPaused, "Bridge contract should not be paused");
+        assert.equal(
+          state.bridgeNodesDataAccountPubkey.toString(),
+          bridgeNodeDataAccountPDA.toString(),
+          "Bridge nodes data account pubkey should remain unchanged"
+        );
+        assert.equal(
+          state.bridgeRewardPoolAccountPubkey.toString(),
+          rewardPoolAccountPDA.toString(),
+          "Reward pool account pubkey should remain unchanged"
+        );
+        assert.equal(
+          state.bridgeEscrowAccountPubkey.toString(),
+          bridgeEscrowAccountPDA.toString(),
+          "Escrow account pubkey should remain unchanged"
+        );
+
+        // Log final state for debugging
+        console.log("Final contract state verification successful:", {
+          isInitialized: state.isInitialized,
+          isPaused: state.isPaused,
+          adminPubkey: state.adminPubkey.toString(),
+          bridgeNodesDataPubkey: state.bridgeNodesDataAccountPubkey.toString(),
+          rewardPoolPubkey: state.bridgeRewardPoolAccountPubkey.toString(),
+          escrowPubkey: state.bridgeEscrowAccountPubkey.toString(),
+        });
+      } catch (error) {
+        console.error("Error verifying final state:", error);
+        throw error;
+      }
     });
   });
 
@@ -1256,24 +1376,40 @@ describe("Solana Pastel Bridge Tests", () => {
         units: COMPUTE_UNITS_PER_TX,
       });
 
-      const [tempServiceRequestsDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("temp_service_requests_data")],
-          program.programId
-        );
+      // Get PDAs with proper error handling
+      let tempServiceRequestsDataAccountPDA: PublicKey;
+      let aggregatedConsensusDataAccountPDA: PublicKey;
 
-      const [aggregatedConsensusDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("aggregated_consensus_data")],
-          program.programId
-        );
+      try {
+        [tempServiceRequestsDataAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("temp_service_requests_data")],
+            program.programId
+          );
+        [aggregatedConsensusDataAccountPDA] =
+          await PublicKey.findProgramAddressSync(
+            [Buffer.from("aggregated_consensus_data")],
+            program.programId
+          );
+      } catch (error) {
+        console.error("Error deriving PDAs:", error);
+        throw error;
+      }
 
-      // Verify account initialization
-      const accountInfo = await provider.connection.getAccountInfo(
-        tempServiceRequestsDataAccountPDA
-      );
+      // Verify account initialization with retries
+      let accountInfo = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        accountInfo = await provider.connection.getAccountInfo(
+          tempServiceRequestsDataAccountPDA
+        );
+        if (accountInfo) break;
+        await sleep(1000);
+      }
+
       if (!accountInfo) {
-        throw new Error("Temp service requests account not initialized");
+        throw new Error(
+          "Temp service requests account not initialized after retries"
+        );
       }
 
       const lamports =
@@ -1308,37 +1444,40 @@ describe("Solana Pastel Bridge Tests", () => {
           const transferTxSignature = await provider.sendAndConfirm(transferTx);
           await confirmTransaction(transferTxSignature);
 
-          // Generate request data
+          // Generate request data with error checking
           const fileHash = crypto
             .createHash("sha3-256")
             .update(`file${i}`)
             .digest("hex")
             .substring(0, 6);
 
+          if (fileHash.length !== 6) {
+            throw new Error(`Invalid file hash length: ${fileHash.length}`);
+          }
+
           const pastelTicketTypeString =
             Object.keys(PastelTicketTypeEnum)[
               i % Object.keys(PastelTicketTypeEnum).length
             ];
 
+          if (!pastelTicketTypeString) {
+            throw new Error("Invalid Pastel ticket type");
+          }
+
           const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
           const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
 
-          // Generate service request ID
-          const concatenatedStr =
-            pastelTicketTypeString +
-            fileHash +
-            endUserKeypair.publicKey.toString();
-          const expectedServiceRequestIdHash = crypto
-            .createHash("sha256")
-            .update(concatenatedStr)
-            .digest("hex");
-          const expectedServiceRequestId =
-            expectedServiceRequestIdHash.substring(0, 24);
+          // Generate service request ID using the program's method
+          const serviceRequestId = await generateServiceRequestId(
+            pastelTicketTypeString,
+            fileHash,
+            endUserKeypair.publicKey
+          );
 
-          // Derive submission account PDA
+          // Derive submission account PDA using the full service request ID
           const [serviceRequestSubmissionAccountPDA] =
             await PublicKey.findProgramAddressSync(
-              [Buffer.from("srq"), Buffer.from(expectedServiceRequestId)],
+              [Buffer.from("srq"), Buffer.from(serviceRequestId)],
               program.programId
             );
 
@@ -1347,65 +1486,134 @@ describe("Solana Pastel Bridge Tests", () => {
             pastelTicketTypeString,
             ipfsCid,
             fileSizeBytes,
-            expectedServiceRequestId,
+            serviceRequestId,
             submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
           });
 
-          // Submit service request
-          const submitTx = await program.methods
-            .submitServiceRequest(
-              pastelTicketTypeString,
-              fileHash,
-              ipfsCid,
-              new BN(fileSizeBytes)
-            )
-            .accounts({
-              serviceRequestSubmissionAccount:
-                serviceRequestSubmissionAccountPDA,
-              bridgeContractState: bridgeContractState.publicKey,
-              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-              aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-              user: endUserKeypair.publicKey,
-              systemProgram: SystemProgram.programId,
-            })
-            .preInstructions([modifyComputeBudgetIx])
-            .signers([endUserKeypair])
-            .rpc({ skipPreflight: true });
+          // Submit service request with retries
+          let submitTx;
+          let retryCount = 0;
+          const maxRetries = 3;
+
+          while (retryCount < maxRetries) {
+            try {
+              submitTx = await program.methods
+                .submitServiceRequest(
+                  pastelTicketTypeString,
+                  fileHash,
+                  ipfsCid,
+                  new BN(fileSizeBytes)
+                )
+                .accounts({
+                  serviceRequestSubmissionAccount:
+                    serviceRequestSubmissionAccountPDA,
+                  bridgeContractState: bridgeContractState.publicKey,
+                  tempServiceRequestsDataAccount:
+                    tempServiceRequestsDataAccountPDA,
+                  aggregatedConsensusDataAccount:
+                    aggregatedConsensusDataAccountPDA,
+                  user: endUserKeypair.publicKey,
+                  systemProgram: SystemProgram.programId,
+                })
+                .preInstructions([modifyComputeBudgetIx])
+                .signers([endUserKeypair])
+                .rpc({
+                  skipPreflight: true,
+                  commitment: "confirmed",
+                });
+              break;
+            } catch (error) {
+              retryCount++;
+              if (retryCount === maxRetries) {
+                throw error;
+              }
+              await sleep(1000);
+            }
+          }
+
+          if (!submitTx) {
+            throw new Error("Failed to submit service request after retries");
+          }
 
           await confirmTransaction(submitTx);
           console.log(`Service request ${i + 1} submitted successfully`);
 
-          // Verify submission
-          const serviceRequestSubmissionData =
-            await program.account.serviceRequestSubmissionAccount.fetch(
-              serviceRequestSubmissionAccountPDA
+          // Verify submission with retries
+          let serviceRequestSubmissionData = null;
+          retryCount = 0;
+
+          while (retryCount < maxRetries) {
+            try {
+              serviceRequestSubmissionData =
+                await program.account.serviceRequestSubmissionAccount.fetch(
+                  serviceRequestSubmissionAccountPDA
+                );
+              break;
+            } catch (error) {
+              retryCount++;
+              if (retryCount === maxRetries) {
+                throw error;
+              }
+              await sleep(1000);
+            }
+          }
+
+          if (!serviceRequestSubmissionData) {
+            throw new Error(
+              "Failed to fetch service request submission data after retries"
             );
+          }
 
           const actualServiceRequestId =
             serviceRequestSubmissionData.serviceRequest.serviceRequestId;
 
           assert.equal(
             actualServiceRequestId,
-            expectedServiceRequestId,
+            serviceRequestId,
             `Service Request ID should match expected value for request ${
               i + 1
             }`
           );
 
-          serviceRequestIds.push(expectedServiceRequestId);
+          serviceRequestIds.push(serviceRequestId);
 
           // Add delay between submissions
           await sleep(OPERATION_DELAY);
         } catch (error) {
-          handleProgramError(error, `Service Request ${i + 1} Submission`);
+          console.error(`Service Request ${i + 1} Submission failed:`, error);
+          if (error.logs) {
+            console.error("Program logs:", error.logs);
+          }
+          throw error;
         }
       }
 
-      // Verify all submissions in temp storage
-      const tempServiceRequestsData =
-        await program.account.tempServiceRequestsDataAccount.fetch(
-          tempServiceRequestsDataAccountPDA
+      // Verify all submissions in temp storage with retries
+      let tempServiceRequestsData = null;
+      let retryCount = 0;
+      const maxRetries = 3;
+
+      while (retryCount < maxRetries) {
+        try {
+          tempServiceRequestsData =
+            await program.account.tempServiceRequestsDataAccount.fetch(
+              tempServiceRequestsDataAccountPDA
+            );
+          break;
+        } catch (error) {
+          retryCount++;
+          if (retryCount === maxRetries) {
+            throw error;
+          }
+          await sleep(1000);
+        }
+      }
+
+      if (!tempServiceRequestsData) {
+        throw new Error(
+          "Failed to fetch temp service requests data after retries"
         );
+      }
 
       console.log(
         "Total submitted service requests:",
@@ -1428,6 +1636,13 @@ describe("Solana Pastel Bridge Tests", () => {
           } should be in TempServiceRequestsDataAccount`
         );
       });
+
+      // Final verification
+      assert.equal(
+        tempServiceRequestsData.serviceRequests.length,
+        NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
+        "All service requests should be submitted successfully"
+      );
     });
   });
 
