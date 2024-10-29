@@ -1012,34 +1012,48 @@ describe("Solana Pastel Bridge Tests", () => {
         throw error;
       }
 
+      // Create a new keypair for testing reinitialization
+      const newBridgeContractState = web3.Keypair.generate();
+
+      // Fund the new contract state account
+      const connection = provider.connection;
+      const rent = await connection.getMinimumBalanceForRentExemption(
+        ACCOUNT_SIZES.BASE_STATE
+      );
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: newBridgeContractState.publicKey,
+          lamports: rent,
+        })
+      );
+
+      await provider.sendAndConfirm(fundTx);
+
       // Try to reinitialize base state
       try {
         await program.methods
           .initializeBase(adminPublicKey)
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
+          .signers([provider.wallet.payer]) // Add the admin as signer
           .rpc();
         assert.fail("Should not be able to reinitialize base state");
       } catch (error) {
+        // Should get ContractStateAlreadyInitialized error
         if (error instanceof anchor.AnchorError) {
-          assert.include(
-            error.error.errorMessage,
-            "Bridge Contract state is already initialized"
+          assert.equal(
+            error.error.errorCode.code,
+            "ContractStateAlreadyInitialized",
+            "Should get ContractStateAlreadyInitialized error"
           );
         } else {
-          console.error(
-            "Unexpected error type during base state reinitialization:",
-            error
-          );
-          assert.include(
-            error.toString(),
-            "already initialized",
-            "Error should indicate initialization failure"
-          );
+          throw error; // Re-throw unexpected errors
         }
       }
 
@@ -1049,13 +1063,14 @@ describe("Solana Pastel Bridge Tests", () => {
           .initializeCorePdas()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             bridgeRewardPoolAccount: rewardPoolAccountPDA,
             bridgeEscrowAccount: bridgeEscrowAccountPDA,
             regFeeReceivingAccount: regFeeReceivingAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
+          .signers([provider.wallet.payer]) // Add the admin as signer
           .rpc();
         assert.fail("Should not be able to reinitialize core PDAs");
       } catch (error) {
@@ -1063,16 +1078,6 @@ describe("Solana Pastel Bridge Tests", () => {
           assert.include(
             error.error.errorMessage,
             "The program expected this account to be uninitialized"
-          );
-        } else {
-          console.error(
-            "Unexpected error type during core PDAs reinitialization:",
-            error
-          );
-          assert.include(
-            error.toString(),
-            "uninitialized",
-            "Error should indicate account should be uninitialized"
           );
         }
       }
@@ -1083,11 +1088,12 @@ describe("Solana Pastel Bridge Tests", () => {
           .initializeBridgeNodesData()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
+          .signers([provider.wallet.payer]) // Add the admin as signer
           .rpc();
         assert.fail("Should not be able to reinitialize bridge nodes data");
       } catch (error) {
@@ -1095,16 +1101,6 @@ describe("Solana Pastel Bridge Tests", () => {
           assert.include(
             error.error.errorMessage,
             "The program expected this account to be uninitialized"
-          );
-        } else {
-          console.error(
-            "Unexpected error type during bridge nodes data reinitialization:",
-            error
-          );
-          assert.include(
-            error.toString(),
-            "uninitialized",
-            "Error should indicate account should be uninitialized"
           );
         }
       }
@@ -1115,11 +1111,12 @@ describe("Solana Pastel Bridge Tests", () => {
           .initializeTempRequestsData()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
+          .signers([provider.wallet.payer]) // Add the admin as signer
           .rpc();
         assert.fail("Should not be able to reinitialize temp requests data");
       } catch (error) {
@@ -1127,16 +1124,6 @@ describe("Solana Pastel Bridge Tests", () => {
           assert.include(
             error.error.errorMessage,
             "The program expected this account to be uninitialized"
-          );
-        } else {
-          console.error(
-            "Unexpected error type during temp requests data reinitialization:",
-            error
-          );
-          assert.include(
-            error.toString(),
-            "uninitialized",
-            "Error should indicate account should be uninitialized"
           );
         }
       }
@@ -1147,11 +1134,12 @@ describe("Solana Pastel Bridge Tests", () => {
           .initializeConsensusData()
           .accounts({
             bridgeContractState: bridgeContractState.publicKey,
-            user: adminPublicKey,
+            user: provider.wallet.publicKey,
             aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
             systemProgram: SystemProgram.programId,
           })
           .preInstructions([modifyComputeBudgetIx])
+          .signers([provider.wallet.payer]) // Add the admin as signer
           .rpc();
         assert.fail("Should not be able to reinitialize consensus data");
       } catch (error) {
@@ -1160,69 +1148,53 @@ describe("Solana Pastel Bridge Tests", () => {
             error.error.errorMessage,
             "The program expected this account to be uninitialized"
           );
-        } else {
-          console.error(
-            "Unexpected error type during consensus data reinitialization:",
-            error
-          );
-          assert.include(
-            error.toString(),
-            "uninitialized",
-            "Error should indicate account should be uninitialized"
-          );
         }
       }
 
       // Add delay to ensure state is settled
       await sleep(OPERATION_DELAY);
 
-      // Verify state remains unchanged with proper error handling
-      try {
-        const state = await program.account.bridgeContractState.fetch(
-          bridgeContractState.publicKey
-        );
+      // Verify state remains unchanged
+      const state = await program.account.bridgeContractState.fetch(
+        bridgeContractState.publicKey
+      );
 
-        assert.isTrue(
-          state.isInitialized,
-          "Bridge Contract State should still be initialized"
-        );
-        assert.equal(
-          state.adminPubkey.toString(),
-          adminPublicKey.toString(),
-          "Admin public key should remain unchanged"
-        );
+      // Verify all state properties remain unchanged
+      assert.isTrue(
+        state.isInitialized,
+        "Bridge Contract State should still be initialized"
+      );
+      assert.equal(
+        state.adminPubkey.toString(),
+        adminPublicKey.toString(),
+        "Admin public key should remain unchanged"
+      );
+      assert.isFalse(state.isPaused, "Bridge contract should not be paused");
+      assert.equal(
+        state.bridgeNodesDataAccountPubkey.toString(),
+        bridgeNodeDataAccountPDA.toString(),
+        "Bridge nodes data account pubkey should remain unchanged"
+      );
+      assert.equal(
+        state.bridgeRewardPoolAccountPubkey.toString(),
+        rewardPoolAccountPDA.toString(),
+        "Reward pool account pubkey should remain unchanged"
+      );
+      assert.equal(
+        state.bridgeEscrowAccountPubkey.toString(),
+        bridgeEscrowAccountPDA.toString(),
+        "Escrow account pubkey should remain unchanged"
+      );
 
-        // Additional state verification
-        assert.isFalse(state.isPaused, "Bridge contract should not be paused");
-        assert.equal(
-          state.bridgeNodesDataAccountPubkey.toString(),
-          bridgeNodeDataAccountPDA.toString(),
-          "Bridge nodes data account pubkey should remain unchanged"
-        );
-        assert.equal(
-          state.bridgeRewardPoolAccountPubkey.toString(),
-          rewardPoolAccountPDA.toString(),
-          "Reward pool account pubkey should remain unchanged"
-        );
-        assert.equal(
-          state.bridgeEscrowAccountPubkey.toString(),
-          bridgeEscrowAccountPDA.toString(),
-          "Escrow account pubkey should remain unchanged"
-        );
-
-        // Log final state for debugging
-        console.log("Final contract state verification successful:", {
-          isInitialized: state.isInitialized,
-          isPaused: state.isPaused,
-          adminPubkey: state.adminPubkey.toString(),
-          bridgeNodesDataPubkey: state.bridgeNodesDataAccountPubkey.toString(),
-          rewardPoolPubkey: state.bridgeRewardPoolAccountPubkey.toString(),
-          escrowPubkey: state.bridgeEscrowAccountPubkey.toString(),
-        });
-      } catch (error) {
-        console.error("Error verifying final state:", error);
-        throw error;
-      }
+      // Log final state for debugging
+      console.log("Final contract state verification successful:", {
+        isInitialized: state.isInitialized,
+        isPaused: state.isPaused,
+        adminPubkey: state.adminPubkey.toString(),
+        bridgeNodesDataPubkey: state.bridgeNodesDataAccountPubkey.toString(),
+        rewardPoolPubkey: state.bridgeRewardPoolAccountPubkey.toString(),
+        escrowPubkey: state.bridgeEscrowAccountPubkey.toString(),
+      });
     });
   });
 
@@ -1370,280 +1342,277 @@ describe("Solana Pastel Bridge Tests", () => {
     });
   });
 
-  describe("Service Request Handling", () => {
-    it("Submits service requests", async () => {
-      const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-        units: COMPUTE_UNITS_PER_TX,
-      });
+  it("Submits service requests", async () => {
+    const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+      units: COMPUTE_UNITS_PER_TX,
+    });
 
-      // Get PDAs with proper error handling
-      let tempServiceRequestsDataAccountPDA: PublicKey;
-      let aggregatedConsensusDataAccountPDA: PublicKey;
+    // Get PDAs with proper error handling
+    let tempServiceRequestsDataAccountPDA: PublicKey;
+    let aggregatedConsensusDataAccountPDA: PublicKey;
 
+    try {
+      [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
+        );
+      [aggregatedConsensusDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+    } catch (error) {
+      console.error("Error deriving PDAs:", error);
+      throw error;
+    }
+
+    // Verify account initialization with retries
+    let accountInfo = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      accountInfo = await provider.connection.getAccountInfo(
+        tempServiceRequestsDataAccountPDA
+      );
+      if (accountInfo) break;
+      await sleep(1000);
+    }
+
+    if (!accountInfo) {
+      throw new Error(
+        "Temp service requests account not initialized after retries"
+      );
+    }
+
+    const lamports =
+      web3.LAMPORTS_PER_SOL * COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
+    const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
+    const totalFundingLamports =
+      lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
+
+    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
       try {
-        [tempServiceRequestsDataAccountPDA] =
+        console.log(
+          `Generating service request ${
+            i + 1
+          } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
+        );
+
+        // Generate and fund end user account
+        const endUserKeypair = web3.Keypair.generate();
+        console.log(`End user address: ${endUserKeypair.publicKey.toString()}`);
+
+        const transferTx = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: adminPublicKey,
+            toPubkey: endUserKeypair.publicKey,
+            lamports: totalFundingLamports,
+          })
+        );
+
+        const transferTxSignature = await provider.sendAndConfirm(transferTx);
+        await confirmTransaction(transferTxSignature);
+
+        // Generate request data with error checking
+        const fileHash = crypto
+          .createHash("sha3-256")
+          .update(`file${i}`)
+          .digest("hex")
+          .substring(0, 6);
+
+        if (fileHash.length !== 6) {
+          throw new Error(`Invalid file hash length: ${fileHash.length}`);
+        }
+
+        const pastelTicketTypeString =
+          Object.keys(PastelTicketTypeEnum)[
+            i % Object.keys(PastelTicketTypeEnum).length
+          ];
+
+        if (!pastelTicketTypeString) {
+          throw new Error("Invalid Pastel ticket type");
+        }
+
+        const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
+        const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
+
+        // Generate service request ID using the program's method
+        const serviceRequestId = await generateServiceRequestId(
+          pastelTicketTypeString,
+          fileHash,
+          endUserKeypair.publicKey
+        );
+
+        // Derive submission account PDA using the truncated service request ID
+        const truncatedServiceRequestIdBytes = Buffer.from(
+          serviceRequestId
+        ).subarray(0, 12);
+        const [serviceRequestSubmissionAccountPDA] =
           await PublicKey.findProgramAddressSync(
-            [Buffer.from("temp_service_requests_data")],
+            [Buffer.from("srq"), truncatedServiceRequestIdBytes],
             program.programId
           );
-        [aggregatedConsensusDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("aggregated_consensus_data")],
-            program.programId
+
+        console.log({
+          fileHash,
+          pastelTicketTypeString,
+          ipfsCid,
+          fileSizeBytes,
+          serviceRequestId,
+          truncatedServiceRequestId: serviceRequestId.substring(0, 24), // Log truncated ID for verification
+          submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
+        });
+
+        // Submit service request with retries
+        let submitTx;
+        let retryCount = 0;
+        const maxRetries = 3;
+
+        while (retryCount < maxRetries) {
+          try {
+            submitTx = await program.methods
+              .submitServiceRequest(
+                pastelTicketTypeString,
+                fileHash,
+                ipfsCid,
+                new BN(fileSizeBytes)
+              )
+              .accounts({
+                serviceRequestSubmissionAccount:
+                  serviceRequestSubmissionAccountPDA,
+                bridgeContractState: bridgeContractState.publicKey,
+                tempServiceRequestsDataAccount:
+                  tempServiceRequestsDataAccountPDA,
+                aggregatedConsensusDataAccount:
+                  aggregatedConsensusDataAccountPDA,
+                user: endUserKeypair.publicKey,
+                systemProgram: SystemProgram.programId,
+              })
+              .preInstructions([modifyComputeBudgetIx])
+              .signers([endUserKeypair])
+              .rpc({
+                skipPreflight: true,
+                commitment: "confirmed",
+              });
+            break;
+          } catch (error) {
+            retryCount++;
+            if (retryCount === maxRetries) {
+              throw error;
+            }
+            await sleep(1000);
+          }
+        }
+
+        if (!submitTx) {
+          throw new Error("Failed to submit service request after retries");
+        }
+
+        await confirmTransaction(submitTx);
+        console.log(`Service request ${i + 1} submitted successfully`);
+
+        // Verify submission with retries
+        let serviceRequestSubmissionData = null;
+        retryCount = 0;
+
+        while (retryCount < maxRetries) {
+          try {
+            serviceRequestSubmissionData =
+              await program.account.serviceRequestSubmissionAccount.fetch(
+                serviceRequestSubmissionAccountPDA
+              );
+            break;
+          } catch (error) {
+            retryCount++;
+            if (retryCount === maxRetries) {
+              throw error;
+            }
+            await sleep(1000);
+          }
+        }
+
+        if (!serviceRequestSubmissionData) {
+          throw new Error(
+            "Failed to fetch service request submission data after retries"
           );
+        }
+
+        const actualServiceRequestId =
+          serviceRequestSubmissionData.serviceRequest.serviceRequestId;
+
+        assert.equal(
+          actualServiceRequestId,
+          serviceRequestId,
+          `Service Request ID should match expected value for request ${i + 1}`
+        );
+
+        serviceRequestIds.push(serviceRequestId);
+
+        // Add delay between submissions
+        await sleep(OPERATION_DELAY);
       } catch (error) {
-        console.error("Error deriving PDAs:", error);
+        console.error(`Service Request ${i + 1} Submission failed:`, error);
+        if (error.logs) {
+          console.error("Program logs:", error.logs);
+        }
         throw error;
       }
+    }
 
-      // Verify account initialization with retries
-      let accountInfo = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        accountInfo = await provider.connection.getAccountInfo(
-          tempServiceRequestsDataAccountPDA
-        );
-        if (accountInfo) break;
-        await sleep(1000);
-      }
+    // Verify all submissions in temp storage with retries
+    let tempServiceRequestsData = null;
+    let retryCount = 0;
+    const maxRetries = 3;
 
-      if (!accountInfo) {
-        throw new Error(
-          "Temp service requests account not initialized after retries"
-        );
-      }
-
-      const lamports =
-        web3.LAMPORTS_PER_SOL *
-        COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
-      const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
-      const totalFundingLamports =
-        lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
-
-      for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-        try {
-          console.log(
-            `Generating service request ${
-              i + 1
-            } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
+    while (retryCount < maxRetries) {
+      try {
+        tempServiceRequestsData =
+          await program.account.tempServiceRequestsDataAccount.fetch(
+            tempServiceRequestsDataAccountPDA
           );
-
-          // Generate and fund end user account
-          const endUserKeypair = web3.Keypair.generate();
-          console.log(
-            `End user address: ${endUserKeypair.publicKey.toString()}`
-          );
-
-          const transferTx = new Transaction().add(
-            SystemProgram.transfer({
-              fromPubkey: adminPublicKey,
-              toPubkey: endUserKeypair.publicKey,
-              lamports: totalFundingLamports,
-            })
-          );
-
-          const transferTxSignature = await provider.sendAndConfirm(transferTx);
-          await confirmTransaction(transferTxSignature);
-
-          // Generate request data with error checking
-          const fileHash = crypto
-            .createHash("sha3-256")
-            .update(`file${i}`)
-            .digest("hex")
-            .substring(0, 6);
-
-          if (fileHash.length !== 6) {
-            throw new Error(`Invalid file hash length: ${fileHash.length}`);
-          }
-
-          const pastelTicketTypeString =
-            Object.keys(PastelTicketTypeEnum)[
-              i % Object.keys(PastelTicketTypeEnum).length
-            ];
-
-          if (!pastelTicketTypeString) {
-            throw new Error("Invalid Pastel ticket type");
-          }
-
-          const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
-          const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
-
-          // Generate service request ID using the program's method
-          const serviceRequestId = await generateServiceRequestId(
-            pastelTicketTypeString,
-            fileHash,
-            endUserKeypair.publicKey
-          );
-
-          // Derive submission account PDA using the full service request ID
-          const [serviceRequestSubmissionAccountPDA] =
-            await PublicKey.findProgramAddressSync(
-              [Buffer.from("srq"), Buffer.from(serviceRequestId)],
-              program.programId
-            );
-
-          console.log({
-            fileHash,
-            pastelTicketTypeString,
-            ipfsCid,
-            fileSizeBytes,
-            serviceRequestId,
-            submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
-          });
-
-          // Submit service request with retries
-          let submitTx;
-          let retryCount = 0;
-          const maxRetries = 3;
-
-          while (retryCount < maxRetries) {
-            try {
-              submitTx = await program.methods
-                .submitServiceRequest(
-                  pastelTicketTypeString,
-                  fileHash,
-                  ipfsCid,
-                  new BN(fileSizeBytes)
-                )
-                .accounts({
-                  serviceRequestSubmissionAccount:
-                    serviceRequestSubmissionAccountPDA,
-                  bridgeContractState: bridgeContractState.publicKey,
-                  tempServiceRequestsDataAccount:
-                    tempServiceRequestsDataAccountPDA,
-                  aggregatedConsensusDataAccount:
-                    aggregatedConsensusDataAccountPDA,
-                  user: endUserKeypair.publicKey,
-                  systemProgram: SystemProgram.programId,
-                })
-                .preInstructions([modifyComputeBudgetIx])
-                .signers([endUserKeypair])
-                .rpc({
-                  skipPreflight: true,
-                  commitment: "confirmed",
-                });
-              break;
-            } catch (error) {
-              retryCount++;
-              if (retryCount === maxRetries) {
-                throw error;
-              }
-              await sleep(1000);
-            }
-          }
-
-          if (!submitTx) {
-            throw new Error("Failed to submit service request after retries");
-          }
-
-          await confirmTransaction(submitTx);
-          console.log(`Service request ${i + 1} submitted successfully`);
-
-          // Verify submission with retries
-          let serviceRequestSubmissionData = null;
-          retryCount = 0;
-
-          while (retryCount < maxRetries) {
-            try {
-              serviceRequestSubmissionData =
-                await program.account.serviceRequestSubmissionAccount.fetch(
-                  serviceRequestSubmissionAccountPDA
-                );
-              break;
-            } catch (error) {
-              retryCount++;
-              if (retryCount === maxRetries) {
-                throw error;
-              }
-              await sleep(1000);
-            }
-          }
-
-          if (!serviceRequestSubmissionData) {
-            throw new Error(
-              "Failed to fetch service request submission data after retries"
-            );
-          }
-
-          const actualServiceRequestId =
-            serviceRequestSubmissionData.serviceRequest.serviceRequestId;
-
-          assert.equal(
-            actualServiceRequestId,
-            serviceRequestId,
-            `Service Request ID should match expected value for request ${
-              i + 1
-            }`
-          );
-
-          serviceRequestIds.push(serviceRequestId);
-
-          // Add delay between submissions
-          await sleep(OPERATION_DELAY);
-        } catch (error) {
-          console.error(`Service Request ${i + 1} Submission failed:`, error);
-          if (error.logs) {
-            console.error("Program logs:", error.logs);
-          }
+        break;
+      } catch (error) {
+        retryCount++;
+        if (retryCount === maxRetries) {
           throw error;
         }
+        await sleep(1000);
       }
+    }
 
-      // Verify all submissions in temp storage with retries
-      let tempServiceRequestsData = null;
-      let retryCount = 0;
-      const maxRetries = 3;
-
-      while (retryCount < maxRetries) {
-        try {
-          tempServiceRequestsData =
-            await program.account.tempServiceRequestsDataAccount.fetch(
-              tempServiceRequestsDataAccountPDA
-            );
-          break;
-        } catch (error) {
-          retryCount++;
-          if (retryCount === maxRetries) {
-            throw error;
-          }
-          await sleep(1000);
-        }
-      }
-
-      if (!tempServiceRequestsData) {
-        throw new Error(
-          "Failed to fetch temp service requests data after retries"
-        );
-      }
-
-      console.log(
-        "Total submitted service requests:",
-        tempServiceRequestsData.serviceRequests.length
+    if (!tempServiceRequestsData) {
+      throw new Error(
+        "Failed to fetch temp service requests data after retries"
       );
+    }
 
-      serviceRequestIds.forEach((serviceRequestId, index) => {
-        const isSubmitted = tempServiceRequestsData.serviceRequests.some(
-          (sr) => sr.serviceRequestId === serviceRequestId
-        );
-        console.log(
-          `Service request ${index + 1} status:`,
-          `ID: ${serviceRequestId}`,
-          `Found: ${isSubmitted ? "Yes" : "No"}`
-        );
-        assert.isTrue(
-          isSubmitted,
-          `Service Request ${
-            index + 1
-          } should be in TempServiceRequestsDataAccount`
-        );
-      });
+    console.log(
+      "Total submitted service requests:",
+      tempServiceRequestsData.serviceRequests.length
+    );
 
-      // Final verification
-      assert.equal(
-        tempServiceRequestsData.serviceRequests.length,
-        NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
-        "All service requests should be submitted successfully"
+    serviceRequestIds.forEach((serviceRequestId, index) => {
+      const isSubmitted = tempServiceRequestsData.serviceRequests.some(
+        (sr) => sr.serviceRequestId === serviceRequestId
+      );
+      console.log(
+        `Service request ${index + 1} status:`,
+        `ID: ${serviceRequestId}`,
+        `Found: ${isSubmitted ? "Yes" : "No"}`
+      );
+      assert.isTrue(
+        isSubmitted,
+        `Service Request ${
+          index + 1
+        } should be in TempServiceRequestsDataAccount`
       );
     });
+
+    // Final verification
+    assert.equal(
+      tempServiceRequestsData.serviceRequests.length,
+      NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
+      "All service requests should be submitted successfully"
+    );
   });
 
   describe("Price Quote Management", () => {
