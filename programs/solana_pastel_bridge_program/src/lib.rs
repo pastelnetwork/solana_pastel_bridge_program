@@ -989,8 +989,27 @@ pub fn submit_service_request_helper(
     ipfs_cid: String,
     file_size_bytes: u64,
 ) -> Result<()> {
+    // Input validation
+    if first_6_chars_of_hash.len() != 6 {
+        msg!("Error: First 6 characters of hash must be exactly 6 characters");
+        return err!(BridgeError::InvalidFileHash);
+    }
     
-    let current_timestamp = Clock::get()?.unix_timestamp as u64;
+    if ipfs_cid.trim().is_empty() {
+        msg!("Error: IPFS CID cannot be empty");
+        return err!(BridgeError::InvalidIpfsCid);
+    }
+    
+    if file_size_bytes == 0 {
+        msg!("Error: File size cannot be zero");
+        return err!(BridgeError::InvalidFileSize);
+    }
+
+    // Get current timestamp with explicit type annotation
+    let current_timestamp: u64 = Clock::get()?
+        .unix_timestamp
+        .try_into()
+        .map_err(|_| error!(BridgeError::TimestampConversionError))?;
 
     // Convert the pastel_ticket_type_string to PastelTicketType enum
     let service_type = match pastel_ticket_type_string.as_str() {
@@ -998,7 +1017,10 @@ pub fn submit_service_request_helper(
         "Cascade" => PastelTicketType::Cascade,
         "Nft" => PastelTicketType::Nft,
         "InferenceApi" => PastelTicketType::InferenceApi,
-        _ => return err!(BridgeError::InvalidServiceType),
+        _ => {
+            msg!("Error: Invalid service type: {}", pastel_ticket_type_string);
+            return err!(BridgeError::InvalidServiceType);
+        }
     };
 
     // Generate the service_request_id
@@ -1007,26 +1029,31 @@ pub fn submit_service_request_helper(
         &first_6_chars_of_hash,
         &ctx.accounts.user.key(),
     );
-    
+    msg!("Generated service request ID: {}", service_request_id);
+
     // Check for duplicate service_request_id
     let temp_service_requests_data_account = &mut ctx.accounts.temp_service_requests_data_account;
     if temp_service_requests_data_account.service_requests.iter().any(|request| request.service_request_id == service_request_id) {
-        msg!("Error: Duplicate service request ID submitted");
+        msg!("Error: Duplicate service request ID submitted: {}", service_request_id);
         return err!(BridgeError::DuplicateServiceRequestId);
     }
 
-    // Create or update the ServiceRequest struct
-    let service_request_account = &mut ctx.accounts.service_request_submission_account;
-    service_request_account.service_request = ServiceRequest {
-        service_request_id,
+    // Calculate request expiry with explicit u64 types
+    let request_expiry: u64 = current_timestamp
+        .checked_add(ESCROW_DURATION)
+        .ok_or_else(|| error!(BridgeError::TimestampConversionError))?;
+
+    // Create the ServiceRequest struct
+    let service_request = ServiceRequest {
+        service_request_id: service_request_id.clone(),
         service_type,
-        first_6_characters_of_sha3_256_hash_of_corresponding_file: first_6_chars_of_hash.clone(),
+        first_6_characters_of_sha3_256_hash_of_corresponding_file: first_6_chars_of_hash,
         ipfs_cid,
         file_size_bytes,
         user_sol_address: *ctx.accounts.user.key,
         status: RequestStatus::Pending,
         payment_in_escrow: false,
-        request_expiry: current_timestamp + ESCROW_DURATION,
+        request_expiry,
         sol_received_from_user_timestamp: None,
         selected_bridge_node_pastelid: None,
         best_quoted_price_in_lamports: None,
@@ -1042,10 +1069,17 @@ pub fn submit_service_request_helper(
         pastel_txid: None,
     };
 
-    validate_service_request(&service_request_account.service_request)?;        
+    // Validate the service request
+    validate_service_request(&service_request)?;
 
-    temp_service_requests_data_account.service_requests.push(service_request_account.service_request.clone());
+    // Store the service request in the submission account
+    let service_request_account = &mut ctx.accounts.service_request_submission_account;
+    service_request_account.service_request = service_request.clone();
 
+    // Add to temporary storage
+    temp_service_requests_data_account.service_requests.push(service_request);
+
+    msg!("Service request successfully submitted and stored with ID: {}", service_request_id);
     Ok(())
 }
 
@@ -1230,6 +1264,7 @@ pub fn validate_price_quote_submission(
 
     Ok(())
 }
+
 pub fn choose_best_price_quote(
     best_quote_account: &BestPriceQuoteReceivedForServiceRequest,
     temp_service_requests_data_account: &mut TempServiceRequestsDataAccount,
@@ -1303,46 +1338,129 @@ pub fn submit_pastel_txid_from_bridge_node_helper(
     ctx: Context<SubmitPastelTxid>, 
     service_request_id: String, 
     pastel_txid: String
-) -> Result<()> {  // Changed from ProgramResult to Result<()>
-    let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
+) -> Result<()> {
+        // Create mapping first
+        update_txid_mapping(
+            &mut ctx.accounts.service_request_txid_mapping_data_account,
+            service_request_id.clone(),
+            pastel_txid.clone(),
+        )?;
+        
+    let current_timestamp: u64 = Clock::get()?.unix_timestamp.try_into()
+        .map_err(|_| error!(BridgeError::TimestampConversionError))?;
+
+    // First validate and collect all necessary data using immutable references
+    let submission_account = &ctx.accounts.service_request_submission_account;
+    let service_request = &submission_account.service_request;
+
+    // Store values we'll need later
+    let stored_service_request_id = service_request.service_request_id.clone();
+    let stored_creation_timestamp = service_request.service_request_creation_timestamp;
+    let stored_selected_pastel_id = service_request.selected_bridge_node_pastelid
+        .as_ref()
+        .ok_or_else(|| {
+            msg!("No bridge node selected for service request");
+            error!(BridgeError::BridgeNodeNotSelected)
+        })?
+        .clone();
+    let submission_owner = *submission_account.to_account_info().owner;
 
     // Validate that the service_request_id matches
-    if service_request.service_request_id != service_request_id {
+    if stored_service_request_id != service_request_id {
+        msg!("Service request ID mismatch. Expected: {}, Got: {}", 
+            service_request_id, stored_service_request_id);
         return err!(BridgeError::InvalidServiceRequestId);
     }
 
     // Validate the format and length of the Pastel TxID
     if pastel_txid.is_empty() || pastel_txid.len() > MAX_TXID_LENGTH {
+        msg!("Invalid Pastel TXID length. Got length: {}, Max allowed: {}", 
+            pastel_txid.len(), MAX_TXID_LENGTH);
         return err!(BridgeError::InvalidPastelTxid);
+    }
+
+    // Validate service request status
+    if service_request.status != RequestStatus::Pending {
+        msg!("Invalid service request status: {:?}", service_request.status);
+        return err!(BridgeError::InvalidRequestStatus);
     }
 
     // Find the bridge node that matches the selected_pastel_id
     let selected_bridge_node = ctx.accounts.bridge_nodes_data_account.bridge_nodes
         .iter()
-        .find(|node| node.pastel_id == *service_request.selected_bridge_node_pastelid.as_ref().unwrap())
-        .ok_or_else(|| error!(BridgeError::UnregisteredBridgeNode))?;
+        .find(|node| node.pastel_id == stored_selected_pastel_id)
+        .ok_or_else(|| {
+            msg!("Selected bridge node not found in registered nodes");
+            error!(BridgeError::UnregisteredBridgeNode)
+        })?;
 
-    // Check if the transaction is being submitted by the selected bridge node
-    if selected_bridge_node.reward_address != ctx.accounts.system_program.key() {
+    if selected_bridge_node.reward_address != submission_owner {
+        msg!("Unauthorized bridge node attempting to submit TXID. Expected: {}, Got: {}", 
+            selected_bridge_node.reward_address, submission_owner);
         return err!(BridgeError::UnauthorizedBridgeNode);
     }
 
-    // Update the service request with the provided Pastel TxID
-    service_request.pastel_txid = Some(pastel_txid.clone());
-    service_request.bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp as u64);
+    // Check timestamp validity
+    if current_timestamp > stored_creation_timestamp + SERVICE_REQUEST_VALIDITY {
+        msg!("Service request has expired. Creation time: {}, Current time: {}, Validity period: {}", 
+            stored_creation_timestamp, current_timestamp, SERVICE_REQUEST_VALIDITY);
+        return err!(BridgeError::ServiceRequestNotFound);
+    }
 
-    // Change the status of the service request to indicate that the TxID has been submitted
+    // Now do all mutable operations
+    let service_request = &mut ctx.accounts.service_request_submission_account.service_request;
+    
+    // Update the service request state
+    service_request.pastel_txid = Some(pastel_txid.clone());
+    service_request.bridge_node_submission_of_txid_timestamp = Some(current_timestamp);
     service_request.status = RequestStatus::AwaitingCompletionConfirmation;
 
-    // Log the TxID submission
-    msg!("Pastel TxID submitted by Bridge Node {} for Service Request ID: {}", 
-        selected_bridge_node.pastel_id, 
-        service_request_id.to_string()
-    );
-
-    // Update the TxID mapping for the service request
+    // Update TXID mapping
     let txid_mapping_data_account = &mut ctx.accounts.service_request_txid_mapping_data_account;
-    update_txid_mapping(txid_mapping_data_account, service_request_id, pastel_txid)?;
+    
+    // Check if mapping already exists
+    let existing_mapping = txid_mapping_data_account.mappings
+        .iter()
+        .position(|m| m.service_request_id == service_request_id);
+
+    match existing_mapping {
+        Some(index) => {
+            // Update existing mapping
+            txid_mapping_data_account.mappings[index].pastel_txid = pastel_txid.clone();
+        },
+        None => {
+            // Create new mapping
+            if txid_mapping_data_account.mappings.len() >= 1000 { // Arbitrary limit to prevent overflow
+                // Remove oldest mapping if at capacity
+                txid_mapping_data_account.mappings.remove(0);
+            }
+            
+            txid_mapping_data_account.mappings.push(ServiceRequestTxidMapping {
+                service_request_id: service_request_id.clone(),
+                pastel_txid: pastel_txid.clone(),
+            });
+        }
+    }
+
+    // Update bridge node metrics
+    if let Some(bridge_node) = ctx.accounts.bridge_nodes_data_account.bridge_nodes
+        .iter_mut()
+        .find(|node| node.pastel_id == stored_selected_pastel_id) {
+            bridge_node.last_active_timestamp = current_timestamp;
+            bridge_node.total_service_requests_attempted += 1;
+    }
+
+    // Log the successful submission
+    msg!("Pastel TXID {} submitted successfully by Bridge Node {} for Service Request ID: {}", 
+        pastel_txid,
+        stored_selected_pastel_id,
+        service_request_id
+    );
+    msg!("Submission timestamp: {}", current_timestamp);
+    
+    // Emit an event or additional logs if needed
+    msg!("Service request status updated to: {:?}", service_request.status);
+    msg!("TXID mapping updated. Total mappings: {}", txid_mapping_data_account.mappings.len());
 
     Ok(())
 }
@@ -2058,9 +2176,18 @@ pub struct InitializeBestPriceQuote<'info> {
     #[account(
         init,
         payer = user,
-        seeds = [b"bpx", &service_request_id.as_bytes()[..12]],
+        seeds = [
+            b"bpx",
+            &service_request_id.as_bytes()[..12]
+        ],
         bump,
-        space = 12 + std::mem::size_of::<BestPriceQuoteReceivedForServiceRequest>()
+        space = 8 + // Discriminator
+                64 + // service_request_id String (32 bytes + padding)
+                64 + // best_bridge_node_pastel_id String (32 bytes + padding)
+                8 + // best_quoted_price_in_lamports u64
+                8 + // best_quote_timestamp u64
+                1 + // best_quote_selection_status enum
+                32   // padding for future extensions
     )]
     pub best_price_quote_account: Account<'info, BestPriceQuoteReceivedForServiceRequest>,
 
@@ -2072,14 +2199,26 @@ pub struct InitializeBestPriceQuote<'info> {
 
 impl<'info> InitializeBestPriceQuote<'info> {
     pub fn initialize(ctx: Context<InitializeBestPriceQuote>, service_request_id: String) -> Result<()> {
+        // Input validation
+        if service_request_id.is_empty() {
+            msg!("Error: Service request ID cannot be empty");
+            return err!(BridgeError::InvalidServiceRequestId);
+        }
+
         let best_price_quote_account = &mut ctx.accounts.best_price_quote_account;
 
-        // Store the full service_request_id
+        // Initialize with explicit default values
         best_price_quote_account.service_request_id = service_request_id;
-        best_price_quote_account.best_bridge_node_pastel_id = "".to_string();
+        best_price_quote_account.best_bridge_node_pastel_id = String::with_capacity(32);
         best_price_quote_account.best_quoted_price_in_lamports = 0;
         best_price_quote_account.best_quote_timestamp = 0;
         best_price_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::NoQuotesReceivedYet;
+
+        // Log successful initialization
+        msg!(
+            "Best price quote account initialized for service request: {}",
+            best_price_quote_account.service_request_id
+        );
 
         Ok(())
     }
@@ -2200,11 +2339,17 @@ pub mod solana_pastel_bridge_program {
         submit_service_request_helper(ctx, pastel_ticket_type_string, first_6_chars_of_hash, ipfs_cid, file_size_bytes)
     }
 
-    pub fn initialize_best_price_quote(
-        ctx: Context<InitializeBestPriceQuote>,
-        service_request_id: String,
-    ) -> Result<()> {
-        InitializeBestPriceQuote::initialize(ctx, service_request_id)
+    pub fn initialize_best_price_quote(ctx: Context<InitializeBestPriceQuote>, service_request_id: String) -> Result<()> {
+        let best_price_quote_account = &mut ctx.accounts.best_price_quote_account;
+        
+        // Initialize with empty/default values
+        best_price_quote_account.service_request_id = service_request_id;
+        best_price_quote_account.best_bridge_node_pastel_id = String::new();
+        best_price_quote_account.best_quoted_price_in_lamports = 0;
+        best_price_quote_account.best_quote_timestamp = 0;
+        best_price_quote_account.best_quote_selection_status = BestQuoteSelectionStatus::NoQuotesReceivedYet;
+    
+        Ok(())
     }
 
     pub fn submit_price_quote(
