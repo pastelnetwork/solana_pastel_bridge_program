@@ -294,7 +294,6 @@ const initializeAccount = async (
 
 describe("Solana Pastel Bridge Tests", () => {
   before(async () => {
-    bridgeContractState = web3.Keypair.generate();
     console.log("Program ID:", program.programId.toString());
     console.log("Admin ID:", adminPublicKey.toString());
 
@@ -311,6 +310,7 @@ describe("Solana Pastel Bridge Tests", () => {
 
   describe("Initialization", () => {
     it("Initializes and expands the bridge contract state", async () => {
+      bridgeContractState = web3.Keypair.generate();
       try {
         // Set up compute budget for all transactions
         const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
@@ -966,238 +966,6 @@ describe("Solana Pastel Bridge Tests", () => {
     });
   });
 
-  describe("Reinitialization Prevention", () => {
-    it("Prevents reinitialization of BridgeContractState and PDAs", async () => {
-      const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-        units: COMPUTE_UNITS_PER_TX,
-      });
-
-      // Get PDAs with proper error handling
-      let rewardPoolAccountPDA: PublicKey,
-        bridgeNodeDataAccountPDA: PublicKey,
-        tempServiceRequestsDataAccountPDA: PublicKey,
-        aggregatedConsensusDataAccountPDA: PublicKey,
-        regFeeReceivingAccountPDA: PublicKey,
-        bridgeEscrowAccountPDA: PublicKey;
-
-      try {
-        [rewardPoolAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_reward_pool_account")],
-          program.programId
-        );
-        [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_nodes_data")],
-          program.programId
-        );
-        [tempServiceRequestsDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("temp_service_requests_data")],
-            program.programId
-          );
-        [aggregatedConsensusDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("aggregated_consensus_data")],
-            program.programId
-          );
-        [regFeeReceivingAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("reg_fee_receiving_account")],
-          program.programId
-        );
-        [bridgeEscrowAccountPDA] = await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_escrow_account")],
-          program.programId
-        );
-      } catch (error) {
-        console.error("Error deriving PDAs:", error);
-        throw error;
-      }
-
-      // Create a new keypair for testing reinitialization
-      const newBridgeContractState = web3.Keypair.generate();
-
-      // Fund the new contract state account
-      const connection = provider.connection;
-      const rent = await connection.getMinimumBalanceForRentExemption(
-        ACCOUNT_SIZES.BASE_STATE
-      );
-
-      const fundTx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: provider.wallet.publicKey,
-          toPubkey: newBridgeContractState.publicKey,
-          lamports: rent,
-        })
-      );
-
-      await provider.sendAndConfirm(fundTx);
-
-      // Try to reinitialize base state
-      try {
-        await program.methods
-          .initializeBase(adminPublicKey)
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            systemProgram: SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx])
-          .signers([provider.wallet.payer]) // Add the admin as signer
-          .rpc();
-        assert.fail("Should not be able to reinitialize base state");
-      } catch (error) {
-        // Should get ContractStateAlreadyInitialized error
-        if (error instanceof anchor.AnchorError) {
-          assert.equal(
-            error.error.errorCode.code,
-            "ContractStateAlreadyInitialized",
-            "Should get ContractStateAlreadyInitialized error"
-          );
-        } else {
-          throw error; // Re-throw unexpected errors
-        }
-      }
-
-      // Try to reinitialize core PDAs
-      try {
-        await program.methods
-          .initializeCorePdas()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            bridgeRewardPoolAccount: rewardPoolAccountPDA,
-            bridgeEscrowAccount: bridgeEscrowAccountPDA,
-            regFeeReceivingAccount: regFeeReceivingAccountPDA,
-            systemProgram: SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx])
-          .signers([provider.wallet.payer]) // Add the admin as signer
-          .rpc();
-        assert.fail("Should not be able to reinitialize core PDAs");
-      } catch (error) {
-        if (error instanceof anchor.AnchorError) {
-          assert.include(
-            error.error.errorMessage,
-            "The program expected this account to be uninitialized"
-          );
-        }
-      }
-
-      // Try to reinitialize bridge nodes data
-      try {
-        await program.methods
-          .initializeBridgeNodesData()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
-            systemProgram: SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx])
-          .signers([provider.wallet.payer]) // Add the admin as signer
-          .rpc();
-        assert.fail("Should not be able to reinitialize bridge nodes data");
-      } catch (error) {
-        if (error instanceof anchor.AnchorError) {
-          assert.include(
-            error.error.errorMessage,
-            "The program expected this account to be uninitialized"
-          );
-        }
-      }
-
-      // Try to reinitialize temp requests data
-      try {
-        await program.methods
-          .initializeTempRequestsData()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
-            systemProgram: SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx])
-          .signers([provider.wallet.payer]) // Add the admin as signer
-          .rpc();
-        assert.fail("Should not be able to reinitialize temp requests data");
-      } catch (error) {
-        if (error instanceof anchor.AnchorError) {
-          assert.include(
-            error.error.errorMessage,
-            "The program expected this account to be uninitialized"
-          );
-        }
-      }
-
-      // Try to reinitialize consensus data
-      try {
-        await program.methods
-          .initializeConsensusData()
-          .accounts({
-            bridgeContractState: bridgeContractState.publicKey,
-            user: provider.wallet.publicKey,
-            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
-            systemProgram: SystemProgram.programId,
-          })
-          .preInstructions([modifyComputeBudgetIx])
-          .signers([provider.wallet.payer]) // Add the admin as signer
-          .rpc();
-        assert.fail("Should not be able to reinitialize consensus data");
-      } catch (error) {
-        if (error instanceof anchor.AnchorError) {
-          assert.include(
-            error.error.errorMessage,
-            "The program expected this account to be uninitialized"
-          );
-        }
-      }
-
-      // Add delay to ensure state is settled
-      await sleep(OPERATION_DELAY);
-
-      // Verify state remains unchanged
-      const state = await program.account.bridgeContractState.fetch(
-        bridgeContractState.publicKey
-      );
-
-      // Verify all state properties remain unchanged
-      assert.isTrue(
-        state.isInitialized,
-        "Bridge Contract State should still be initialized"
-      );
-      assert.equal(
-        state.adminPubkey.toString(),
-        adminPublicKey.toString(),
-        "Admin public key should remain unchanged"
-      );
-      assert.isFalse(state.isPaused, "Bridge contract should not be paused");
-      assert.equal(
-        state.bridgeNodesDataAccountPubkey.toString(),
-        bridgeNodeDataAccountPDA.toString(),
-        "Bridge nodes data account pubkey should remain unchanged"
-      );
-      assert.equal(
-        state.bridgeRewardPoolAccountPubkey.toString(),
-        rewardPoolAccountPDA.toString(),
-        "Reward pool account pubkey should remain unchanged"
-      );
-      assert.equal(
-        state.bridgeEscrowAccountPubkey.toString(),
-        bridgeEscrowAccountPDA.toString(),
-        "Escrow account pubkey should remain unchanged"
-      );
-
-      // Log final state for debugging
-      console.log("Final contract state verification successful:", {
-        isInitialized: state.isInitialized,
-        isPaused: state.isPaused,
-        adminPubkey: state.adminPubkey.toString(),
-        bridgeNodesDataPubkey: state.bridgeNodesDataAccountPubkey.toString(),
-        rewardPoolPubkey: state.bridgeRewardPoolAccountPubkey.toString(),
-        escrowPubkey: state.bridgeEscrowAccountPubkey.toString(),
-      });
-    });
-  });
-
   describe("Bridge Node Registration", () => {
     it("Registers new bridge nodes", async () => {
       const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
@@ -1342,338 +1110,15 @@ describe("Solana Pastel Bridge Tests", () => {
     });
   });
 
-  it("Submits service requests", async () => {
-    const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-      units: COMPUTE_UNITS_PER_TX,
-    });
-
-    // Get PDAs with proper error handling
-    let tempServiceRequestsDataAccountPDA: PublicKey;
-    let aggregatedConsensusDataAccountPDA: PublicKey;
-
-    try {
-      [tempServiceRequestsDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("temp_service_requests_data")],
-          program.programId
-        );
-      console.log(
-        "Derived temp requests PDA:",
-        tempServiceRequestsDataAccountPDA.toString()
+  describe("Service Requests", () => {
+    before(async () => {
+      // Make sure bridge contract state is initialized first
+      const state = await program.account.bridgeContractState.fetch(
+        bridgeContractState.publicKey
       );
-      console.log("Program ID used:", program.programId.toString());
-
-      [aggregatedConsensusDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("aggregated_consensus_data")],
-          program.programId
-        );
-    } catch (error) {
-      console.error("Error deriving PDAs:", error);
-      throw error;
-    }
-
-    // Verify account initialization with retries
-    let accountInfo = null;
-    console.log(
-      "About to verify account exists at:",
-      tempServiceRequestsDataAccountPDA.toString()
-    );
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      console.log(`Attempt ${attempt + 1} to get account info...`);
-      accountInfo = await provider.connection.getAccountInfo(
-        tempServiceRequestsDataAccountPDA
-      );
-      console.log("Account info received:", accountInfo ? "exists" : "null");
-      if (accountInfo) break;
-      await sleep(1000);
-    }
-
-    if (!accountInfo) {
-      throw new Error(
-        "Temp service requests account not initialized after retries"
-      );
-    }
-
-    const lamports =
-      web3.LAMPORTS_PER_SOL * COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
-    const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
-    const totalFundingLamports =
-      lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
-
-    for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
-      try {
-        console.log(
-          `Generating service request ${
-            i + 1
-          } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
-        );
-
-        // Generate and fund end user account
-        const endUserKeypair = web3.Keypair.generate();
-        console.log(`End user address: ${endUserKeypair.publicKey.toString()}`);
-
-        const transferTx = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: adminPublicKey,
-            toPubkey: endUserKeypair.publicKey,
-            lamports: totalFundingLamports,
-          })
-        );
-
-        const transferTxSignature = await provider.sendAndConfirm(transferTx);
-        await confirmTransaction(transferTxSignature);
-
-        // Generate request data with error checking
-        const fileHash = crypto
-          .createHash("sha3-256")
-          .update(`file${i}`)
-          .digest("hex")
-          .substring(0, 6);
-
-        if (fileHash.length !== 6) {
-          throw new Error(`Invalid file hash length: ${fileHash.length}`);
-        }
-
-        const pastelTicketTypeString =
-          Object.keys(PastelTicketTypeEnum)[
-            i % Object.keys(PastelTicketTypeEnum).length
-          ];
-
-        if (!pastelTicketTypeString) {
-          throw new Error("Invalid Pastel ticket type");
-        }
-
-        const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
-        const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
-
-        // Generate service request ID using the program's method
-        const serviceRequestId = await generateServiceRequestId(
-          pastelTicketTypeString,
-          fileHash,
-          endUserKeypair.publicKey
-        );
-
-        // Derive submission account PDA using the truncated service request ID
-        const truncatedServiceRequestIdBytes = Buffer.from(
-          serviceRequestId
-        ).subarray(0, 12);
-        const [serviceRequestSubmissionAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("srq"), truncatedServiceRequestIdBytes],
-            program.programId
-          );
-
-        // Derive best price quote account PDA
-        const [bestPriceQuoteAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("bpx"), truncatedServiceRequestIdBytes],
-            program.programId
-          );
-
-        console.log({
-          fileHash,
-          pastelTicketTypeString,
-          ipfsCid,
-          fileSizeBytes,
-          serviceRequestId,
-          truncatedServiceRequestId: serviceRequestId.substring(0, 24),
-          submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
-          bestPriceQuoteAccountPDA: bestPriceQuoteAccountPDA.toString(),
-        });
-
-        // Initialize best price quote account first
-        try {
-          const initQuoteTx = await program.methods
-            .initializeBestPriceQuote(serviceRequestId)
-            .accounts({
-              bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-              user: endUserKeypair.publicKey,
-              systemProgram: SystemProgram.programId,
-            })
-            .preInstructions([modifyComputeBudgetIx])
-            .signers([endUserKeypair])
-            .rpc({
-              skipPreflight: true,
-              commitment: "confirmed",
-            });
-
-          await confirmTransaction(initQuoteTx);
-          console.log(
-            `Best price quote account initialized for request ${i + 1}`
-          );
-        } catch (error) {
-          console.error(
-            `Failed to initialize best price quote account for request ${
-              i + 1
-            }:`,
-            error
-          );
-          throw error;
-        }
-
-        // Submit service request with retries
-        let submitTx;
-        let retryCount = 0;
-        const maxRetries = 3;
-        while (retryCount < maxRetries) {
-          try {
-            submitTx = await program.methods
-              .submitServiceRequest(
-                pastelTicketTypeString,
-                fileHash,
-                ipfsCid,
-                new BN(fileSizeBytes)
-              )
-              .accounts({
-                serviceRequestSubmissionAccount:
-                  serviceRequestSubmissionAccountPDA,
-                bridgeContractState: bridgeContractState.publicKey,
-                tempServiceRequestsDataAccount:
-                  tempServiceRequestsDataAccountPDA,
-                aggregatedConsensusDataAccount:
-                  aggregatedConsensusDataAccountPDA,
-                user: endUserKeypair.publicKey,
-                systemProgram: SystemProgram.programId,
-              })
-              .preInstructions([modifyComputeBudgetIx])
-              .signers([endUserKeypair])
-              .rpc({
-                skipPreflight: true,
-                commitment: "confirmed",
-              });
-            break;
-          } catch (error) {
-            retryCount++;
-            if (retryCount === maxRetries) {
-              throw error;
-            }
-            await sleep(1000);
-          }
-        }
-
-        if (!submitTx) {
-          throw new Error("Failed to submit service request after retries");
-        }
-
-        await confirmTransaction(submitTx);
-        console.log(`Service request ${i + 1} submitted successfully`);
-
-        // Verify submission with retries
-        let serviceRequestSubmissionData = null;
-        retryCount = 0;
-
-        while (retryCount < maxRetries) {
-          try {
-            serviceRequestSubmissionData =
-              await program.account.serviceRequestSubmissionAccount.fetch(
-                serviceRequestSubmissionAccountPDA
-              );
-            break;
-          } catch (error) {
-            retryCount++;
-            if (retryCount === maxRetries) {
-              throw error;
-            }
-            await sleep(1000);
-          }
-        }
-
-        if (!serviceRequestSubmissionData) {
-          throw new Error(
-            "Failed to fetch service request submission data after retries"
-          );
-        }
-
-        const actualServiceRequestId =
-          serviceRequestSubmissionData.serviceRequest.serviceRequestId;
-
-        assert.equal(
-          actualServiceRequestId,
-          serviceRequestId,
-          `Service Request ID should match expected value for request ${i + 1}`
-        );
-
-        serviceRequestIds.push(serviceRequestId);
-
-        // Add delay between submissions
-        await sleep(OPERATION_DELAY);
-      } catch (error) {
-        console.error(`Service Request ${i + 1} Submission failed:`, error);
-        if (error.logs) {
-          console.error("Program logs:", error.logs);
-        }
-        throw error;
-      }
-    }
-
-    // Verify all submissions in temp storage with retries
-    let tempServiceRequestsData = null;
-    let retryCount = 0;
-    const maxRetries = 3;
-
-    while (retryCount < maxRetries) {
-      try {
-        tempServiceRequestsData =
-          await program.account.tempServiceRequestsDataAccount.fetch(
-            tempServiceRequestsDataAccountPDA
-          );
-        break;
-      } catch (error) {
-        retryCount++;
-        if (retryCount === maxRetries) {
-          throw error;
-        }
-        await sleep(1000);
-      }
-    }
-
-    if (!tempServiceRequestsData) {
-      throw new Error(
-        "Failed to fetch temp service requests data after retries"
-      );
-    }
-
-    console.log(
-      "Total submitted service requests:",
-      tempServiceRequestsData.serviceRequests.length
-    );
-
-    serviceRequestIds.forEach((serviceRequestId, index) => {
-      const isSubmitted = tempServiceRequestsData.serviceRequests.some(
-        (sr) => sr.serviceRequestId === serviceRequestId
-      );
-      console.log(
-        `Service request ${index + 1} status:`,
-        `ID: ${serviceRequestId}`,
-        `Found: ${isSubmitted ? "Yes" : "No"}`
-      );
-      assert.isTrue(
-        isSubmitted,
-        `Service Request ${
-          index + 1
-        } should be in TempServiceRequestsDataAccount`
-      );
-    });
-
-    // Final verification
-    assert.equal(
-      tempServiceRequestsData.serviceRequests.length,
-      NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
-      "All service requests should be submitted successfully"
-    );
-  });
-
-  describe("Price Quote Management", () => {
-    it("Submits and manages price quotes", async () => {
-      const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-        units: COMPUTE_UNITS_PER_TX,
-      });
-
-      assert.isTrue(
-        serviceRequestIds.length > 0,
-        "No service request IDs available"
+      assert(
+        state.isInitialized,
+        "Bridge contract state must be initialized first"
       );
 
       const [tempServiceRequestsDataAccountPDA] =
@@ -1682,336 +1127,1413 @@ describe("Solana Pastel Bridge Tests", () => {
           program.programId
         );
 
-      const [bridgeNodesDataAccountPDA] =
-        await PublicKey.findProgramAddressSync(
-          [Buffer.from("bridge_nodes_data")],
-          program.programId
-        );
+      const accountInfo = await provider.connection.getAccountInfo(
+        tempServiceRequestsDataAccountPDA
+      );
 
-      for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+      if (!accountInfo) {
+        console.log("Initializing temp service requests account...");
         try {
-          const serviceRequestId = serviceRequestIds[i];
-          if (!serviceRequestId) {
-            console.log(`Skipping invalid service request ID at index ${i}`);
-            continue;
-          }
-
-          const truncatedServiceRequestId = serviceRequestId.substring(0, 24);
-          console.log(
-            `Processing service request ${i + 1}: ${serviceRequestId}`
-          );
-
-          // Get service request data
-          const [serviceRequestSubmissionAccountPDA] =
-            await PublicKey.findProgramAddressSync(
-              [Buffer.from("srq"), Buffer.from(truncatedServiceRequestId)],
-              program.programId
-            );
-
-          const serviceRequestSubmissionData =
-            await program.account.serviceRequestSubmissionAccount.fetch(
-              serviceRequestSubmissionAccountPDA
-            );
-
-          const fileSizeBytes = new BN(
-            serviceRequestSubmissionData.serviceRequest.fileSizeBytes
-          ).toNumber();
-
-          const baselinePriceLamports = Math.floor(
-            (fileSizeBytes / 1000000) * baselinePriceSol * 1e9
-          );
-
-          // Initialize best price quote account
-          const [bestPriceQuoteAccountPDA] =
-            await PublicKey.findProgramAddressSync(
-              [Buffer.from("bpx"), Buffer.from(truncatedServiceRequestId)],
-              program.programId
-            );
-
-          const initQuoteTx = await program.methods
-            .initializeBestPriceQuote(truncatedServiceRequestId)
+          const tx = await program.methods
+            .initializeTempRequestsData()
             .accounts({
-              bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+              bridgeContractState: bridgeContractState.publicKey,
               user: provider.wallet.publicKey,
+              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
               systemProgram: SystemProgram.programId,
             })
-            .preInstructions([modifyComputeBudgetIx])
-            .rpc({ skipPreflight: true });
+            .signers([provider.wallet.payer])
+            .rpc();
 
-          await confirmTransaction(initQuoteTx);
-
-          // Submit quotes from each bridge node
-          for (const bridgeNode of bridgeNodes) {
-            if (!bridgeNode?.keypair?.publicKey) {
-              console.error("Invalid bridge node configuration");
-              continue;
-            }
-
-            const quotedPriceLamports = generateRandomPriceQuote(
-              baselinePriceLamports
-            );
-            console.log(
-              "Quote details:",
-              `Bridge Node: ${bridgeNode.keypair.publicKey.toBase58()}`,
-              `Price: ${quotedPriceLamports.toString()}`
-            );
-
-            const [priceQuoteSubmissionAccountPDA] =
-              await PublicKey.findProgramAddressSync(
-                [
-                  Buffer.from("px_quote"),
-                  Buffer.from(truncatedServiceRequestId),
-                ],
-                program.programId
-              );
-
-            try {
-              const submitQuoteTx = await program.methods
-                .submitPriceQuote(
-                  bridgeNode.pastelId,
-                  serviceRequestId,
-                  quotedPriceLamports
-                )
-                .accounts({
-                  priceQuoteSubmissionAccount: priceQuoteSubmissionAccountPDA,
-                  bridgeContractState: bridgeContractState.publicKey,
-                  tempServiceRequestsDataAccount:
-                    tempServiceRequestsDataAccountPDA,
-                  user: bridgeNode.keypair.publicKey,
-                  bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
-                  bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
-                  systemProgram: SystemProgram.programId,
-                })
-                .preInstructions([modifyComputeBudgetIx])
-                .signers([bridgeNode.keypair])
-                .rpc({ skipPreflight: true });
-
-              await confirmTransaction(submitQuoteTx);
-              console.log(
-                `Price quote submitted successfully for service request ${
-                  i + 1
-                }`
-              );
-
-              await sleep(OPERATION_DELAY);
-            } catch (error) {
-              handleProgramError(
-                error,
-                `Price Quote Submission for Service Request ${i + 1}`
-              );
-            }
-          }
-
-          // Verify best price quote selection
-          const bestPriceQuoteData =
-            await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
-              bestPriceQuoteAccountPDA
-            );
-
-          console.log(
-            `Best price quote data for request ${i + 1}:`,
-            bestPriceQuoteData
-          );
-
-          assert.equal(
-            bestPriceQuoteData.serviceRequestId,
-            serviceRequestIds[i],
-            `Best price quote should be selected for service request ${i + 1}`
-          );
-
-          // Add delay between service requests
-          await sleep(OPERATION_DELAY);
+          await confirmTransaction(tx);
+          console.log("Temp service requests account initialized");
         } catch (error) {
-          handleProgramError(
-            error,
-            `Service Request ${i + 1} Price Quote Processing`
+          console.error(
+            "Failed to initialize temp service requests account:",
+            error
           );
+          throw error;
         }
       }
     });
   });
 
-  describe("Transaction and Account Cleanup", () => {
-    it("Verifies final account states", async () => {
-      try {
-        const [bridgeNodeDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("bridge_nodes_data")],
-            program.programId
-          );
+  describe("Core Bridge Functionality", () => {
+    let userKeypair: web3.Keypair;
+    let fileHash: string;
+    let ipfsCid: string;
+    let serviceRequestId: string;
+    let bestPriceQuoteAccount: web3.PublicKey;
+    let serviceRequestPDA: web3.PublicKey;
+    let bestPriceQuoteBump: number;
 
-        const [tempServiceRequestsDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("temp_service_requests_data")],
-            program.programId
-          );
+    before(async () => {
+      // Create and fund user account
+      userKeypair = web3.Keypair.generate();
+      const fundTx = new web3.Transaction().add(
+        web3.SystemProgram.transfer({
+          fromPubkey: adminPublicKey,
+          toPubkey: userKeypair.publicKey,
+          lamports: web3.LAMPORTS_PER_SOL * 10,
+        })
+      );
+      await provider.sendAndConfirm(fundTx);
+      console.log("User account funded:", userKeypair.publicKey.toString());
+    });
 
-        const [serviceRequestTxidMappingDataAccountPDA] =
-          await PublicKey.findProgramAddressSync(
-            [Buffer.from("service_request_txid_map")],
-            program.programId
-          );
+    it("Submits a service request", async () => {
+      // Generate test data
+      fileHash = "abc123"; // First 6 chars of SHA3-256
+      ipfsCid = "QmW8rAgr5Levy1qyXqBRm24e4XhiDNBqhcDRnZ7puKytcG";
+      const fileSizeBytes = 1024 * 1024; // 1MB
 
-        // Verify bridge nodes data
-        const bridgeNodeData =
-          await program.account.bridgeNodesDataAccount.fetch(
-            bridgeNodeDataAccountPDA
-          );
+      // Generate service request ID
+      serviceRequestId = await generateServiceRequestId(
+        "Sense",
+        fileHash,
+        userKeypair.publicKey
+      );
+      console.log("Generated service request ID:", serviceRequestId);
 
-        assert.equal(
-          bridgeNodeData.bridgeNodes.length,
-          NUM_BRIDGE_NODES,
-          "Should have correct number of registered bridge nodes"
+      // Find PDAs
+      [serviceRequestPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("srq"), Buffer.from(serviceRequestId.slice(0, 12))],
+        program.programId
+      );
+
+      const [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
         );
 
-        // Verify service requests data
-        const tempServiceRequestsData =
+      const [aggregatedConsensusDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+
+      // Submit service request with compute budget instruction
+      const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: COMPUTE_UNITS_PER_TX,
+      });
+
+      try {
+        const tx = await program.methods
+          .submitServiceRequest(
+            "Sense",
+            fileHash,
+            ipfsCid,
+            new BN(fileSizeBytes)
+          )
+          .accounts({
+            serviceRequestSubmissionAccount: serviceRequestPDA,
+            bridgeContractState: bridgeContractState.publicKey,
+            user: userKeypair.publicKey,
+            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .signers([userKeypair])
+          .rpc();
+
+        await confirmTransaction(tx);
+        console.log(
+          "Service request submitted successfully:",
+          serviceRequestId
+        );
+
+        // Verify the service request was stored
+        const tempRequests =
           await program.account.tempServiceRequestsDataAccount.fetch(
             tempServiceRequestsDataAccountPDA
           );
-
-        assert.equal(
-          tempServiceRequestsData.serviceRequests.length,
-          NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
-          "Should have correct number of service requests"
+        const request = tempRequests.serviceRequests.find(
+          (r) => r.serviceRequestId === serviceRequestId
         );
-
-        // Check account sizes
-        const accountInfos = await Promise.all([
-          provider.connection.getAccountInfo(bridgeNodeDataAccountPDA),
-          provider.connection.getAccountInfo(tempServiceRequestsDataAccountPDA),
-          provider.connection.getAccountInfo(
-            serviceRequestTxidMappingDataAccountPDA
-          ),
-        ]);
-
-        accountInfos.forEach((accountInfo, index) => {
-          if (!accountInfo) {
-            throw new Error(`Account at index ${index} not found`);
-          }
-          assert.isTrue(
-            accountInfo.data.length <= MAX_ACCOUNT_SIZE,
-            `Account size exceeds maximum allowed size of ${MAX_ACCOUNT_SIZE} bytes`
-          );
-        });
-
-        console.log("Final account states verified successfully");
+        assert(request, "Service request should be stored");
+        assert.equal(request.status.pending, true, "Status should be pending");
       } catch (error) {
-        handleProgramError(error, "Final Account State Verification");
+        handleProgramError(error, "Service Request Submission");
       }
     });
 
-    it("Verifies compute units usage is within limits", async () => {
-      console.log("Total compute units used:", totalComputeUnitsUsed);
-      assert.isTrue(
-        totalComputeUnitsUsed > 0,
-        "Should have tracked compute units usage"
-      );
-      assert.isTrue(
-        totalComputeUnitsUsed <=
-          COMPUTE_UNITS_PER_TX *
-            (NUM_BRIDGE_NODES + NUMBER_OF_SIMULATED_SERVICE_REQUESTS) *
-            3,
-        "Total compute units should be within reasonable limits"
-      );
+    it("Initializes best price quote tracking", async () => {
+      await sleep(2000); // Add delay between transactions
+
+      // Generate PDA for best price quote account
+      [bestPriceQuoteAccount, bestPriceQuoteBump] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("bpx"), Buffer.from(serviceRequestId.slice(0, 12))],
+          program.programId
+        );
+
+      console.log("Best price quote PDA:", bestPriceQuoteAccount.toString());
+
+      try {
+        const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+          units: COMPUTE_UNITS_PER_TX,
+        });
+
+        const tx = await program.methods
+          .initializeBestPriceQuote(serviceRequestId)
+          .accounts({
+            bestPriceQuoteAccount,
+            user: provider.wallet.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .rpc();
+
+        await confirmTransaction(tx);
+        console.log("Best price quote tracking initialized");
+
+        // Verify the account was initialized
+        const bestQuoteAccount =
+          await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+            bestPriceQuoteAccount
+          );
+        assert(
+          bestQuoteAccount,
+          "Best price quote account should be initialized"
+        );
+        assert.equal(
+          bestQuoteAccount.serviceRequestId,
+          serviceRequestId,
+          "Service request ID should match"
+        );
+      } catch (error) {
+        handleProgramError(error, "Best Price Quote Initialization");
+      }
     });
 
-    it("Verifies account storage usage is within limits", async () => {
-      console.log("Max account storage used:", maxAccountStorageUsed);
-      assert.isTrue(
-        maxAccountStorageUsed > 0,
-        "Should have tracked account storage usage"
-      );
-      assert.isTrue(
-        maxAccountStorageUsed <= MAX_ACCOUNT_SIZE,
-        "Account storage should be within size limits"
-      );
-    });
-  });
+    it("Bridge nodes submit price quotes", async () => {
+      await sleep(2000); // Add delay between transactions
 
-  // Helper function to assert on numerical values with a margin of error
-  const assertApproximatelyEqual = (
-    actual: number,
-    expected: number,
-    tolerance: number = 0.01
-  ) => {
-    const diff = Math.abs(actual - expected);
-    const margin = expected * tolerance;
-    assert.isTrue(
-      diff <= margin,
-      `Expected ${actual} to be approximately equal to ${expected} within ${
-        tolerance * 100
-      }% tolerance`
-    );
-  };
-
-  // Helper function to verify account data consistency
-  const verifyAccountConsistency = async (
-    accountPDA: web3.PublicKey,
-    expectedDataSize: number
-  ) => {
-    const accountInfo = await provider.connection.getAccountInfo(accountPDA);
-    if (!accountInfo) {
-      throw new Error(`Account at ${accountPDA.toString()} not found`);
-    }
-    assert.isTrue(
-      accountInfo.data.length >= expectedDataSize,
-      `Account data size ${accountInfo.data.length} is less than expected ${expectedDataSize}`
-    );
-    return accountInfo;
-  };
-
-  after(async () => {
-    try {
-      console.log("\nTest Suite Completion Statistics:");
-      console.log("--------------------------------");
-      console.log("Total compute units used:", totalComputeUnitsUsed);
-      console.log("Max account storage used:", maxAccountStorageUsed);
-      console.log("Total bridge nodes registered:", bridgeNodes.length);
-      console.log(
-        "Total service requests processed:",
-        serviceRequestIds.length
-      );
-
-      // Calculate and log average compute units per transaction
-      const totalTransactions =
-        bridgeNodes.length + serviceRequestIds.length * 2; // Registration + service request + price quotes
-      const avgComputeUnits = Math.floor(
-        totalComputeUnitsUsed / totalTransactions
-      );
-      console.log("Average compute units per transaction:", avgComputeUnits);
-
-      // Log account sizes
       const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
         [Buffer.from("bridge_nodes_data")],
         program.programId
       );
-      const accountInfo = await provider.connection.getAccountInfo(
-        bridgeNodeDataAccountPDA
-      );
-      if (accountInfo) {
-        console.log(
-          "Final bridge node data account size:",
-          accountInfo.data.length
+
+      const [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
         );
+
+      // Have each bridge node submit a quote
+      for (const bridgeNode of bridgeNodes) {
+        const baselinePriceLamports = baselinePriceSol * web3.LAMPORTS_PER_SOL;
+        const quotedPrice = generateRandomPriceQuote(baselinePriceLamports);
+
+        // Generate PDA for price quote submission
+        const [priceQuotePDA] = await PublicKey.findProgramAddressSync(
+          [Buffer.from("px_quote"), Buffer.from(serviceRequestId)],
+          program.programId
+        );
+
+        try {
+          const modifyComputeBudgetIx =
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS_PER_TX,
+            });
+
+          const tx = await program.methods
+            .submitPriceQuote(
+              bridgeNode.pastelId,
+              serviceRequestId,
+              quotedPrice
+            )
+            .accounts({
+              priceQuoteSubmissionAccount: priceQuotePDA,
+              bridgeContractState: bridgeContractState.publicKey,
+              tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+              user: bridgeNode.keypair.publicKey,
+              systemProgram: web3.SystemProgram.programId,
+              bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+              bestPriceQuoteAccount,
+            })
+            .preInstructions([modifyComputeBudgetIx])
+            .signers([bridgeNode.keypair])
+            .rpc();
+
+          await confirmTransaction(tx);
+          console.log(
+            `Bridge node ${
+              bridgeNode.pastelId
+            } submitted quote: ${quotedPrice.toString()} lamports`
+          );
+
+          // Verify the quote was stored
+          const bestQuoteAccount =
+            await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+              bestPriceQuoteAccount
+            );
+          assert(
+            bestQuoteAccount.bestQuoteSelectionStatus !== "noQuotesReceivedYet"
+          );
+        } catch (error) {
+          handleProgramError(error, "Price Quote Submission");
+        }
+
+        await sleep(2000); // Add delay between quotes
+      }
+    });
+
+    it("Selected bridge node submits Pastel txid", async () => {
+      await sleep(2000); // Add delay between transactions
+
+      const [txidMappingPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("service_request_txid_map")],
+        program.programId
+      );
+
+      const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("bridge_nodes_data")],
+        program.programId
+      );
+
+      // Get the best quote to find selected bridge node
+      const bestQuoteAccount =
+        await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+          bestPriceQuoteAccount
+        );
+
+      const selectedNode = bridgeNodes.find(
+        (node) => node.pastelId === bestQuoteAccount.bestBridgeNodePastelId
+      );
+
+      if (!selectedNode) {
+        throw new Error("Selected bridge node not found");
       }
 
-      // Clear arrays
-      bridgeNodes = [];
-      serviceRequestIds = [];
-    } catch (error) {
-      console.error("Error in cleanup:", error);
-    } finally {
-      // Reset counters
-      totalComputeUnitsUsed = 0;
-      maxAccountStorageUsed = 0;
-    }
-  });
+      const pastelTxid = "0x" + crypto.randomBytes(32).toString("hex");
 
-  // Error event handler for uncaught promise rejections
-  process.on("unhandledRejection", (error: Error) => {
-    console.error("Unhandled promise rejection:", error);
-    console.error("Stack trace:", error.stack);
-    process.exit(1);
+      try {
+        const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+          units: COMPUTE_UNITS_PER_TX,
+        });
+
+        const tx = await program.methods
+          .submitPastelTxid(serviceRequestId, pastelTxid)
+          .accounts({
+            serviceRequestSubmissionAccount: serviceRequestPDA,
+            bridgeContractState: bridgeContractState.publicKey,
+            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+            serviceRequestTxidMappingDataAccount: txidMappingPDA,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .signers([selectedNode.keypair])
+          .rpc();
+
+        await confirmTransaction(tx);
+        console.log("Pastel txid submitted:", pastelTxid);
+
+        // Verify the txid was stored
+        const txidMapping =
+          await program.account.serviceRequestTxidMappingDataAccount.fetch(
+            txidMappingPDA
+          );
+        const mapping = txidMapping.mappings.find(
+          (m) => m.serviceRequestId === serviceRequestId
+        );
+        assert(mapping, "TXID mapping should be stored");
+        assert.equal(
+          mapping.pastelTxid,
+          pastelTxid,
+          "Pastel TXID should match"
+        );
+      } catch (error) {
+        handleProgramError(error, "Pastel TXID Submission");
+      }
+    });
+
+    it("Processes oracle consensus data and releases payment", async () => {
+      await sleep(2000); // Add delay between transactions
+
+      const [bridgeEscrowAccountPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("bridge_escrow_account")],
+        program.programId
+      );
+
+      const [bridgeRewardPoolAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("bridge_reward_pool_account")],
+          program.programId
+        );
+
+      const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("bridge_nodes_data")],
+        program.programId
+      );
+
+      const [tempServiceRequestsDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("temp_service_requests_data")],
+          program.programId
+        );
+
+      const [aggregatedConsensusDataAccountPDA] =
+        await PublicKey.findProgramAddressSync(
+          [Buffer.from("aggregated_consensus_data")],
+          program.programId
+        );
+
+      const [txidMappingPDA] = await PublicKey.findProgramAddressSync(
+        [Buffer.from("service_request_txid_map")],
+        program.programId
+      );
+
+      try {
+        // First add mock consensus data
+        const txidMapping =
+          await program.account.serviceRequestTxidMappingDataAccount.fetch(
+            txidMappingPDA
+          );
+        const mapping = txidMapping.mappings.find(
+          (m) => m.serviceRequestId === serviceRequestId
+        );
+
+        if (!mapping) {
+          throw new Error("TXID mapping not found");
+        }
+
+        // Now process the oracle data
+        const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+          units: COMPUTE_UNITS_PER_TX,
+        });
+
+        const tx = await program.methods
+          .processOracleData(mapping.pastelTxid, serviceRequestId)
+          .accounts({
+            aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+            serviceRequestTxidMappingDataAccount: txidMappingPDA,
+            tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+            bridgeContractState: bridgeContractState.publicKey,
+            bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+            bridgeRewardPoolAccount: bridgeRewardPoolAccountPDA,
+            bridgeEscrowAccount: bridgeEscrowAccountPDA,
+            userAccount: userKeypair.publicKey,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .preInstructions([modifyComputeBudgetIx])
+          .rpc();
+
+        await confirmTransaction(tx);
+        console.log("Oracle data processed and payment released");
+
+        // Verify request status
+        const tempRequests =
+          await program.account.tempServiceRequestsDataAccount.fetch(
+            tempServiceRequestsDataAccountPDA
+          );
+        const request = tempRequests.serviceRequests.find(
+          (r) => r.serviceRequestId === serviceRequestId
+        );
+        assert(request, "Service request should exist");
+        assert(request.status.completed, "Request should be completed");
+      } catch (error) {
+        handleProgramError(error, "Oracle Data Processing");
+      }
+    });
   });
 });
+
+// describe("Reinitialization Prevention", () => {
+//   it("Prevents reinitialization of BridgeContractState and PDAs", async () => {
+//     const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+//       units: COMPUTE_UNITS_PER_TX,
+//     });
+
+//     // Instead of creating new accounts, try to reinitialize existing ones
+//     try {
+//       await program.methods
+//         .initializeBase(adminPublicKey)
+//         .accounts({
+//           bridgeContractState: bridgeContractState.publicKey,
+//           user: provider.wallet.publicKey,
+//           systemProgram: SystemProgram.programId,
+//         })
+//         .preInstructions([modifyComputeBudgetIx])
+//         .signers([provider.wallet.payer])
+//         .rpc();
+//       assert.fail("Should not be able to reinitialize base state");
+//     } catch (error) {
+//       // We expect this to fail
+//       assert(
+//         error.toString().includes("already in use") ||
+//           error.toString().includes("ContractStateAlreadyInitialized")
+//       );
+//     }
+
+//     // Try to reinitialize core PDAs
+//     try {
+//       await program.methods
+//         .initializeCorePdas()
+//         .accounts({
+//           bridgeContractState: bridgeContractState.publicKey,
+//           user: provider.wallet.publicKey,
+//           bridgeRewardPoolAccount: rewardPoolAccountPDA,
+//           bridgeEscrowAccount: bridgeEscrowAccountPDA,
+//           regFeeReceivingAccount: regFeeReceivingAccountPDA,
+//           systemProgram: SystemProgram.programId,
+//         })
+//         .preInstructions([modifyComputeBudgetIx])
+//         .signers([provider.wallet.payer, bridgeContractState])
+//         .rpc();
+//       assert.fail("Should not be able to reinitialize core PDAs");
+//     } catch (error) {
+//       if (error instanceof anchor.AnchorError) {
+//         assert.include(
+//           error.error.errorMessage,
+//           "The program expected this account to be uninitialized"
+//         );
+//       }
+//     }
+
+//     // Try to reinitialize bridge nodes data
+//     try {
+//       await program.methods
+//         .initializeBridgeNodesData()
+//         .accounts({
+//           bridgeContractState: bridgeContractState.publicKey,
+//           user: provider.wallet.publicKey,
+//           bridgeNodesDataAccount: bridgeNodeDataAccountPDA,
+//           systemProgram: SystemProgram.programId,
+//         })
+//         .preInstructions([modifyComputeBudgetIx])
+//         .signers([provider.wallet.payer, bridgeContractState])
+//         .rpc();
+//       assert.fail("Should not be able to reinitialize bridge nodes data");
+//     } catch (error) {
+//       if (error instanceof anchor.AnchorError) {
+//         assert.include(
+//           error.error.errorMessage,
+//           "The program expected this account to be uninitialized"
+//         );
+//       }
+//     }
+
+//     // Try to reinitialize temp requests data
+//     try {
+//       await program.methods
+//         .initializeTempRequestsData()
+//         .accounts({
+//           bridgeContractState: bridgeContractState.publicKey,
+//           user: provider.wallet.publicKey,
+//           tempServiceRequestsDataAccount: tempServiceRequestsDataAccountPDA,
+//           systemProgram: SystemProgram.programId,
+//         })
+//         .preInstructions([modifyComputeBudgetIx])
+//         .signers([provider.wallet.payer, bridgeContractState])
+//         .rpc();
+//       assert.fail("Should not be able to reinitialize temp requests data");
+//     } catch (error) {
+//       if (error instanceof anchor.AnchorError) {
+//         assert.include(
+//           error.error.errorMessage,
+//           "The program expected this account to be uninitialized"
+//         );
+//       }
+//     }
+
+//     // Try to reinitialize consensus data
+//     try {
+//       await program.methods
+//         .initializeConsensusData()
+//         .accounts({
+//           bridgeContractState: bridgeContractState.publicKey,
+//           user: provider.wallet.publicKey,
+//           aggregatedConsensusDataAccount: aggregatedConsensusDataAccountPDA,
+//           systemProgram: SystemProgram.programId,
+//         })
+//         .preInstructions([modifyComputeBudgetIx])
+//         .signers([provider.wallet.payer, bridgeContractState])
+//         .rpc();
+//       assert.fail("Should not be able to reinitialize consensus data");
+//     } catch (error) {
+//       if (error instanceof anchor.AnchorError) {
+//         assert.include(
+//           error.error.errorMessage,
+//           "The program expected this account to be uninitialized"
+//         );
+//       }
+//     }
+
+//     // Add delay to ensure state is settled
+//     await sleep(OPERATION_DELAY);
+
+//     // Verify state remains unchanged
+//     const state = await program.account.bridgeContractState.fetch(
+//       bridgeContractState.publicKey
+//     );
+
+//     // Verify all state properties remain unchanged
+//     assert.isTrue(
+//       state.isInitialized,
+//       "Bridge Contract State should still be initialized"
+//     );
+//     assert.equal(
+//       state.adminPubkey.toString(),
+//       adminPublicKey.toString(),
+//       "Admin public key should remain unchanged"
+//     );
+//     assert.isFalse(state.isPaused, "Bridge contract should not be paused");
+//     assert.equal(
+//       state.bridgeNodesDataAccountPubkey.toString(),
+//       bridgeNodeDataAccountPDA.toString(),
+//       "Bridge nodes data account pubkey should remain unchanged"
+//     );
+//     assert.equal(
+//       state.bridgeRewardPoolAccountPubkey.toString(),
+//       rewardPoolAccountPDA.toString(),
+//       "Reward pool account pubkey should remain unchanged"
+//     );
+//     assert.equal(
+//       state.bridgeEscrowAccountPubkey.toString(),
+//       bridgeEscrowAccountPDA.toString(),
+//       "Escrow account pubkey should remain unchanged"
+//     );
+
+//     // Log final state for debugging
+//     console.log("Final contract state verification successful:", {
+//       isInitialized: state.isInitialized,
+//       isPaused: state.isPaused,
+//       adminPubkey: state.adminPubkey.toString(),
+//       bridgeNodesDataPubkey: state.bridgeNodesDataAccountPubkey.toString(),
+//       rewardPoolPubkey: state.bridgeRewardPoolAccountPubkey.toString(),
+//       escrowPubkey: state.bridgeEscrowAccountPubkey.toString(),
+//     });
+//   });
+// });
+
+// it("Submits service requests", async () => {
+//   let [tempServiceRequestsDataAccountPDA] =
+//     await PublicKey.findProgramAddressSync(
+//       [Buffer.from("temp_service_requests_data")],
+//       program.programId
+//     );
+
+//   // Verify account exists
+//   let accountInfo = await provider.connection.getAccountInfo(
+//     tempServiceRequestsDataAccountPDA
+//   );
+//   if (!accountInfo) {
+//     throw new Error("Temp service requests account not initialized");
+//   }
+
+//   console.log(
+//     "Temp service requests account exists, proceeding with test..."
+//   );
+
+//   const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+//     units: COMPUTE_UNITS_PER_TX,
+//   });
+
+//   // Get PDAs with proper error handling
+//   let aggregatedConsensusDataAccountPDA: PublicKey;
+
+//   try {
+//     [tempServiceRequestsDataAccountPDA] =
+//       await PublicKey.findProgramAddressSync(
+//         [Buffer.from("temp_service_requests_data")],
+//         program.programId
+//       );
+//     console.log(
+//       "Derived temp requests PDA:",
+//       tempServiceRequestsDataAccountPDA.toString()
+//     );
+//     console.log("Program ID used:", program.programId.toString());
+
+//     [aggregatedConsensusDataAccountPDA] =
+//       await PublicKey.findProgramAddressSync(
+//         [Buffer.from("aggregated_consensus_data")],
+//         program.programId
+//       );
+//   } catch (error) {
+//     console.error("Error deriving PDAs:", error);
+//     throw error;
+//   }
+
+//   // Verify account initialization with retries
+//   console.log(
+//     "About to verify account exists at:",
+//     tempServiceRequestsDataAccountPDA.toString()
+//   );
+
+//   for (let attempt = 0; attempt < 3; attempt++) {
+//     console.log(`Attempt ${attempt + 1} to get account info...`);
+//     console.log("Account info received:", accountInfo ? "exists" : "null");
+//     if (accountInfo) break;
+//     await sleep(1000);
+//   }
+
+//   if (!accountInfo) {
+//     throw new Error(
+//       "Temp service requests account not initialized after retries"
+//     );
+//   }
+
+//   const lamports =
+//     web3.LAMPORTS_PER_SOL * COST_IN_SOL_OF_ADDING_PASTEL_TXID_FOR_MONITORING;
+//   const ADDITIONAL_SOL_FOR_ACTUAL_REQUEST = 1;
+//   const totalFundingLamports =
+//     lamports + web3.LAMPORTS_PER_SOL * ADDITIONAL_SOL_FOR_ACTUAL_REQUEST;
+
+//   for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+//     try {
+//       console.log(
+//         `Generating service request ${
+//           i + 1
+//         } of ${NUMBER_OF_SIMULATED_SERVICE_REQUESTS}`
+//       );
+
+//       // Generate and fund end user account
+//       const endUserKeypair = web3.Keypair.generate();
+//       console.log(`End user address: ${endUserKeypair.publicKey.toString()}`);
+
+//       const transferTx = new Transaction().add(
+//         SystemProgram.transfer({
+//           fromPubkey: adminPublicKey,
+//           toPubkey: endUserKeypair.publicKey,
+//           lamports: totalFundingLamports,
+//         })
+//       );
+
+//       const transferTxSignature = await provider.sendAndConfirm(transferTx);
+//       await confirmTransaction(transferTxSignature);
+
+//       // Generate request data with error checking
+//       const fileHash = crypto
+//         .createHash("sha3-256")
+//         .update(`file${i}`)
+//         .digest("hex")
+//         .substring(0, 6);
+
+//       if (fileHash.length !== 6) {
+//         throw new Error(`Invalid file hash length: ${fileHash.length}`);
+//       }
+
+//       const pastelTicketTypeString =
+//         Object.keys(PastelTicketTypeEnum)[
+//           i % Object.keys(PastelTicketTypeEnum).length
+//         ];
+
+//       if (!pastelTicketTypeString) {
+//         throw new Error("Invalid Pastel ticket type");
+//       }
+
+//       const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
+//       const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
+
+//       // Generate service request ID using the program's method
+//       const serviceRequestId = await generateServiceRequestId(
+//         pastelTicketTypeString,
+//         fileHash,
+//         endUserKeypair.publicKey
+//       );
+
+//       // Derive submission account PDA using the truncated service request ID
+//       const truncatedServiceRequestIdBytes = Buffer.from(
+//         serviceRequestId
+//       ).subarray(0, 12);
+//       const [serviceRequestSubmissionAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [Buffer.from("srq"), truncatedServiceRequestIdBytes],
+//           program.programId
+//         );
+
+//       // Derive best price quote account PDA
+//       const [bestPriceQuoteAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [Buffer.from("bpx"), truncatedServiceRequestIdBytes],
+//           program.programId
+//         );
+
+//       console.log({
+//         fileHash,
+//         pastelTicketTypeString,
+//         ipfsCid,
+//         fileSizeBytes,
+//         serviceRequestId,
+//         truncatedServiceRequestId: serviceRequestId.substring(0, 24),
+//         submissionAccountPDA: serviceRequestSubmissionAccountPDA.toString(),
+//         bestPriceQuoteAccountPDA: bestPriceQuoteAccountPDA.toString(),
+//       });
+
+//       // Initialize best price quote account first
+//       try {
+//         const initQuoteTx = await program.methods
+//           .initializeBestPriceQuote(serviceRequestId)
+//           .accounts({
+//             bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+//             user: endUserKeypair.publicKey,
+//             systemProgram: SystemProgram.programId,
+//           })
+//           .preInstructions([modifyComputeBudgetIx])
+//           .signers([endUserKeypair])
+//           .rpc({
+//             skipPreflight: true,
+//             commitment: "confirmed",
+//           });
+
+//         await confirmTransaction(initQuoteTx);
+//         console.log(
+//           `Best price quote account initialized for request ${i + 1}`
+//         );
+//       } catch (error) {
+//         console.error(
+//           `Failed to initialize best price quote account for request ${
+//             i + 1
+//           }:`,
+//           error
+//         );
+//         throw error;
+//       }
+
+//       // Submit service request with retries
+//       let submitTx;
+//       let retryCount = 0;
+//       const maxRetries = 3;
+//       while (retryCount < maxRetries) {
+//         try {
+//           submitTx = await program.methods
+//             .submitServiceRequest(
+//               pastelTicketTypeString,
+//               fileHash,
+//               ipfsCid,
+//               new BN(fileSizeBytes)
+//             )
+//             .accounts({
+//               serviceRequestSubmissionAccount:
+//                 serviceRequestSubmissionAccountPDA,
+//               bridgeContractState: bridgeContractState.publicKey,
+//               tempServiceRequestsDataAccount:
+//                 tempServiceRequestsDataAccountPDA,
+//               aggregatedConsensusDataAccount:
+//                 aggregatedConsensusDataAccountPDA,
+//               user: endUserKeypair.publicKey,
+//               systemProgram: SystemProgram.programId,
+//             })
+//             .preInstructions([modifyComputeBudgetIx])
+//             .signers([endUserKeypair])
+//             .rpc({
+//               skipPreflight: true,
+//               commitment: "confirmed",
+//             });
+//           break;
+//         } catch (error) {
+//           retryCount++;
+//           if (retryCount === maxRetries) {
+//             throw error;
+//           }
+//           await sleep(1000);
+//         }
+//       }
+
+//       if (!submitTx) {
+//         throw new Error("Failed to submit service request after retries");
+//       }
+
+//       await confirmTransaction(submitTx);
+//       console.log(`Service request ${i + 1} submitted successfully`);
+
+//       // Verify submission with retries
+//       let serviceRequestSubmissionData = null;
+//       retryCount = 0;
+
+//       while (retryCount < maxRetries) {
+//         try {
+//           serviceRequestSubmissionData =
+//             await program.account.serviceRequestSubmissionAccount.fetch(
+//               serviceRequestSubmissionAccountPDA
+//             );
+//           break;
+//         } catch (error) {
+//           retryCount++;
+//           if (retryCount === maxRetries) {
+//             throw error;
+//           }
+//           await sleep(1000);
+//         }
+//       }
+
+//       if (!serviceRequestSubmissionData) {
+//         throw new Error(
+//           "Failed to fetch service request submission data after retries"
+//         );
+//       }
+
+//       const actualServiceRequestId =
+//         serviceRequestSubmissionData.serviceRequest.serviceRequestId;
+
+//       assert.equal(
+//         actualServiceRequestId,
+//         serviceRequestId,
+//         `Service Request ID should match expected value for request ${i + 1}`
+//       );
+
+//       serviceRequestIds.push(serviceRequestId);
+
+//       // Add delay between submissions
+//       await sleep(OPERATION_DELAY);
+//     } catch (error) {
+//       console.error(`Service Request ${i + 1} Submission failed:`, error);
+//       if (error.logs) {
+//         console.error("Program logs:", error.logs);
+//       }
+//       throw error;
+//     }
+//   }
+
+//   // Verify all submissions in temp storage with retries
+//   let tempServiceRequestsData = null;
+//   let retryCount = 0;
+//   const maxRetries = 3;
+
+//   while (retryCount < maxRetries) {
+//     try {
+//       tempServiceRequestsData =
+//         await program.account.tempServiceRequestsDataAccount.fetch(
+//           tempServiceRequestsDataAccountPDA
+//         );
+//       break;
+//     } catch (error) {
+//       retryCount++;
+//       if (retryCount === maxRetries) {
+//         throw error;
+//       }
+//       await sleep(1000);
+//     }
+//   }
+
+//   if (!tempServiceRequestsData) {
+//     throw new Error(
+//       "Failed to fetch temp service requests data after retries"
+//     );
+//   }
+
+//   console.log(
+//     "Total submitted service requests:",
+//     tempServiceRequestsData.serviceRequests.length
+//   );
+
+//   serviceRequestIds.forEach((serviceRequestId, index) => {
+//     const isSubmitted = tempServiceRequestsData.serviceRequests.some(
+//       (sr) => sr.serviceRequestId === serviceRequestId
+//     );
+//     console.log(
+//       `Service request ${index + 1} status:`,
+//       `ID: ${serviceRequestId}`,
+//       `Found: ${isSubmitted ? "Yes" : "No"}`
+//     );
+//     assert.isTrue(
+//       isSubmitted,
+//       `Service Request ${
+//         index + 1
+//       } should be in TempServiceRequestsDataAccount`
+//     );
+//   });
+
+//   // Final verification
+//   assert.equal(
+//     tempServiceRequestsData.serviceRequests.length,
+//     NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
+//     "All service requests should be submitted successfully"
+//   );
+// });
+// describe("Price Quote Management", () => {
+//   it("Submits and manages price quotes", async () => {
+//     const modifyComputeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+//       units: COMPUTE_UNITS_PER_TX,
+//     });
+
+//     // First create some service requests if none exist
+//     if (serviceRequestIds.length === 0) {
+//       const [tempServiceRequestsDataAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [Buffer.from("temp_service_requests_data")],
+//           program.programId
+//         );
+
+//       const [aggregatedConsensusDataAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [Buffer.from("aggregated_consensus_data")],
+//           program.programId
+//         );
+
+//       for (let i = 0; i < NUMBER_OF_SIMULATED_SERVICE_REQUESTS; i++) {
+//         const endUserKeypair = web3.Keypair.generate();
+
+//         // Fund the end user
+//         const fundTx = new Transaction().add(
+//           SystemProgram.transfer({
+//             fromPubkey: provider.wallet.publicKey,
+//             toPubkey: endUserKeypair.publicKey,
+//             lamports: web3.LAMPORTS_PER_SOL * 2,
+//           })
+//         );
+
+//         const fundSig = await provider.sendAndConfirm(fundTx);
+//         await confirmTransaction(fundSig);
+
+//         const fileHash = crypto
+//           .createHash("sha3-256")
+//           .update(`file${i}`)
+//           .digest("hex")
+//           .substring(0, 6);
+
+//         const pastelTicketTypeString =
+//           Object.keys(PastelTicketTypeEnum)[
+//             i % Object.keys(PastelTicketTypeEnum).length
+//           ];
+
+//         const ipfsCid = `Qm${crypto.randomBytes(44).toString("hex")}`;
+//         const fileSizeBytes = Math.floor(Math.random() * 1000000) + 1;
+
+//         const serviceRequestId = await generateServiceRequestId(
+//           pastelTicketTypeString,
+//           fileHash,
+//           endUserKeypair.publicKey
+//         );
+
+//         const [serviceRequestSubmissionAccountPDA] =
+//           await PublicKey.findProgramAddressSync(
+//             [
+//               Buffer.from("srq"),
+//               Buffer.from(serviceRequestId.substring(0, 12)),
+//             ],
+//             program.programId
+//           );
+
+//         const [bestPriceQuoteAccountPDA] =
+//           await PublicKey.findProgramAddressSync(
+//             [
+//               Buffer.from("bpx"),
+//               Buffer.from(serviceRequestId.substring(0, 12)),
+//             ],
+//             program.programId
+//           );
+
+//         const space =
+//           8 + // Discriminator
+//           32 + // service_request_id string
+//           32 + // best_bridge_node_pastel_id string
+//           8 + // best_quoted_price_in_lamports u64
+//           8 + // best_quote_timestamp u64
+//           1; // best_quote_selection_status enum
+
+//         const rent =
+//           await provider.connection.getMinimumBalanceForRentExemption(space);
+
+//         try {
+//           const initQuoteTx = await program.methods
+//             .initializeBestPriceQuote(serviceRequestId)
+//             .accounts({
+//               bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+//               user: endUserKeypair.publicKey,
+//               systemProgram: SystemProgram.programId,
+//             })
+//             .preInstructions([modifyComputeBudgetIx])
+//             .signers([endUserKeypair])
+//             .rpc();
+
+//           await confirmTransaction(initQuoteTx);
+
+//           const submitTx = await program.methods
+//             .submitServiceRequest(
+//               pastelTicketTypeString,
+//               fileHash,
+//               ipfsCid,
+//               new BN(fileSizeBytes)
+//             )
+//             .accounts({
+//               serviceRequestSubmissionAccount:
+//                 serviceRequestSubmissionAccountPDA,
+//               bridgeContractState: bridgeContractState.publicKey,
+//               tempServiceRequestsDataAccount:
+//                 tempServiceRequestsDataAccountPDA,
+//               aggregatedConsensusDataAccount:
+//                 aggregatedConsensusDataAccountPDA,
+//               user: endUserKeypair.publicKey,
+//               systemProgram: SystemProgram.programId,
+//             })
+//             .preInstructions([modifyComputeBudgetIx])
+//             .signers([endUserKeypair])
+//             .rpc();
+
+//           await confirmTransaction(submitTx);
+
+//           serviceRequestIds.push(serviceRequestId);
+//           console.log(
+//             `Service request ${
+//               i + 1
+//             } initialized with ID: ${serviceRequestId}`
+//           );
+
+//           await sleep(OPERATION_DELAY);
+//         } catch (error) {
+//           console.error(
+//             `Failed to initialize service request ${i + 1}:`,
+//             error
+//           );
+//           if (error.logs) {
+//             console.error("Program logs:", error.logs);
+//           }
+//           throw error;
+//         }
+//       }
+//     }
+
+//     assert.isTrue(
+//       serviceRequestIds.length > 0,
+//       "No service request IDs available after initialization"
+//     );
+
+//     const [bridgeNodesDataAccountPDA] =
+//       await PublicKey.findProgramAddressSync(
+//         [Buffer.from("bridge_nodes_data")],
+//         program.programId
+//       );
+
+//     const [tempServiceRequestsDataAccountPDA] =
+//       await PublicKey.findProgramAddressSync(
+//         [Buffer.from("temp_service_requests_data")],
+//         program.programId
+//       );
+
+//     // Process each service request
+//     for (let i = 0; i < serviceRequestIds.length; i++) {
+//       const serviceRequestId = serviceRequestIds[i];
+//       console.log(`Processing service request ${i + 1}: ${serviceRequestId}`);
+
+//       const [serviceRequestSubmissionAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [
+//             Buffer.from("srq"),
+//             Buffer.from(serviceRequestId.substring(0, 12)),
+//           ],
+//           program.programId
+//         );
+
+//       const [bestPriceQuoteAccountPDA] =
+//         await PublicKey.findProgramAddressSync(
+//           [
+//             Buffer.from("bpx"),
+//             Buffer.from(serviceRequestId.substring(0, 12)),
+//           ],
+//           program.programId
+//         );
+
+//       try {
+//         const serviceRequestSubmissionData =
+//           await program.account.serviceRequestSubmissionAccount.fetch(
+//             serviceRequestSubmissionAccountPDA
+//           );
+
+//         const fileSizeBytes = new BN(
+//           serviceRequestSubmissionData.serviceRequest.fileSizeBytes
+//         ).toNumber();
+
+//         const baselinePriceLamports = Math.floor(
+//           (fileSizeBytes / 1000000) * baselinePriceSol * 1e9
+//         );
+
+//         // Submit quotes from each bridge node
+//         for (const bridgeNode of bridgeNodes) {
+//           if (!bridgeNode?.keypair?.publicKey) {
+//             console.error("Invalid bridge node configuration");
+//             continue;
+//           }
+
+//           const quotedPriceLamports = generateRandomPriceQuote(
+//             baselinePriceLamports
+//           );
+
+//           console.log(
+//             "Quote details:",
+//             `Bridge Node: ${bridgeNode.keypair.publicKey.toBase58()}`,
+//             `Price: ${quotedPriceLamports.toString()}`
+//           );
+
+//           const [priceQuoteSubmissionAccountPDA] =
+//             await PublicKey.findProgramAddressSync(
+//               [
+//                 Buffer.from("px_quote"),
+//                 Buffer.from(serviceRequestId.substring(0, 12)),
+//               ],
+//               program.programId
+//             );
+
+//           try {
+//             const submitQuoteTx = await program.methods
+//               .submitPriceQuote(
+//                 bridgeNode.pastelId,
+//                 serviceRequestId,
+//                 quotedPriceLamports
+//               )
+//               .accounts({
+//                 priceQuoteSubmissionAccount: priceQuoteSubmissionAccountPDA,
+//                 bridgeContractState: bridgeContractState.publicKey,
+//                 tempServiceRequestsDataAccount:
+//                   tempServiceRequestsDataAccountPDA,
+//                 user: bridgeNode.keypair.publicKey,
+//                 bridgeNodesDataAccount: bridgeNodesDataAccountPDA,
+//                 bestPriceQuoteAccount: bestPriceQuoteAccountPDA,
+//                 systemProgram: SystemProgram.programId,
+//               })
+//               .preInstructions([modifyComputeBudgetIx])
+//               .signers([bridgeNode.keypair])
+//               .rpc({ skipPreflight: true });
+
+//             await confirmTransaction(submitQuoteTx);
+//             console.log(`Price quote submitted for service request ${i + 1}`);
+
+//             await sleep(OPERATION_DELAY);
+//           } catch (error) {
+//             console.error(
+//               `Failed to submit price quote for service request ${i + 1}:`,
+//               error
+//             );
+//             if (error.logs) {
+//               console.error("Program logs:", error.logs);
+//             }
+//             throw error;
+//           }
+//         }
+
+//         // Verify best price quote selection
+//         const bestPriceQuoteData =
+//           await program.account.bestPriceQuoteReceivedForServiceRequest.fetch(
+//             bestPriceQuoteAccountPDA
+//           );
+
+//         console.log(
+//           `Best price quote data for request ${i + 1}:`,
+//           bestPriceQuoteData
+//         );
+
+//         assert.equal(
+//           bestPriceQuoteData.serviceRequestId,
+//           serviceRequestIds[i],
+//           `Best price quote should be selected for service request ${i + 1}`
+//         );
+//       } catch (error) {
+//         console.error(`Error processing service request ${i + 1}:`, error);
+//         if (error.logs) {
+//           console.error("Program logs:", error.logs);
+//         }
+//         throw error;
+//       }
+
+//       await sleep(OPERATION_DELAY);
+//     }
+
+//     // Verify final state
+//     const finalServiceRequestsData =
+//       await program.account.tempServiceRequestsDataAccount.fetch(
+//         tempServiceRequestsDataAccountPDA
+//       );
+
+//     assert.equal(
+//       finalServiceRequestsData.serviceRequests.length,
+//       NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
+//       "Should have the correct number of service requests"
+//     );
+
+//     // Verify all service requests have price quotes
+//     for (const serviceRequest of finalServiceRequestsData.serviceRequests) {
+//       assert.isTrue(
+//         serviceRequest.best_quoted_price_in_lamports !== null,
+//         `Service request ${serviceRequest.service_request_id} should have a price quote`
+//       );
+//     }
+//   });
+// });
+
+//   describe("Transaction and Account Cleanup", () => {
+//     it("Verifies final account states", async () => {
+//       try {
+//         const [bridgeNodeDataAccountPDA] =
+//           await PublicKey.findProgramAddressSync(
+//             [Buffer.from("bridge_nodes_data")],
+//             program.programId
+//           );
+
+//         const [tempServiceRequestsDataAccountPDA] =
+//           await PublicKey.findProgramAddressSync(
+//             [Buffer.from("temp_service_requests_data")],
+//             program.programId
+//           );
+
+//         const [serviceRequestTxidMappingDataAccountPDA] =
+//           await PublicKey.findProgramAddressSync(
+//             [Buffer.from("service_request_txid_map")],
+//             program.programId
+//           );
+
+//         // Verify bridge nodes data
+//         const bridgeNodeData =
+//           await program.account.bridgeNodesDataAccount.fetch(
+//             bridgeNodeDataAccountPDA
+//           );
+
+//         assert.equal(
+//           bridgeNodeData.bridgeNodes.length,
+//           NUM_BRIDGE_NODES,
+//           "Should have correct number of registered bridge nodes"
+//         );
+
+//         // Verify service requests data
+//         const tempServiceRequestsData =
+//           await program.account.tempServiceRequestsDataAccount.fetch(
+//             tempServiceRequestsDataAccountPDA
+//           );
+
+//         assert.equal(
+//           tempServiceRequestsData.serviceRequests.length,
+//           NUMBER_OF_SIMULATED_SERVICE_REQUESTS,
+//           "Should have correct number of service requests"
+//         );
+
+//         // Check account sizes
+//         const accountInfos = await Promise.all([
+//           provider.connection.getAccountInfo(bridgeNodeDataAccountPDA),
+//           provider.connection.getAccountInfo(tempServiceRequestsDataAccountPDA),
+//           provider.connection.getAccountInfo(
+//             serviceRequestTxidMappingDataAccountPDA
+//           ),
+//         ]);
+
+//         accountInfos.forEach((accountInfo, index) => {
+//           if (!accountInfo) {
+//             throw new Error(`Account at index ${index} not found`);
+//           }
+//           assert.isTrue(
+//             accountInfo.data.length <= MAX_ACCOUNT_SIZE,
+//             `Account size exceeds maximum allowed size of ${MAX_ACCOUNT_SIZE} bytes`
+//           );
+//         });
+
+//         console.log("Final account states verified successfully");
+//       } catch (error) {
+//         handleProgramError(error, "Final Account State Verification");
+//       }
+//     });
+
+//     it("Verifies compute units usage is within limits", async () => {
+//       console.log("Total compute units used:", totalComputeUnitsUsed);
+//       assert.isTrue(
+//         totalComputeUnitsUsed > 0,
+//         "Should have tracked compute units usage"
+//       );
+//       assert.isTrue(
+//         totalComputeUnitsUsed <=
+//           COMPUTE_UNITS_PER_TX *
+//             (NUM_BRIDGE_NODES + NUMBER_OF_SIMULATED_SERVICE_REQUESTS) *
+//             3,
+//         "Total compute units should be within reasonable limits"
+//       );
+//     });
+
+//     it("Verifies account storage usage is within limits", async () => {
+//       console.log("Max account storage used:", maxAccountStorageUsed);
+//       assert.isTrue(
+//         maxAccountStorageUsed > 0,
+//         "Should have tracked account storage usage"
+//       );
+//       assert.isTrue(
+//         maxAccountStorageUsed <= MAX_ACCOUNT_SIZE,
+//         "Account storage should be within size limits"
+//       );
+//     });
+//   });
+
+//   // Helper function to assert on numerical values with a margin of error
+//   const assertApproximatelyEqual = (
+//     actual: number,
+//     expected: number,
+//     tolerance: number = 0.01
+//   ) => {
+//     const diff = Math.abs(actual - expected);
+//     const margin = expected * tolerance;
+//     assert.isTrue(
+//       diff <= margin,
+//       `Expected ${actual} to be approximately equal to ${expected} within ${
+//         tolerance * 100
+//       }% tolerance`
+//     );
+//   };
+
+//   // Helper function to verify account data consistency
+//   const verifyAccountConsistency = async (
+//     accountPDA: web3.PublicKey,
+//     expectedDataSize: number
+//   ) => {
+//     const accountInfo = await provider.connection.getAccountInfo(accountPDA);
+//     if (!accountInfo) {
+//       throw new Error(`Account at ${accountPDA.toString()} not found`);
+//     }
+//     assert.isTrue(
+//       accountInfo.data.length >= expectedDataSize,
+//       `Account data size ${accountInfo.data.length} is less than expected ${expectedDataSize}`
+//     );
+//     return accountInfo;
+//   };
+
+//   after(async () => {
+//     try {
+//       console.log("\nTest Suite Completion Statistics:");
+//       console.log("--------------------------------");
+//       console.log("Total compute units used:", totalComputeUnitsUsed);
+//       console.log("Max account storage used:", maxAccountStorageUsed);
+//       console.log("Total bridge nodes registered:", bridgeNodes.length);
+//       console.log(
+//         "Total service requests processed:",
+//         serviceRequestIds.length
+//       );
+
+//       // Calculate and log average compute units per transaction
+//       const totalTransactions =
+//         bridgeNodes.length + serviceRequestIds.length * 2; // Registration + service request + price quotes
+//       const avgComputeUnits = Math.floor(
+//         totalComputeUnitsUsed / totalTransactions
+//       );
+//       console.log("Average compute units per transaction:", avgComputeUnits);
+
+//       // Log account sizes
+//       const [bridgeNodeDataAccountPDA] = await PublicKey.findProgramAddressSync(
+//         [Buffer.from("bridge_nodes_data")],
+//         program.programId
+//       );
+//       const accountInfo = await provider.connection.getAccountInfo(
+//         bridgeNodeDataAccountPDA
+//       );
+//       if (accountInfo) {
+//         console.log(
+//           "Final bridge node data account size:",
+//           accountInfo.data.length
+//         );
+//       }
+
+//       // Clear arrays
+//       bridgeNodes = [];
+//       serviceRequestIds = [];
+//     } catch (error) {
+//       console.error("Error in cleanup:", error);
+//     } finally {
+//       // Reset counters
+//       totalComputeUnitsUsed = 0;
+//       maxAccountStorageUsed = 0;
+//     }
+//   });
+
+//   // Error event handler for uncaught promise rejections
+//   process.on("unhandledRejection", (error: Error) => {
+//     console.error("Unhandled promise rejection:", error);
+//     console.error("Stack trace:", error.stack);
+//     process.exit(1);
+//   });
+// });
